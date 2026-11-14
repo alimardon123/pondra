@@ -96,7 +96,7 @@ pub(crate) type Known = HashMap<String, Option<Cols>>;
 /// isn't JSON is refused 22P02. Only for a statement with such a string, a `pg_typeof`, a JSON maker or a `||`: a string
 /// compared by equality (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`, a CASE's WHEN) counts as one. A string written into a
 /// column is held as its column says (`rules::shape`). Whether it changed anything.
-pub async fn rewrite<H: Host>(host: &H, stmt: &mut Statement) -> anyhow::Result<bool> {
+pub async fn rewrite<H: Host + ?Sized>(host: &H, stmt: &mut Statement) -> anyhow::Result<bool> {
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
     let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::text::is_uuid(s) && crate::pg_casts::uuid_spelled(s).is_some());
     // (a string compared by equality, `doc = '…'`, `'…' <> doc`, `doc IN ('…')`, `CASE doc WHEN '…'`: each is read as the
@@ -306,7 +306,7 @@ pub(crate) fn one(sql: &str) -> Option<Statement> {
 }
 
 /// The columns of every table and view `stmt` names, as `host` answers them (`look_up`).
-pub(crate) async fn known<H: Host>(host: &H, stmt: &Statement) -> Known {
+pub(crate) async fn known<H: Host + ?Sized>(host: &H, stmt: &Statement) -> Known {
     let mut found = Known::new();
     look_up(host, stmt, &mut found, 0).await;
     found
@@ -315,7 +315,7 @@ pub(crate) async fn known<H: Host>(host: &H, stmt: &Statement) -> Known {
 /// The columns of each table and view `stmt` names that `known` lacks. A view's are its query's,
 /// traced the same way, four views deep at most; anything else (a CTE, a table function, a file) is
 /// unknown. Boxed, because a view's query is looked up here again.
-fn look_up<'a, H: Host>(host: &'a H, stmt: &'a Statement, known: &'a mut Known, depth: usize) -> futures::future::BoxFuture<'a, ()> {
+fn look_up<'a, H: Host + ?Sized>(host: &'a H, stmt: &'a Statement, known: &'a mut Known, depth: usize) -> futures::future::BoxFuture<'a, ()> {
     Box::pin(async move {
         let mut names = vec![];
         let _ = crate::walk::visit_relations(stmt, |n| {
@@ -334,7 +334,7 @@ fn look_up<'a, H: Host>(host: &'a H, stmt: &'a Statement, known: &'a mut Known, 
 
 /// One name `look_up` meets, as its columns: a relation's as `host` answers them, a stored view's as its query traces
 /// (`Trace::statement`). Another lake's view names its own lake's tables, so it is traced over those alone.
-async fn traced<H: Host>(host: &H, name: &str, known: &mut Known, depth: usize) -> Option<Cols> {
+async fn traced<H: Host + ?Sized>(host: &H, name: &str, known: &mut Known, depth: usize) -> Option<Cols> {
     match host.relation(name).await? {
         Relation::Columns(cols) => Some(cols),
         Relation::View { sql, lake } => {
@@ -361,7 +361,7 @@ async fn traced<H: Host>(host: &H, name: &str, known: &mut Known, depth: usize) 
 /// columns aren't known here (a CTE, a file, a table function), or when a FROM item names no relation at all (a CTE, or a
 /// call of another kind): either may have a column of any name. A JSON call in a FROM is a call, not a relation, and is
 /// left out. A derived table's own columns are handled where it is in scope, by `pg_json_sets`' scopes.
-pub(crate) async fn columns_named<H: Host>(host: &H, stmt: &Statement) -> Option<HashSet<String>> {
+pub(crate) async fn columns_named<H: Host + ?Sized>(host: &H, stmt: &Statement) -> Option<HashSet<String>> {
     if !names_its_columns(stmt) {
         return None;
     }

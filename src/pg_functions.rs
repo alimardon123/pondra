@@ -121,7 +121,8 @@ pub static POSTGRES: crate::registry::BuiltIn = crate::registry::BuiltIn {
             register(&ctx);
             crate::pg_casts::register(&ctx);
             ctx
-        })
+        });
+        r.section_mut::<crate::front::Trees>().add(crate::pg_casts::tree_pass()); // (its casts and JSON set functions in a statement's tree)
     },
 };
 

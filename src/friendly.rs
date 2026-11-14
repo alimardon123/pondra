@@ -732,9 +732,14 @@ struct Level {
     entered: usize,
 }
 
+/// The front's tree pass (`front::Trees`): DuckDB's and Snowflake's forms (`rewrite`), last.
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "friendly.rewrite", order: 60, looks: &["friendly.forms", "friendly.marked", "friendly.aliases"], run: tree } }
+
+fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], _: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> { Box::pin(rewrite(front, stmts)) }
+
 /// `stmts` with every friendly form in them rewritten, asking the host what they need to know;
 /// whether any was.
-pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
+pub async fn rewrite<H: crate::front::Host + ?Sized>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let before = stmts.to_vec();
     for s in stmts.iter_mut() {
         default_values(host, s).await?;
@@ -781,13 +786,13 @@ tokio::task_local! {
 /// The answer to an ask, from a query run as the caller (itself expanded: it may hold friendly
 /// SQL too). Asks inside asks stop 8 deep: a probe that asked itself again overflowed the stack
 /// and took the node down.
-async fn answer<H: crate::front::Host>(host: &H, ask: Ask) -> Result<Vec<Column>> {
+async fn answer<H: crate::front::Host + ?Sized>(host: &H, ask: Ask) -> Result<Vec<Column>> {
     let depth = ASKING.try_with(|d| *d).unwrap_or(0);
     ensure!(depth < 8, "a query that needs its own columns to know its own columns (asked 8 deep)");
     ASKING.scope(depth + 1, answered(host, ask)).await
 }
 
-async fn answered<H: crate::front::Host>(host: &H, ask: Ask) -> Result<Vec<Column>> {
+async fn answered<H: crate::front::Host + ?Sized>(host: &H, ask: Ask) -> Result<Vec<Column>> {
     let (sql, values) = match ask {
         Ask::Values(q) => (q, true),
         Ask::Columns(q) => (q, false),
@@ -1372,7 +1377,7 @@ fn backslash_pattern(pattern: &str, esc: Option<char>) -> Result<String> {
 /// `INSERT INTO t DEFAULT VALUES` as `INSERT INTO t VALUES (DEFAULT, …)`, one DEFAULT per column, so
 /// defaults and identity columns fill the row as they do for any INSERT. Only a table the host has; a
 /// temporary table's INSERT is its own path (`temp.rs`), so it is left as it is.
-async fn default_values<H: crate::front::Host>(host: &H, s: &mut Statement) -> Result<bool> {
+async fn default_values<H: crate::front::Host + ?Sized>(host: &H, s: &mut Statement) -> Result<bool> {
     let Statement::Insert(ins) = s else { return Ok(false) };
     if ins.source.is_some() || !ins.assignments.is_empty() {
         return Ok(false);
@@ -2320,7 +2325,7 @@ fn with_aliases(s: &mut Select, cols: &[Column]) -> Result<()> {
 /// DuckDB's `SUMMARIZE t` (or `SUMMARIZE SELECT …`): a row per column (its type, least and
 /// greatest value, distinct values about, mean, standard deviation, quartiles, count and share
 /// of NULLs), from one pass over the rows.
-pub async fn summarize<H: crate::front::Host>(host: &H, sql: &str) -> Result<Option<String>> {
+pub async fn summarize<H: crate::front::Host + ?Sized>(host: &H, sql: &str) -> Result<Option<String>> {
     static SUMMARIZE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*summarize\s+(.+?)\s*;?\s*$").expect("a regex"));
     let Some(m) = SUMMARIZE.captures(sql) else { return Ok(None) };
     let what = m[1].trim();

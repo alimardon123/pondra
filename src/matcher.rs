@@ -1794,6 +1794,7 @@ pub static MATCH_RECOGNIZE: crate::registry::BuiltIn = crate::registry::BuiltIn 
             ctx
         });
         crate::pattern::passes().into_iter().for_each(|p| r.section_mut::<crate::passes::Passes>().add(p));
+        r.section_mut::<crate::front::Trees>().add(crate::pattern::tree_pass());
         #[cfg(feature = "lake")] // (what a lake keeps for its matches views: `matches::Kept`)
         r.section_mut::<crate::lake_state::Registered>().add::<crate::matches::Kept>();
     },

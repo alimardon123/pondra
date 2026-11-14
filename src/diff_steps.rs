@@ -53,7 +53,7 @@ struct Step {
 }
 
 /// The query that answers `pondra.diff_steps(a, b)`.
-pub(crate) async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
+pub(crate) async fn answer_of<H: Host + ?Sized>(host: &H, call: &Call) -> Result<String> {
     let (a, ran_a) = definition(host, &call.a, call.data.as_deref()).await?;
     let (b, ran_b) = definition(host, &call.b, call.data.as_deref()).await?;
     let parse = crate::expander::parse_query;
@@ -62,7 +62,7 @@ pub(crate) async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> 
 
 /// A side's definition as written (its steps' marks compare these), and as it runs: its names read where its database
 /// has them, or from `data`'s tables.
-async fn definition<H: Host>(host: &H, side: &Side, data: Option<&str>) -> Result<(String, String)> {
+async fn definition<H: Host + ?Sized>(host: &H, side: &Side, data: Option<&str>) -> Result<(String, String)> {
     let over = |own: String| data.map_or(own, str::to_string);
     Ok(match (side, crate::diff::relation_of(host, side).await) {
         (Side::Name(n), Some(Relation::Columns(_))) => {
