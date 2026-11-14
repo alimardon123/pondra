@@ -101,6 +101,8 @@ defaults engine
 dialect_fns engine
 dialect_stmts engine
 diff engine
+redirect engine
+diff_steps engine
 divide engine
 eager engine
 engine engine

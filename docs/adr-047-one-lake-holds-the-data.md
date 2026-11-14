@@ -153,7 +153,14 @@ SELECT * FROM pondra.diff('prod.gold.revenue', 'ali_orders.gold.revenue');   -- 
   PRIMARY KEY … NOT ENFORCED). Keys match NULL to NULL; a side holding one key on two rows is refused
   (21000, naming it), and two sides declaring different keys too (42P10: `key =>` picks). The two sides
   must have the same columns (42804 names the first that differs); the answer has the second's, in its
-  order (Trellis T1).
+  order (Trellis T1). `data => 'db'` runs both sides' definitions over `db`'s tables, in one statement, so
+  only the code moves rows: `pondra.diff('prod.gold.revenue', 'ali_orders.gold.revenue', data => 'prod')`
+  is what ali's change to the view does over prod's rows. A definition's own tables are read from `db`'s,
+  and the views it reads are inlined and read the same way; two tables are refused (0A000: a table has no
+  definition to run). `pondra.diff_steps(a, b [, data => 'db'])` says which step moved them: one row for
+  each `WITH` step of either side, matched by name, and one for the query itself, `(final)`, with each
+  side's count of the step's rows and a mark: `same`, `changed`, `new`, `removed`, or `reads changed` (its
+  text is the same, and it reads a step that isn't) (T2).
 
 ### 4. Plan and deploy: the project made true in a database
 

@@ -77,6 +77,8 @@ mod dialect;
 mod passes;
 mod past_names;
 mod diff;
+mod redirect;
+mod diff_steps;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod expander;
 mod front;

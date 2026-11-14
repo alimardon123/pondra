@@ -10629,7 +10629,9 @@ def diffs():
     table's, a view's PRIMARY KEY … NOT ENFORCED, or `key =>`) match by it, with update rows naming what changed; a key
     held twice (21000), a key column the sides lack (42703) and two declared keys (42P10) are refused. (Two tables match by their rows' ids,
     a branch's: environments_check.py, where an update names the columns it changed.) The answer has b's columns in b's
-    order; sides of other columns are refused with 42804, naming the first."""
+    order; sides of other columns are refused with 42804, naming the first. `data => 'db'` (T1c) runs both sides'
+    definitions over a clone's tables or this database's, so a view's changed code shows alone; two tables are refused
+    with 0A000. `pondra.diff_steps(a, b)` (T2) marks each WITH step and counts its rows on each side."""
     import duckdb
     setup = ["CREATE TABLE t (id BIGINT, n BIGINT, s TEXT)",
              "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 20, 'b'), (4, 30, 'c'), (5, 40, NULL), (6, 40, NULL)",
@@ -10716,6 +10718,70 @@ def diffs():
         status, state, body = _sqlstate_of(A.port, text)
         info[f"refused: {name}"] = [status, state, body[:300]]
         checks[f"refused, {name}: {code}, saying so"] = status >= 400 and state == code and said in body
+    # data => (Trellis T1c): both sides' definitions run over one database's tables, so only the code moves rows. dfdev
+    # is this database as it was; then this one's rows and its view low's code change.
+    here = sql(A.port, "SELECT current_database() AS d")[0]["d"]
+    steps_of = lambda gt, third: f"CREATE OR REPLACE VIEW sv AS WITH big AS (SELECT id, n, s FROM t WHERE n >= {gt}), named AS (SELECT n, s FROM big WHERE s IS NOT NULL), {third} AS (SELECT 1 AS one) SELECT s, count(*) AS c FROM named GROUP BY s"
+    sql(A.port, steps_of(20, "gone"))  # (sv's steps, for diff_steps below: dfdev takes this one)
+    dev_at = f"{lake}-dfdev"
+    LAKES.append(dev_at)
+    sql(A.port, f"CREATE DATABASE dfdev LOCATION '{dev_at}' CLONE \"{here}\"")
+    duck.execute("CREATE TABLE t_dev AS SELECT * FROM t")
+    for s_ in ["INSERT INTO t VALUES (8, 15, 'd')", "UPDATE t SET s = 'e' WHERE id = 3"]:
+        sql(A.port, s_)
+        duck.execute(s_)
+    sql(A.port, "CREATE OR REPLACE VIEW low AS SELECT n, s FROM t WHERE n <= 20")
+    sql(A.port, "CREATE VIEW lowest AS SELECT n, s FROM low WHERE n >= 15")
+    sql(A.port, steps_of(30, "extra"))
+    old, new = "SELECT n, s FROM {} WHERE n <= 30", "SELECT n, s FROM {} WHERE n <= 20"
+    info["dfdev"] = [here, sql(A.port, "SELECT count(*) AS n FROM dfdev.public.t"), sql(A.port, "SELECT count(*) AS n FROM t")]
+    same("data => dfdev: the code's change alone", "'dfdev.public.low'", "'low', data => 'dfdev'", duck_a=old.format("t_dev"), duck_b=new.format("t_dev"))
+    same("no data =>: the code's change and the rows'", "'dfdev.public.low'", "'low'", duck_a=old.format("t_dev"), duck_b=new.format("t"))
+    same(f"data => {here}: the code's change alone, over this database's rows", "'dfdev.public.low'", f"'low', data => '{here}'", duck_a=old.format("t"), duck_b=new.format("t"))
+    same("data => dfdev: a view of a view, each over dfdev's rows", "'dfdev.public.low'", "'lowest', data => 'dfdev'",
+         duck_a=old.format("t_dev"), duck_b=f"SELECT n, s FROM ({new.format('t_dev')}) WHERE n >= 15")
+    same("data => dfdev: a query side reads dfdev's tables too", "(SELECT n, s FROM t WHERE n >= 20)", "'low', data => 'dfdev'",
+         duck_a="SELECT n, s FROM t_dev WHERE n >= 20", duck_b=new.format("t_dev"))
+    same("data => dfdev: a table beside a query is dfdev's of its name", "'t'", "(SELECT * FROM t WHERE id > 1), data => 'dfdev'",
+         duck_a="SELECT * FROM t_dev", duck_b="SELECT * FROM t_dev WHERE id > 1")
+    checks["data => dfdev shows only the code's change: n <= 20 drops (30, 'c')"] = info["data => dfdev: the code's change alone"] == [("delete", 30, "c", None)]
+    for name, text, code, said in [
+        ("two tables with data =>", "SELECT * FROM pondra.diff('t', 'dfdev.public.t', data => 'dfdev')", "0A000", "are tables, which have none"),
+        ("data => naming no database as text", "SELECT * FROM pondra.diff('low', 'lowest', data => 1)", "22023", "data => 'dev', not 1"),
+    ]:
+        status, state, body = _sqlstate_of(A.port, text)
+        info[f"refused: {name}"] = [status, state, body[:300]]
+        checks[f"refused, {name}: {code}, saying so"] = status >= 400 and state == code and said in body
+    status, state, body = _sqlstate_of(A.port, "SELECT * FROM pondra.diff('low', 'lowest', data => 'nowhere')")
+    info["refused: data => a database that isn't there"] = [status, state, body[:300]]
+    checks["data => a database that isn't there: refused, naming it"] = 400 <= status < 500 and "nowhere" in body
+    # pondra.diff_steps (Trellis T2): which of sv's steps moved the rows. dfdev's sv keeps n >= 20 and a step gone; this
+    # one's keeps n >= 30 and a new step. Each step's rows on each side are counted as DuckDB counts them.
+    def counted(t_a, t_b):
+        c = lambda q: duck.execute(f"SELECT count(*) FROM ({q})").fetchone()[0]
+        big, named, final = "SELECT id, n, s FROM {} WHERE n >= {}", "SELECT n, s FROM ({}) WHERE s IS NOT NULL", "SELECT s, count(*) FROM ({}) GROUP BY s"
+        na, nb = named.format(big.format(t_a, 20)), named.format(big.format(t_b, 30))
+        return [["big", c(big.format(t_a, 20)), c(big.format(t_b, 30)), "changed"], ["named", c(na), c(nb), "reads changed"],
+                ["extra", None, 1, "new"], ["gone", 1, None, "removed"], ["(final)", c(final.format(na)), c(final.format(nb)), "reads changed"]]
+    stepped = lambda a, b: [list(r) for r in typed(f"SELECT * FROM pondra.diff_steps({a}, {b})")["rows"]]
+    for name, (a, b, t_a, t_b) in {"each side over its own database's rows": ("'dfdev.public.sv'", "'sv'", "t_dev", "t"),
+                                   "data => dfdev": ("'dfdev.public.sv'", "'sv', data => 'dfdev'", "t_dev", "t_dev"),
+                                   f"data => {here}": ("'dfdev.public.sv'", f"'sv', data => '{here}'", "t", "t")}.items():
+        got, want = stepped(a, b), counted(t_a, t_b)
+        info[f"steps: {name}"] = [got, want]
+        checks[f"diff_steps, {name}: each step marked, and its rows on each side as DuckDB counts them"] = got == want
+    checks["diff_steps: the answer's columns, and a view against itself all same"] = header("SELECT * FROM pondra.diff_steps('sv', 'sv')") == ["step", "rows_a", "rows_b", "mark"] \
+        and [r[3] for r in stepped("'sv'", "'sv'")] == ["same"] * 4
+    checks["diff_steps: a query side, a WITH's steps against none"] = [(r[0], r[3]) for r in stepped("'sv'", "(SELECT 1 AS one)")] == \
+        [("big", "removed"), ("named", "removed"), ("extra", "removed"), ("(final)", "changed")]
+    for name, text, code, said in [
+        ("a table, which has no steps", "SELECT * FROM pondra.diff_steps('t', 'sv')", "0A000", "t is a table, which has none"),
+        ("a name that is nothing", "SELECT * FROM pondra.diff_steps('nope', 'sv')", "42P01", 'relation "nope" does not exist'),
+        ("a key, which steps don't take", "SELECT * FROM pondra.diff_steps('sv', 'sv', key => 'id')", "42883", "pondra.diff_steps has no argument key"),
+    ]:
+        status, state, body = _sqlstate_of(A.port, text)
+        info[f"refused: {name}"] = [status, state, body[:300]]
+        checks[f"diff_steps refused, {name}: {code}, saying so"] = status >= 400 and state == code and said in body
     # Refusals
     status, state, body = _sqlstate_of(A.port, "SELECT * FROM pondra.diff('low', 't')")
     info["other columns"] = [status, state, body[:300]]
