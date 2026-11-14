@@ -483,7 +483,8 @@ fn guarded(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, 
         }
         return None;
     }
-    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None, shown: false, asked: asked.clone() }))
+    let rows = scope.rows("select", name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None, shown: false, asked: asked.clone(), rows }))
 }
 
 /// An attached lake's table `name` as `scope` may read it: not at all when that
@@ -500,7 +501,8 @@ fn across(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, l
         }
         return None; // (as `guarded`: a table it doesn't know is there isn't, for it)
     }
-    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone(), shown: false, asked: asked.clone() }))
+    let rows = scope.rows_named("select", name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone(), shown: false, asked: asked.clone(), rows }))
 }
 
 /// A table as a user granted some of it reads it (`users.rs`): planned as the table is, so that a statement naming a
@@ -517,6 +519,7 @@ struct Guarded {
     why: Option<String>,
     shown: bool,
     asked: Arc<str>,
+    rows: Option<crate::row_scan::Rows>, // (its grant's filter on its rows: step 6 piece 5b, `row_scan`)
 }
 
 /// Does `sql` name `column` itself: a word of it, not inside a string?
@@ -547,10 +550,14 @@ impl TableProvider for Guarded {
     fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> { None } // (a view's plan would read around the check)
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         // (inexact: each filter stays above the scan too, so its columns are in what is scanned; and one that is never
-        // true comes to the scan, which then reads nothing)
+        // true comes to the scan, which then reads nothing. Under a filter on its rows, only one that can't fail on a row
+        // the filter hides comes to the scan at all: `row_scan::leakproof`.)
+        use datafusion::logical_expr::TableProviderFilterPushDown::{Exact, Inexact, Unsupported};
+        let schema = self.inner.schema();
         Ok(self.inner.supports_filters_pushdown(filters)?.into_iter().zip(filters).map(|(p, f)| match p {
-            datafusion::logical_expr::TableProviderFilterPushDown::Exact => datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
-            _ if never(f) => datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+            _ if never(f) => Inexact,
+            _ if self.rows.is_some() && !crate::row_scan::leakproof(f, &schema) => Unsupported,
+            Exact => Inexact,
             p => p,
         }).collect())
     }
@@ -562,7 +569,10 @@ impl TableProvider for Guarded {
             let schema = match &projection { Some(p) => Arc::new(all.project(p)?), None => all };
             return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema)));
         }
-        self.inner.scan(state, projection.as_ref(), filters, limit).await
+        match &self.rows {
+            None => self.inner.scan(state, projection.as_ref(), filters, limit).await,
+            Some(rows) => crate::row_scan::scan(state, &self.inner, &self.name, rows, projection, filters, limit).await,
+        }
     }
 }
 
@@ -1633,7 +1643,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
                 Some(t) => {
                     ctx.register_table(table_ref(name), t)?;
                 }
-                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None, shown: false, asked: asked.clone() }) as Arc<dyn TableProvider>)),
+                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None, shown: false, asked: asked.clone(), rows: None }) as Arc<dyn TableProvider>)),
             }
         }
     }
@@ -1960,7 +1970,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
                         Some(v) => ctx.register_table(table_ref(&name), v)?,
                         None => {
                             planned_only.push(table_ref(&name));
-                            ctx.register_table(table_ref(&name), Arc::new(Guarded { inner: view, name: name.clone(), columns: None, why: None, shown: false, asked: asked.clone() }))?
+                            ctx.register_table(table_ref(&name), Arc::new(Guarded { inner: view, name: name.clone(), columns: None, why: None, shown: false, asked: asked.clone(), rows: None }))?
                         }
                     };
                 }
@@ -2231,6 +2241,124 @@ mod tests {
         })
         .await
     }
+    /// A table read under its reader's grant's filter on its rows (step 6 piece 5b, `row_scan`): the rows it keeps only, cut
+    /// by a limit after it, counted and bounded from them; nothing the query asks of a row it hides is worked out, so no
+    /// condition fails on one (L1's tests: a division by its zero, under a top-N of 16 columns too, and a cast of its text),
+    /// though the table is read through a view of its files that works out the conditions given it (a renamed column's),
+    /// or with Parquet's row filters on; the filter's columns are read for a reader granted others; EXPLAIN ANALYZE shows
+    /// no count of hidden rows. A leakproof filter and one that isn't (offered to the files, or not) alike. A reader granted
+    /// the table with no filter plans as before. (Each of the first two fails if the query's conditions or its limit are
+    /// given to the scan under the filter.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_filter_on_rows_shows_its_rows_only_and_nothing_fails_on_one_it_hides() -> anyhow::Result<()> {
+        crate::auth::as_node(async move {
+            use super::*;
+            use crate::rights::Scope;
+            use crate::users::{Access, Grant, On};
+            use datafusion::arrow::record_batch::RecordBatch;
+            async fn answer(lake: &crate::store::Lake, sql: &str, scope: &Scope) -> anyhow::Result<Vec<RecordBatch>> {
+                let ctx = session_for(lake, sql, "", None, scope).await?;
+                Ok(crate::engine::sql(&ctx, sql).await?.collect().await?)
+            }
+            // (with Parquet's filters worked out row by row as the files are read, a reader's setting: `ext::PARQUET_TUNING`)
+            async fn pushed(lake: &crate::store::Lake, sql: &str, scope: &Scope) -> anyhow::Result<Vec<RecordBatch>> {
+                let ctx = session_for(lake, sql, "", None, scope).await?;
+                {
+                    let state = ctx.state_ref();
+                    let mut state = state.write();
+                    let parquet = &mut state.config_mut().options_mut().execution.parquet;
+                    (parquet.pushdown_filters, parquet.reorder_filters) = (true, true);
+                }
+                Ok(crate::engine::sql(&ctx, sql).await?.collect().await?)
+            }
+            async fn text(lake: &crate::store::Lake, sql: &str, scope: &Scope) -> anyhow::Result<String> {
+                Ok(datafusion::arrow::util::pretty::pretty_format_batches(&answer(lake, sql, scope).await?)?.to_string())
+            }
+            let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
+            let dir = std::env::temp_dir().join(format!("pondra-rows-{}", uuid::Uuid::new_v4()));
+            let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            let wide: String = (5..16).map(|i| format!(r#", ["c{i}", "Int64"]"#)).collect();
+            let columns = format!(r#"[["k", "Int64"], ["x", "Int64"], ["s", "Utf8"], ["dept", "Utf8"], ["name", "Utf8"]{wide}]"#);
+            crate::write::create_table(&lake, "t", &format!(r#"{{"columns": {columns}}}"#)).await?;
+            let seq = crate::log::Sequencer::start(lake.clone(), None).await?;
+            // (100 rows the filter hides come first, each with x = 5 and s = 'abc'; then the 20 it shows, x = k, s = k's digits)
+            let rest: String = (5..16).map(|i| format!(", {i} AS c{i}")).collect();
+            let hidden = |then: &str, shown: &str| format!("CASE WHEN value < 100 THEN {then} ELSE {shown} END");
+            let fill = format!("SELECT value AS k, {} AS x, {} AS s, {} AS dept, 'n' || value AS name{rest} FROM range(120)", hidden("5", "value"), hidden("'abc'", "CAST(value AS VARCHAR)"), hidden("'hr'", "'eng'"));
+            let files = crate::write::write_files(&lake, &lake.session(), "t", &fill, "fill", None).await?.expect("not yet recorded");
+            crate::write::record(&lake, files, &seq).await?;
+            // (a column renamed: the table is read through a view of its files (`named`), which works out the conditions
+            // given its scan itself, on every row it reads)
+            let Some(crate::write::Stmt::Ddl(renamed)) = crate::write::parse("ALTER TABLE t RENAME COLUMN c15 TO c_last") else { panic!("an ALTER TABLE") };
+            for d in renamed {
+                crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
+            }
+            let grant = |columns: &[&str], rows: Option<&str>| {
+                let g = Grant { privilege: "select".into(), on: On::Table("t".into()), columns: columns.iter().map(|c| c.to_string()).collect(), rows: rows.map(String::from) };
+                Scope::granted(Arc::new(Access::granted(vec![g])))
+            };
+            let ann = grant(&[], Some("dept = 'eng'"));
+            let lowered = grant(&[], Some("lower(dept) = 'eng'")); // (a filter that isn't leakproof: not offered to the files)
+            let ks = |b: &[RecordBatch]| -> Vec<i64> { b.iter().flat_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap().values().to_vec()).collect() };
+            assert_eq!(ks(&answer(&lake, "SELECT k FROM t ORDER BY k", &ann).await?), (100..120).collect::<Vec<i64>>(), "its rows only");
+            for scope in [&ann, &lowered] {
+                for sql in ["SELECT * FROM t WHERE 100 / (x - 5) >= 0", "SELECT * FROM t WHERE k >= 0 AND 100 / (x - 5) >= 0", "SELECT * FROM t WHERE 100 / (x - 5) >= 0 ORDER BY k LIMIT 10"] {
+                    for rows in [answer(&lake, sql, scope).await, pushed(&lake, sql, scope).await] {
+                        assert!(rows.is_ok(), "{sql} is worked out on no hidden row: {rows:?}");
+                        assert_eq!(count(&rows?), if sql.contains("LIMIT") { 10 } else { 20 }, "{sql}");
+                    }
+                }
+                let limited = answer(&lake, "SELECT k FROM t LIMIT 10", scope).await?;
+                assert_eq!(count(&limited), 10, "the limit is after the filter");
+                assert!(ks(&limited).iter().all(|k| *k >= 100), "{limited:?}");
+                for cast in [answer(&lake, "SELECT k FROM t WHERE s = 105", scope).await, pushed(&lake, "SELECT k FROM t WHERE s = 105", scope).await] {
+                    assert!(cast.as_ref().is_ok_and(|b| ks(b) == [105]), "a cast of a hidden row's text is never worked out: {cast:?}");
+                }
+            }
+            assert_eq!(text(&lake, "SELECT count(*) AS n, min(k) AS lo, max(k) AS hi FROM t", &ann).await?.lines().nth(3).unwrap().split_whitespace().collect::<Vec<_>>(), ["|", "20", "|", "100", "|", "119", "|"], "counted from its rows, never the files'");
+            // (a reader granted `name` only, by a filter on `dept`: the filter reads `dept`, the reader may not)
+            let named = grant(&["name"], Some("dept = 'eng'"));
+            assert_eq!(count(&answer(&lake, "SELECT name FROM t", &named).await?), 20);
+            let dept = answer(&lake, "SELECT dept FROM t", &named).await;
+            assert!(dept.is_err_and(|e| format!("{e:#}").contains("permission denied")), "it still may not read dept");
+            // (EXPLAIN ANALYZE: the filtered scan's rows and time, nothing of the files' rows, bytes or row groups)
+            for sql in ["EXPLAIN ANALYZE SELECT k FROM t WHERE k >= 0", "EXPLAIN VERBOSE SELECT k FROM t WHERE k >= 0"] {
+                let told = text(&lake, sql, &ann).await?;
+                assert!(told.contains("GuardedExec: t, row filter of your grant"), "{sql}: {told}");
+                for hidden in ["DataSourceExec", "rows=120", "(120)", "bytes_scanned", "row_groups", "dept = 'eng'"] {
+                    assert!(!told.contains(hidden), "{sql} shows {hidden}: {told}");
+                }
+            }
+            // (a condition that can fail on a row stays above the filtered scan; one that can't goes into it too)
+            let physical = |sql: &str, scope: &Scope| {
+                let (lake, sql, scope) = (lake.clone(), sql.to_string(), scope.clone());
+                async move {
+                    let ctx = session_for(&lake, &sql, "", None, &scope).await?;
+                    let plan = crate::engine::sql(&ctx, &sql).await?.create_physical_plan().await?;
+                    let shown = datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string();
+                    anyhow::Ok(shown)
+                }
+            };
+            let above = physical("SELECT k FROM t WHERE 100 / (x - 5) >= 0", &ann).await?;
+            assert!(above.contains("FilterExec") && above.contains("GuardedExec"), "{above}");
+            // (a filter that no longer plans shows no row; one on no row's columns that is never true reads nothing)
+            assert_eq!(count(&answer(&lake, "SELECT k FROM t", &grant(&[], Some("salary > 3"))).await?), 0);
+            assert!(physical("SELECT k FROM t", &grant(&[], Some("1 = 0"))).await?.contains("EmptyExec"));
+            assert_eq!(count(&answer(&lake, "SELECT k FROM t", &grant(&[], Some("1 = 1"))).await?), 120);
+            // (a reader granted it with no filter, and the node: the files' scan, as before)
+            for scope in [grant(&[], None), crate::auth::Principal::node().scope] {
+                assert_eq!(count(&answer(&lake, "SELECT k FROM t", &scope).await?), 120);
+                let plan = physical("SELECT k FROM t WHERE 100 / (x - 5) >= 0 OR k > 3", &scope).await?;
+                assert!(!plan.contains("GuardedExec") && plan.contains("DataSourceExec"), "{plan}");
+            }
+            drop(seq);
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
+    }
+
     use super::{exhausted, frugally, keep, peak_pool, retrying, tails, task_with_peak, Facts, FactsMemo, Tail, Tails, TAILS};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;

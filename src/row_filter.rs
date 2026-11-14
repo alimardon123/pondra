@@ -12,14 +12,13 @@ use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::{ExprSchemable, Volatility};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value, ValueWithSpan};
+use datafusion::sql::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart, Value, ValueWithSpan};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
 
 /// The filter `text` on `table`'s rows (`schema`: its columns), if a grant may hold it: as it is kept (written again from
 /// what was parsed), or why not. `ctx` names the functions it may call: the lake's own session's.
-#[cfg_attr(not(test), allow(dead_code))] // (its caller is the grant's syntax, when it comes: L6 names it)
 pub fn check(ctx: &SessionContext, table: &str, schema: &Schema, text: &str) -> Result<String> {
     let e = parsed(text)?;
     let state = ctx.state();
@@ -51,18 +50,39 @@ pub fn filled(text: &str, reader: Option<&str>) -> String {
     }
 }
 
-/// One condition, and nothing after it.
+/// The filter `text` as a grant keeps it (`check` gives the same): its parse printed, so spacing, keyword case and the
+/// case of names unquoted never make two filters differ (`REVOKE … WHERE c` takes the grant whose filter is `c`'s).
+pub fn kept(text: &str) -> Result<String> { Ok(parsed(text)?.to_string()) }
+
+/// One condition, and nothing after it: names unquoted in lower case (as SQL reads them), and a minus before a minus
+/// printed as one (`parsed::signed`: `- -1`'s print, `--1`, reads back as a comment).
 fn parsed(text: &str) -> Result<Expr> {
     let dialect = PostgreSqlDialect {};
     let said = |e: &dyn std::fmt::Display| coded("42601", format!("a filter on rows is one SQL condition: {e}"));
     let mut p = Parser::new(&dialect).try_with_sql(text).map_err(|e| said(&e))?;
-    let e = p.parse_expr().map_err(|e| said(&e))?;
+    let mut e = p.parse_expr().map_err(|e| said(&e))?;
     ensure!(matches!(p.peek_token().token, Token::EOF), said(&format!("{text} goes on past {e}")));
+    let lower = |i: &mut Ident| {
+        if i.quote_style.is_none() {
+            i.value = i.value.to_lowercase();
+        }
+    };
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x: &mut Expr| {
+        match x {
+            Expr::Identifier(i) => lower(i),
+            Expr::Function(f) => f.name.0.iter_mut().filter_map(|p| match p {
+                ObjectNamePart::Identifier(i) => Some(i),
+                _ => None,
+            }).for_each(lower),
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    crate::parsed::signed_in(&mut e);
     Ok(e)
 }
 
 /// Why `x`, a part of a filter on `table`'s rows, may not be in one (None: it may).
-#[cfg_attr(not(test), allow(dead_code))] // (`check`'s)
 fn why_not(x: &Expr, table: &str, schema: &Schema, state: &datafusion::execution::SessionState) -> Option<anyhow::Error> {
     match x {
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => Some(coded("0A000", "a filter on rows reads its own row only: no subquery")),
@@ -107,7 +127,6 @@ fn names_reader(x: &Expr) -> bool {
 }
 
 /// `current_claim('x')`'s claim's name.
-#[cfg_attr(not(test), allow(dead_code))] // (`check`'s)
 fn claim(x: &Expr) -> Option<&str> {
     let Expr::Function(f) = x else { return None };
     let FunctionArguments::List(l) = &f.args else { return None };

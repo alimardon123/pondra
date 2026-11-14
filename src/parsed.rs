@@ -46,7 +46,10 @@ pub(crate) fn generic(sql: &str) -> Result<Vec<Statement>, ParserError> {
 /// SELECT id, - -k FROM t` kept its query as `SELECT id,`). Each parse of a text has it done (`generic`, `read`, a
 /// session's dialect's in `write::parse`, Spark's), so any print of a tree a text parsed to reads back as it means; and
 /// `text::sql`, for a tree built since. Whether any was.
-pub(crate) fn signed(s: &mut Statement) -> bool {
+pub(crate) fn signed(s: &mut Statement) -> bool { signed_in(s) }
+
+/// `signed` on any part of a tree: a grant's filter on its rows, kept as its print (`row_filter::kept`).
+pub(crate) fn signed_in<V: datafusion::sql::sqlparser::ast::VisitMut>(s: &mut V) -> bool {
     let mut any = false;
     let _ = crate::walk::visit_expressions_mut(s, |e| {
         if let Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } = e {

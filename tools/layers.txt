@@ -88,6 +88,7 @@ audit engine
 auth engine
 rights engine
 row_filter engine
+row_scan engine
 authored engine
 avg engine
 branch engine

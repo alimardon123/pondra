@@ -502,6 +502,9 @@ pub fn unless(if_not_exists: bool, name: &str, kind: &str, d: crate::ddl::Ddl) -
     }
 }
 
+/// What Postgres's policies (`CREATE POLICY`, `ALTER TABLE … ROW LEVEL SECURITY`) are told: a filter on rows is a grant's.
+const ON_THE_GRANT: &str = "a filter on rows is kept on the grant here: GRANT SELECT ON t TO r WHERE …";
+
 /// A write statement, or None for a query.
 pub fn parse(sql: &str) -> Option<Stmt> {
     use datafusion::sql::sqlparser::parser::Parser;
@@ -678,6 +681,13 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             });
             Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
+        // (Postgres's filters on rows, its policies, are kept on the grant here: `GRANT … WHERE`, step 6 piece 5. A table no
+        // grant filters is read whole by whoever may read it, so there is no switch to turn on)
+        Statement::CreatePolicy(_) | Statement::AlterPolicy(_) | Statement::DropPolicy(_) => Stmt::Refused("0A000", ON_THE_GRANT.into()),
+        Statement::AlterTable(a) if a.operations.iter().any(|o| {
+            use ast::AlterTableOperation as O;
+            matches!(o, O::EnableRowLevelSecurity | O::DisableRowLevelSecurity | O::ForceRowLevelSecurity | O::NoForceRowLevelSecurity)
+        }) => Stmt::Refused("0A000", ON_THE_GRANT.into()),
         Statement::AlterTable(a) => match &a.operations[..] {
             [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::rules::alter::fills_existing(c) => Stmt::Invalid(crate::rules::alter::owes_rows(&a.name.to_string(), &c.name.to_string())),
             [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, column_position, .. }] => match crate::rules::alter::beside_type(c) {
@@ -1910,6 +1920,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     let stored = lake.cat.meta(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
     let meta = stored.as_ref().map(|m| m.logical_ref()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
+    if let (Some(m), Stmt::Insert(..)) = (&meta, &stmt) {
+        crate::txn::merges_unseen(&table, m, &by.scope)?;
+    }
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one

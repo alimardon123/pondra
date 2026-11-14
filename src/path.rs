@@ -173,6 +173,11 @@ pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<Stri
             return Err(coded("0A000", in_other(what, kind, path.database())));
         }
     }
+    if let Some((grant, rows)) = crate::users::rows_of(sql) {
+        // (`GRANT … WHERE condition`: the grant's names placed, its filter on rows kept as written, its `current_user`
+        // whoever reads, not whoever grants)
+        return Ok(format!("{} WHERE {rows}", Box::pin(door(lake, grant, skip)).await?));
+    }
     let inlined = crate::languages::inline(sql)?; // (`spark_sql('…')` first: its text is placed like any SQL's)
     let sql = inlined.as_str();
     if let Some(out) = head(lake, &path, sql, &HEADS).await? {

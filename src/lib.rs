@@ -164,6 +164,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod row_filter; // (a grant's filter on its rows: checked when set, filled in for its reader)
+#[cfg(feature = "lake")] mod row_scan; // (a table read under a grant's filter on its rows: `query::Guarded`'s scan)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod buckets; // (what opens a lake's bucket: the hosts fill it, `hosted`)
 #[cfg(feature = "lake")] mod hosted;
