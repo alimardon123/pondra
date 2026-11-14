@@ -16,6 +16,8 @@ pub mod lifecycle;
 pub mod machine;
 // The one clock: what time it is and how long since, which a test's paused time moves too (the sim, redesign step 3).
 pub mod clock;
+// The sim (redesign step 3): a cluster's members in one process, on a test's paused time, with faults placed on purpose.
+#[cfg(all(feature = "doors", any(test, feature = "sim")))] pub mod sim;
 // How a node's calls out reach the network: one client factory, with the policy named by whom a call goes to.
 #[cfg(feature = "lake")] pub mod net;
 // Space of this process's own on this machine's disk: the folders its spills go to.
@@ -164,6 +166,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
 #[cfg(feature = "lake")] mod row_filter; // (a grant's filter on its rows: checked when set, filled in for its reader)
+#[cfg(feature = "lake")] mod row_scan; // (a table read under a grant's filter on its rows: `query::Guarded`'s scan)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod buckets; // (what opens a lake's bucket: the hosts fill it, `hosted`)
 #[cfg(feature = "lake")] mod hosted;

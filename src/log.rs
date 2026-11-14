@@ -601,7 +601,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
     if data.len() > inline_bytes() {
         f.path = format!("log/{}-{:015}.seg", uuid::Uuid::new_v4().simple(), now_ms()); // (a random first part: every node's flushes spread over the key range, C5; the catalog holds each path)
         lake.put(&f.path, data).await?;
-        maybe_crash("after_seg_put", &*lake.node.life);
+        maybe_crash("after_seg_put", &lake.node);
     } else {
         f.data = data.into();
     }
@@ -1202,7 +1202,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
             drop(ms);
             lake.cat.stage("commit", t0); // (from `order` to here: the commit /stats times)
-            maybe_crash("after_commit", &*lake.node.life);
+            maybe_crash("after_commit", &lake.node);
             lake.advance(hwm);
             for (reply, outcome) in replies {
                 let _ = reply.send(outcome);
@@ -1226,7 +1226,10 @@ fn stamp_file(d: &mut DataFile, seg: u64, ms: u64) {
     d.ord = seg;
     if let Some(l) = d.lineage.as_mut().filter(|l| l.version == 0) {
         (l.version, l.ms) = (seg, ms);
-        d.stats.extend(crate::adopt::system_stats(l, d.rows));
+        // (in the form the file keeps its other ranges: typed only where the lake already is, format 8)
+        let (stats, bounds) = crate::bounds::kept(&crate::adopt::system_stats(l, d.rows), !d.bounds.is_empty());
+        d.stats.extend(stats);
+        d.bounds.extend(bounds);
     }
 }
 

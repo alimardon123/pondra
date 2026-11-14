@@ -56,9 +56,10 @@ pub(crate) fn wanted(sql: &str) -> bool {
 /// differently. None when none was.
 fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> { regroup(&mut stmts).then(|| written(&stmts)) }
 
-/// `regrouped` in place, on a tree whichever dialect read (the front's: generic's, or the fallback's for FROM first).
+/// `regrouped` in place, on a tree whichever dialect read (the front's: generic's, or the fallback's for FROM first), or on a
+/// client's frame as it is inlined (`expander.rs`).
 /// Whether any was. (The walk visits an expression after its operands, so an inner one is regrouped first.)
-pub(crate) fn regroup(stmts: &mut Vec<ast::Statement>) -> bool {
+pub(crate) fn regroup<V: ast::VisitMut>(stmts: &mut V) -> bool {
     let mut moved = false;
     let _ = crate::walk::visit_expressions_mut(stmts, |e| {
         if is_json_op(e) {

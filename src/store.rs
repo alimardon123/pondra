@@ -2144,7 +2144,12 @@ use crate::memory_lake::in_memory;
 pub fn served(url: &str) -> bool { url.starts_with("pondra://") }
 
 /// The schemes of a bucket's lake (`s3://bucket/prefix`): `open_store` and `place` both take only these.
+#[cfg(not(all(feature = "doors", any(test, feature = "sim"))))]
 const BUCKETS: [&str; 5] = ["s3", "gs", "az", "abfs", "abfss"];
+
+/// (and the sim's members' bucket, in a test or sim build: `sim::store`)
+#[cfg(all(feature = "doors", any(test, feature = "sim")))]
+const BUCKETS: [&str; 6] = ["s3", "gs", "az", "abfs", "abfss", "sim"];
 
 /// The kinds of place a lake can be (`place`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4362,9 +4367,12 @@ pub(crate) fn fatal(e: kv::Error, life: &dyn crate::lifecycle::Lifecycle) -> any
 
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
-pub fn maybe_crash(point: &str, life: &dyn crate::lifecycle::Lifecycle) {
+pub fn maybe_crash(point: &str, node: &crate::node_state::NodeState) {
+    if node.stops_at(point) {
+        panic!("the sim stopped this member at {point}"); // (its other tasks end as it is killed: `sim::Cluster::kill`)
+    }
     if crash_rolled(point) {
-        if !life.owns_process() {
+        if !node.life.owns_process() {
             panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
         }
         eprintln!("PONDRA_CRASH: aborting at {point}");

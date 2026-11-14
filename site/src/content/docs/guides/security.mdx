@@ -287,6 +287,7 @@ permission denied: INSERT on notes
 | `GRANT SELECT [(a, b)] \| INSERT \| UPDATE \| DELETE \| ALL ON t TO r` | a table or view, or some of its columns |
 | `GRANT … ON SCHEMA s` or `ON ALL TABLES IN SCHEMA s` | every table of a schema, now and later |
 | `GRANT … ON ALL TABLES` | every table of the lake (and of the lakes attached to it) |
+| `GRANT SELECT ON t TO r WHERE condition` | some of a table's rows ([below](#a-grants-rows)) |
 | `GRANT USAGE ON SECRET s TO r` | queries may read the URLs its scope covers (below) |
 | `GRANT r TO u`, `REVOKE r FROM u`, `REVOKE … FROM r` | roles held, and grants taken back |
 | `GRANT … TO public` | every user |
@@ -323,6 +324,48 @@ through the Iceberg catalog) needs every column of it. SELECT on all of a materi
 the rows its expectations left out, every column of each, in
 [`pondra.rejects`](/pondra/sql/system-tables/#flows-and-expectations): a view of
 `CHECK (region = 'EU') ON VIOLATION DROP ROW` shows its readers every non-EU row too.
+
+### A grant's rows
+
+A grant may hold some of a table's rows only: those where its condition holds. Postgres keeps such a filter
+as a policy on the table; here it is the grant's, so one statement says who reads what:
+
+```python
+admin.sql("CREATE TABLE regional (id BIGINT, region VARCHAR, owner VARCHAR)")
+admin.sql("INSERT INTO regional VALUES (1, 'eu', 'bob'), (2, 'us', 'ann'), (3, 'us', 'bob')")
+admin.sql("GRANT SELECT ON regional TO staff WHERE region = 'eu'")
+admin.sql("GRANT SELECT ON regional TO staff WHERE owner = current_user")
+print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
+admin.sql("REVOKE SELECT ON regional FROM staff WHERE region = 'eu'")
+print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
+```
+
+```text
+[{'id': 1}, {'id': 2}]
+[{'id': 2}]
+```
+
+- The condition reads its own row only: the table's columns, literals, immutable functions, and `current_user`
+  (or `current_role`, `session_user`), which is whoever reads. No subquery, aggregate, window, parameter or function
+  that may answer otherwise each time (`random()`, `now()`). It is checked when it is granted, and kept as written
+  again from its parse (`pondra.grants` shows it, in the `rows` column).
+- It is a table's, and SELECT's: on a view, a schema, every table, or for INSERT, UPDATE or DELETE it is refused.
+- A reader's grants on one table add up: the rows any of their filters holds for, and every row if one grant has
+  none. Columns add up apart from rows, as in Postgres, so a grant of other columns with no filter shows every row
+  of those columns.
+- Rows a reader may not see never reach its query: counts, sums and joins are of its rows only, and a condition
+  that would fail on a hidden row (`1 / (amount - 1)`) never fails its query. `EXPLAIN` says a grant's filter is
+  there, and doesn't show it. The planner's counts of a filtered table are unknown to its reader.
+- A stream of the whole table (Kafka, `/watch`, `/lookup`, Flight's log, another engine through the Iceberg catalog)
+  is refused to a reader a filter holds, saying to read it with SELECT.
+- A writer a filter holds changes only rows it reads: an UPDATE, DELETE or MERGE leaves a hidden row as it is, and
+  an insert of a key a hidden row holds is refused as any taken key is (23505), so that row isn't replaced. A load
+  whose rows replace their keys' rows (COPY, Flight or Kafka into a keyed table) is refused to them, naming SQL's ways,
+  and so is an INSERT into a merge table, whose rows add up by key as they're read.
+- `REVOKE … WHERE condition` takes back the grant of that filter only; `REVOKE` without one, every grant of the
+  privilege.
+- `CREATE POLICY` and `ALTER TABLE … ROW LEVEL SECURITY` are refused, naming this: a table no grant filters is read
+  whole by whoever may read it, so there is nothing to switch on.
 
 ## Secrets
 

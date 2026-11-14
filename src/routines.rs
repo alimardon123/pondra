@@ -1402,6 +1402,20 @@ mod tests {
         }
     }
 
+    /// A client's frame groups as the same query sent alone: the front regroups the request's own tree, and the
+    /// Expander each frame it inlines (11-14 audit H1).
+    #[tokio::test]
+    async fn a_frame_groups_as_the_query_sent_alone() {
+        let lake = Lake::open(&format!("memory://frames-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        let scope = crate::auth::Principal::node().scope;
+        let frame = "SELECT a IS DISTINCT FROM b OR c AS x FROM t";
+        let alone = expand(&lake, frame, &scope).await.unwrap();
+        assert!(alone.contains("(a IS DISTINCT FROM b) OR c"), "{alone}");
+        let views = HashMap::from([("f".to_string(), frame.to_string())]);
+        let via = prepare(&lake, "SELECT * FROM f", &HashMap::new(), &views, &scope).await.unwrap();
+        assert!(via.contains(&alone), "{via}");
+    }
+
     /// The statements the tokenizer reads in `text`: each `;` token's text before it, when more than whitespace and
     /// comments (None: the tokenizer refuses the text).
     fn by_the_tokenizer(text: &str) -> Option<Vec<String>> {

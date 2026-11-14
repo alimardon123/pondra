@@ -11,6 +11,20 @@ use std::collections::BTreeMap;
 /// Column (by its stored name: ADR-022) -> (min, max), each in Iceberg's single-value form.
 pub type Bounds = BTreeMap<String, (Bound, Bound)>;
 
+/// Column -> its (min, max) as values: a file's as it is written (`manifest::Seen`), a table's whole (`manifest::ranges`).
+pub type Values = BTreeMap<String, (ScalarValue, ScalarValue)>;
+
+/// Ranges as a file or a manifest keeps them: typed (`typed`: its lake is at format 8, `format::BOUNDS`, so every node
+/// reads them), else as text, which a node from before reads. A string past 64 bytes is left out either way, as `text`
+/// leaves it out: an entry stays small.
+pub fn kept(values: &Values, typed: bool) -> (Stats, Bounds) {
+    let short = |v: &ScalarValue| encode(v).filter(|b| b.len() <= 64 || !matches!(v, ScalarValue::Utf8(_) | ScalarValue::Utf8View(_) | ScalarValue::LargeUtf8(_)));
+    match typed {
+        true => (Stats::new(), values.iter().filter_map(|(c, (lo, hi))| Some((c.clone(), (Bound(short(lo)?), Bound(short(hi)?))))).collect()),
+        false => (values.iter().filter_map(|(c, (lo, hi))| Some((c.clone(), (crate::data_file::text(lo)?, crate::data_file::text(hi)?)))).collect(), Bounds::new()),
+    }
+}
+
 /// One value's bytes (`encode`), kept in a catalog entry as base64.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Bound(pub Vec<u8>);
@@ -21,8 +35,14 @@ impl Serialize for Bound {
 
 impl<'de> Deserialize<'de> for Bound {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        base64::engine::general_purpose::STANDARD.decode(s).map(Bound).map_err(serde::de::Error::custom)
+        // (decoded where it lies in the text, not copied out first: a manifest holds thousands)
+        struct Base64;
+        impl serde::de::Visitor<'_> for Base64 {
+            type Value = Bound;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a bound in base64") }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Bound, E> { base64::engine::general_purpose::STANDARD.decode(s).map(Bound).map_err(E::custom) }
+        }
+        d.deserialize_str(Base64)
     }
 }
 

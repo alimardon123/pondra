@@ -88,6 +88,7 @@ audit engine
 auth engine
 rights engine
 row_filter engine
+row_scan engine
 authored engine
 avg engine
 branch engine
@@ -265,6 +266,7 @@ hosted hosts
 idle hosts
 lib hosts
 library hosts
+sim hosts
 main hosts
 memory hosts
 memory_lake catalog

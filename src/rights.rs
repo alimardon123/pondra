@@ -166,7 +166,11 @@ impl From<Refusal> for anyhow::Error {
 }
 
 /// May `who` do `action` to `object`?
-pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusal> {
+pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusal> { may_in(who, action, object, false) }
+
+/// `may`, and `sql`: asked for SQL's own write (`may_run`), which reads the rows it changes through the writer's filters on
+/// them (`change.rs`). Every other door's UPDATE or DELETE replaces or deletes rows by their key, unread (`writer::may`).
+fn may_in(who: &Principal, action: Action, object: Object, sql: bool) -> Result<(), Refusal> {
     let superuser = who.superuser();
     // (a role first: a token's, a user's for what no grant names, and whoever isn't signed in, which sees nothing)
     let need = action.role();
@@ -197,6 +201,11 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
     // (every column and every row: a table some of whose rows its grants hide is read with SELECT, which filters them)
     if granted && action == Action::SelectAll && a.rows(privilege, &table, false).is_some() {
         return Err(Refusal::new(format!("permission denied: {table} shows {} some of its rows only (a filter on its rows in a grant): read it with SELECT", who.name)));
+    }
+    // (a load's rows replace their keys' rows or delete them, unread: a writer some of whose rows its grants hide changes them
+    // with SQL, which reads them through the filter, so it never replaces or deletes a row it can't read)
+    if granted && !sql && matches!(action, Action::Update | Action::Delete) && a.rows("select", &table, false).is_some() {
+        return Err(Refusal::new(format!("permission denied: {table} shows {} some of its rows only (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT", who.name)));
     }
     if granted {
         return Ok(());
@@ -256,7 +265,7 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
     }
     let object = if table.is_empty() { Object::Lake } else { Object::Table(&table) };
     for action in actions {
-        may(&who, action, object)?;
+        may_in(&who, action, object, true)?;
     }
     Ok(())
 }
@@ -688,6 +697,12 @@ mod tests {
         assert_eq!(said(may(&ann, Action::Select, Object::Table("t"))), "ok");
         assert_eq!(said(may(&ann, Action::SelectAll, Object::Table("t"))), "permission denied: t shows ann some of its rows only (a filter on its rows in a grant): read it with SELECT");
         assert_eq!(said(may(&as_("ann", &every), Action::SelectAll, Object::Table("t"))), "ok");
+        let writer = as_("ann", &access(vec![grant("select", t(), Some("owner = current_user")), grant("insert", t(), None), grant("update", t(), None), grant("delete", t(), None)]));
+        for action in [Action::Update, Action::Delete] {
+            assert_eq!(said(may(&writer, action, Object::Table("t"))), "permission denied: t shows ann some of its rows only (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT", "a load's rows replace or delete rows by their key, unread");
+            assert_eq!(said(may_in(&writer, action, Object::Table("t"), true)), "ok", "SQL's change reads them through the filter");
+        }
+        assert_eq!(said(may(&writer, Action::Insert, Object::Table("t"))), "ok", "a load's new rows change no row");
         assert!(!ann.scope.reads("t", ["owner"].into_iter()), "a key lookup: SQL answers it, through its filter");
         assert!(as_("ann", &plain).scope.reads("t", ["owner"].into_iter()));
     }
