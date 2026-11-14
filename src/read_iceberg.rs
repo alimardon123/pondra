@@ -39,6 +39,24 @@ impl crate::ledger::Charged for Manifests {
 /// The table at `url` (a table's folder or a metadata file), at its current snapshot or the one
 /// asked for: `version` (of its metadata), `snapshot_from_id`, `snapshot_from_timestamp`.
 /// The credentials are the table's catalog's, when it vouches for them (`catalogs::Delegated`).
+/// Iceberg's table format (`table_formats`): a table of a catalog attached `(TYPE iceberg)`, or `iceberg_scan('…')`.
+pub const FORMAT: crate::table_formats::TableFormat = crate::table_formats::TableFormat {
+    name: "iceberg",
+    abilities: &[crate::table_formats::Ability::Read, crate::table_formats::Ability::AsOf, crate::table_formats::Ability::Insert, crate::table_formats::Ability::CopyTo],
+    options: &["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
+    resolve: |lake, spec, scope| {
+        Box::pin(async move {
+            let (meta, d) = resolve(lake, &spec.urls[0], &spec.options, scope).await?;
+            Ok(crate::table_formats::Resolved {
+                vouched: d.as_ref().map(|d| d.prefix.clone()),
+                then: d.map(|d| Box::new(move |m: &mut TableMeta| crate::catalogs::rehome(&d, m)) as Box<dyn FnOnce(&mut TableMeta) + Send>), // (its files read through the table's own delegated store)
+                meta,
+            })
+        })
+    },
+    prime: Some(|lake, spec, meta, scope| Box::pin(async move { if spec.options.contains_key("namespace") { crate::catalogs::prime(lake, spec, meta, scope).await } else { Ok(()) } })),
+};
+
 pub async fn resolve(lake: &Lake, url: &str, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<(TableMeta, Option<crate::catalogs::Delegated>)> {
     let url = url.trim_end_matches('/');
     if options.contains_key("namespace") {

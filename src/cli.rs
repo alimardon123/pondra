@@ -526,12 +526,13 @@ async fn run() -> anyhow::Result<()> {
                 let on_network = on_network(&addr, [&pg, &kafka, &flight]);
                 anyhow::ensure!(auth.on() || !on_network, "a folder of lakes served on {addr} answers anyone there: set --admin-token (each database's node takes it), or listen on 127.0.0.1");
                 anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
-                // Each database's node gets the rest, as `pondra serve <lake>` would take them (and the settings given here, the
-                // tokens too, as its environment: `dbserver.rs`).
-                let node: Vec<String> = ["--flush-ms", &flush_ms.to_string(), "--task-ms", &task_ms.to_string(), "--retain-secs", &retain_secs.to_string(),
-                    "--backlog", &backlog.to_string(), "--ack", &ack, "--replicas", &replicas.to_string()].map(String::from).to_vec();
-                let options = dbserver::Options { python, tier_secs: Some(tier_secs), reader, node };
-                return dbserver::serve(dir, addr, pg, default, options, auth).await;
+                // Each database's node, in this process, gets the rest, as `pondra serve <lake>` would take them, and the
+                // settings given here (`dbserver.rs`). It listens on no port, so it is on no network of its own, and the
+                // program that started the server for itself owns it as it would own a lake's node.
+                let owner = env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16);
+                let node_auth = Arc::new(auth::Auth::new(env::get("PONDRA_READ_TOKEN"), env::get("PONDRA_WRITE_TOKEN"), env::get("PONDRA_ADMIN_TOKEN")).owned_by(owner));
+                let start = node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth: node_auth };
+                return dbserver::serve(dir, addr, pg, default, start, auth).await;
             }
             let owner = env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16); // (16 characters at least, as a library's: `library.rs`)
             if owner.is_some() && !dir.contains("://") && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {

@@ -23,8 +23,7 @@ const OP: u8 = 70;
 /// `jsonb_exists(doc, 'a')`, and `a IS DISTINCT FROM b OR c` as `(a IS DISTINCT FROM b) OR c`. Text that needs none of
 /// it (and any text neither dialect reads) comes back borrowed, as it was.
 pub fn text(sql: &str) -> Cow<'_, str> {
-    const OPERATORS: [&str; 6] = ["->", "#>", "@>", "<@", "?", "#-"];
-    if !OPERATORS.iter().any(|op| sql.contains(op)) && !distinct_from(sql) {
+    if !wanted(sql) {
         return Cow::Borrowed(sql);
     }
     let grouped = match Parser::parse_sql(&GenericDialect {}, sql) {
@@ -46,11 +45,22 @@ pub fn expression(e: &str) -> Cow<'_, str> {
     }
 }
 
+/// Whether `sql` may hold something generic groups otherwise: a JSON operator, or `IS [NOT] DISTINCT FROM`. A look
+/// before anything is parsed, here and for the front (`front::expand`, which groups every form's and dialect's tree).
+pub(crate) fn wanted(sql: &str) -> bool {
+    const OPERATORS: [&str; 6] = ["->", "#>", "@>", "<@", "?", "#-"];
+    OPERATORS.iter().any(|op| sql.contains(op)) || distinct_from(sql)
+}
+
 /// The statements with each JSON operator and each `IS [NOT] DISTINCT FROM` regrouped where Postgres groups it
-/// differently. None when none was. (The walk visits an expression after its operands, so an inner one is regrouped first.)
-fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> {
+/// differently. None when none was.
+fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> { regroup(&mut stmts).then(|| written(&stmts)) }
+
+/// `regrouped` in place, on a tree whichever dialect read (the front's: generic's, or the fallback's for FROM first).
+/// Whether any was. (The walk visits an expression after its operands, so an inner one is regrouped first.)
+pub(crate) fn regroup(stmts: &mut Vec<ast::Statement>) -> bool {
     let mut moved = false;
-    let _ = crate::walk::visit_expressions_mut(&mut stmts, |e| {
+    let _ = crate::walk::visit_expressions_mut(stmts, |e| {
         if is_json_op(e) {
             moved |= regroup_at(e);
         } else {
@@ -58,7 +68,14 @@ fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> {
         }
         ControlFlow::<()>::Continue(())
     });
-    moved.then(|| written(&stmts))
+    moved
+}
+
+/// The front's look for `regroup` (`passes.rs`): a text that may hold what generic groups otherwise.
+pub(crate) fn pass() -> crate::passes::Pass {
+    use crate::passes::{Pass, Run};
+    let marks: Vec<&'static [&'static str]> = vec![&["->"], &["#>"], &["@>"], &["<@"], &["?"], &["#-"]];
+    Pass { name: "grouping.regroups", order: 85, words: vec!["distinct"], marks, run: Run::Wants(wanted) }
 }
 
 /// Text with a `?`, `?|` or `?&`, read as Postgres's dialect reads it (so its JSON operators are grouped right).
@@ -265,13 +282,21 @@ fn map_last(e: ast::Expr, f: impl FnOnce(ast::Expr) -> ast::Expr) -> ast::Expr {
 /// Postgres's rank of `IS` (with `ISNULL` and `NOTNULL`), which `IS [NOT] DISTINCT FROM` takes.
 const IS: u8 = 40;
 
-/// Whether the text has `DISTINCT FROM`, in any case and with any space between: only such text is parsed for it.
+/// Whether the text has `IS [NOT] DISTINCT FROM`, in any case and with any space between: only such text is parsed for
+/// it. (`SELECT DISTINCT * FROM t` has a DISTINCT before a FROM too, and isn't: 11-10 audit L8.)
 fn distinct_from(sql: &str) -> bool {
-    let mut after_distinct = false;
+    // (how far into `IS [NOT] DISTINCT FROM` the words so far reach: 1 after IS, 2 after NOT, 3 after DISTINCT)
+    let mut reached = 0;
     sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).any(|w| {
-        let hit = after_distinct && w.eq_ignore_ascii_case("from");
-        after_distinct = w.eq_ignore_ascii_case("distinct");
-        hit
+        let is = |word: &str| w.eq_ignore_ascii_case(word);
+        reached = match reached {
+            1 if is("not") => 2,
+            1 | 2 if is("distinct") => 3,
+            3 if is("from") => return true,
+            _ if is("is") => 1,
+            _ => 0,
+        };
+        false
     })
 }
 
@@ -443,6 +468,22 @@ mod tests {
         assert!(matches!(text("SELECT (a IS DISTINCT FROM b) OR c FROM t"), Cow::Borrowed(_)));
         assert!(matches!(text("SELECT DISTINCT a FROM t WHERE a OR b"), Cow::Borrowed(_)), "SELECT DISTINCT is no DISTINCT FROM");
         assert!(!distinct_from("SELECT DISTINCT from_date FROM t") && distinct_from("a IS NOT DISTINCT/**/FROM b"));
+        assert!(!distinct_from("SELECT DISTINCT * FROM t") && !distinct_from("SELECT DISTINCT ON (a) a FROM t"), "no IS before it (11-10 audit L8)");
+        assert!(!distinct_from("SELECT a IS NOT NULL, DISTINCT FROM t") && distinct_from("x is\n distinct from y"));
+    }
+
+    /// A tree only the fallback dialect reads (FROM first) is regrouped as generic's is: `text` hands such text back as it
+    /// was, so the front groups the tree it read (`front::expand`), in every form (11-10 audit H3).
+    #[test]
+    fn a_tree_the_fallback_read_is_regrouped() {
+        let sql = "SELECT [x FOR x IN l] AS d, a IS DISTINCT FROM b OR c FROM t";
+        assert!(crate::parsed::generic(sql).is_err() && matches!(text(sql), Cow::Borrowed(_)) && wanted(sql), "generic can't read it; the front's look can");
+        let mut stmts = crate::parsed::read(sql).unwrap();
+        assert!(regroup(&mut stmts));
+        assert!(written(&stmts).contains("(a IS DISTINCT FROM b) OR c"), "{}", written(&stmts));
+        let mut again = crate::parsed::read(&written(&stmts)).unwrap();
+        assert!(!regroup(&mut again), "its print reads grouped");
+        assert!(!wanted("SELECT DISTINCT * FROM t"));
     }
 
     /// Each grouping answers as DuckDB 2.0 does, run: with booleans the old reading answered otherwise, with no error.

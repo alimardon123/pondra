@@ -110,6 +110,7 @@ expander engine
 explain engine
 ext engine
 ext_names engine
+table_formats engine
 facts engine
 find engine
 finish engine
