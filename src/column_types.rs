@@ -18,7 +18,7 @@ pub struct ColumnType {
     /// Its name, as a column's record keeps it (`Col::held`) and the mark says it, lower case.
     pub name: &'static str,
     /// Its Arrow extension name: Arrow's canonical one where its storage is the canonical one's (`arrow.json`), else
-    /// `pondra.<name>`. Written on what leaves Pondra once the column record keeps the full type (5-TY-b).
+    /// `pondra.<name>`. `mark` writes it beside the mark.
     pub extension: &'static str,
     /// What its files hold, of its parameters (none yet). (Read once the column record keeps the full type, 5-TY-b.)
     #[allow(dead_code)]
@@ -65,10 +65,16 @@ pub fn named(name: &str) -> Option<&'static ColumnType> {
 /// The column type a field is marked with (`mark`), if any.
 pub fn of(field: &Field) -> Option<&'static ColumnType> { field.metadata().get(MARK).and_then(|n| named(n)) }
 
-/// `field` marked as a column of `t`, its other metadata kept.
+/// The field metadata Arrow names an extension type by (`arrow_schema::extension::EXTENSION_TYPE_NAME_KEY`): Parquet,
+/// IPC and Flight keep it, and pyarrow and DuckDB read a canonical one (`arrow.json`) as its type.
+pub const EXTENSION: &str = "ARROW:extension:name";
+
+/// `field` marked as a column of `t`, by its name (`MARK`) and its Arrow extension name (`EXTENSION`), its other metadata
+/// kept: so a file or an answer a marked column goes out in says its type to other readers too.
 pub fn mark(field: Field, t: &ColumnType) -> Field {
     let mut meta = field.metadata().clone();
     meta.insert(MARK.into(), t.name.into());
+    meta.insert(EXTENSION.into(), t.extension.into());
     field.with_metadata(meta)
 }
 
@@ -104,6 +110,7 @@ mod tests {
             let marked = mark(field, t);
             assert_eq!(of(&marked).map(|t| t.name), Some(name));
             assert_eq!(marked.metadata().get("x").map(String::as_str), Some("y"), "{name}: its other metadata kept");
+            assert_eq!(marked.metadata().get(EXTENSION).map(String::as_str), Some(t.extension), "{name}: its Arrow extension name");
         }
         assert_eq!(named("json").map(|t| t.extension), Some("arrow.json"));
         assert!(named("varchar(3)").is_none() && of(&Field::new("c", DataType::Utf8, true)).is_none());
