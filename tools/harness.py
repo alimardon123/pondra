@@ -544,8 +544,10 @@ def external():
     # a DELETE of an attached Delta table read "no table" with its path.
     placed = err(f"CREATE TABLE placed (id BIGINT) LOCATION '{here}/placed/'")
     q(f"COPY (SELECT 1 AS id) TO '{here}/wh/s/t/' (FORMAT delta)"); q(f"ATTACH '{here}/wh' AS wh (TYPE delta)")
-    checks["CREATE TABLE … LOCATION refused by name, nothing made; DELETE of an attached Delta table refused by name"] = "LOCATION" in placed and "not found" in err("SELECT * FROM placed") \
-        and "another engine's table" in err("DELETE FROM wh.s.t WHERE id = 1") and q("SELECT count(*) AS n FROM wh.s.t") == [{"n": 1}]
+    said = {k: err(s) for k, s in {"DELETE": "DELETE FROM wh.s.t WHERE id = 1", "UPDATE": "UPDATE wh.s.t SET id = 2"}.items()}  # (the body as bytes: … escaped)
+    checks["CREATE TABLE … LOCATION refused by name, nothing made; DELETE and UPDATE of an attached Delta table refused saying what its format takes"] = "LOCATION" in placed and "not found" in err("SELECT * FROM placed") \
+        and all("another engine's table (delta), of which Pondra takes reads, AT, INSERT, COPY" in e and f"TO; {k}: not yet" in e for k, e in said.items()) \
+        and q("SELECT count(*) AS n FROM wh.s.t") == [{"n": 1}]
     q("DETACH wh")
     # The lake's own files (PUT /files/…) are the lake's: whoever reads the lake reads them as a
     # table too, and nothing else of its folder (ADR-032); /objects says what each object is.
