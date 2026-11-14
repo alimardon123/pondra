@@ -1,0 +1,6 @@
++63_800
+
+The module's code order, not its code (#798, audit 11-10 H2: morsels leave whole the files their source reads only
+from the start). Into main's 541d32b (measured on CI): its wasm 375 B and its gzip 30 B over main's (59,455,665 and
+15,638,872), its brotli 61.7 KB over (9,394,092 against 9,332,367), as #709's was: brotli's window finds fewer
+matches when the same code lands in another order. Plus the room above main back to 3 KB, which was 0.9 KB.

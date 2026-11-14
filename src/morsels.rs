@@ -1,6 +1,6 @@
 //! A scan's files cut into morsels, which its partitions take from one queue as each gets free.
 //!
-//! DataFusion reads a Parquet scan's ranges from one queue that every partition takes from (`enable_file_stream_work_stealing`),
+//! DataFusion reads a file scan's ranges from one queue that every partition takes from (`enable_file_stream_work_stealing`),
 //! but it cuts the files into only as many ranges as there are partitions, one each. A partition whose range holds more
 //! of the work then finishes last while the other cores wait: when a filter keeps a stretch of a file sorted by date,
 //! one range holds all of it. Cut into a few morsels a partition, a partition that gets free takes the next one, as
@@ -10,7 +10,7 @@
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::Result;
-use datafusion::datasource::physical_plan::{FileGroup, FileGroupPartitioner, FileScanConfig, FileScanConfigBuilder};
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder, FileSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
@@ -53,7 +53,9 @@ impl PhysicalOptimizerRule for Morsels {
 /// The scan's ranges cut finer, as many groups as it had (its partitions), each a run of neighbouring morsels (the
 /// queue is the groups one after another, so the files are read in order); or `None` where its partitions may not
 /// share: a scan that keeps its files' order, or whose groups are the plan's partitioning, or a file read with a
-/// selection of its own (a table's deletes), or one too small to be worth it.
+/// selection of its own (a table's deletes), or one too small to be worth it. The files' own source cuts them, as it
+/// cuts DataFusion's own ranges, so a file it reads only from its start stays whole: a compressed CSV or JSON file, a
+/// CSV with newlines in its values, an Arrow stream (each refused its ranges at the read, the 11-10 audit's H2).
 fn finer(files: &FileScanConfig) -> Option<Vec<FileGroup>> {
     let parts = files.file_groups.len();
     if parts < 2 || files.preserve_order || files.output_partitioning.is_some() || !files.output_ordering.is_empty() {
@@ -68,14 +70,7 @@ fn finer(files: &FileScanConfig) -> Option<Vec<FileGroup>> {
     if morsels <= all.len() {
         return None;
     }
-    let cut: Vec<_> = FileGroupPartitioner::new()
-        .with_target_partitions(morsels)
-        .with_repartition_file_min_size(0)
-        .with_preserve_order_within_groups(false)
-        .repartition_file_groups(&files.file_groups)?
-        .into_iter()
-        .flat_map(FileGroup::into_inner)
-        .collect();
+    let cut: Vec<_> = files.file_source.repartitioned(morsels, 0, None, files).ok()??.file_groups.into_iter().flat_map(FileGroup::into_inner).collect();
     (cut.len() >= parts).then(|| (0..parts).map(|i| FileGroup::new(cut[i * cut.len() / parts..(i + 1) * cut.len() / parts].to_vec())).collect())
 }
 
@@ -84,12 +79,20 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::datasource::physical_plan::ParquetSource;
+    use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+    use datafusion::datasource::physical_plan::{ArrowSource, CsvSource, ParquetSource};
     use datafusion::execution::object_store::ObjectStoreUrl;
 
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]))
+    }
+
     fn scan(groups: Vec<Vec<PartitionedFile>>) -> FileScanConfig {
-        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
-        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(ParquetSource::new(schema))).with_file_groups(groups.into_iter().map(FileGroup::new).collect()).build()
+        scan_of(Arc::new(ParquetSource::new(schema())), FileCompressionType::UNCOMPRESSED, groups)
+    }
+
+    fn scan_of(source: Arc<dyn FileSource>, compression: FileCompressionType, groups: Vec<Vec<PartitionedFile>>) -> FileScanConfig {
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source).with_file_compression_type(compression).with_file_groups(groups.into_iter().map(FileGroup::new).collect()).build()
     }
 
     /// Each file's ranges, in the order the queue holds them.
@@ -140,5 +143,18 @@ mod tests {
         let mut selected = PartitionedFile::new("a.parquet", 1 << 30);
         selected.extensions.insert(1u8);
         assert!(finer(&scan(vec![vec![selected], vec![PartitionedFile::new("b.parquet", 1 << 30)]])).is_none(), "a file read with its own selection");
+    }
+
+    /// Three big files, each a group: what a scan of a compressed CSV or JSON folder looks like on 3 cores.
+    fn three() -> Vec<Vec<PartitionedFile>> {
+        (0..3).map(|i| vec![PartitionedFile::new(format!("f{i}"), 300 << 20)]).collect()
+    }
+
+    #[test]
+    fn files_read_only_from_their_start_stay_whole() {
+        assert!(finer(&scan_of(Arc::new(CsvSource::new(schema())), FileCompressionType::UNCOMPRESSED, three())).is_some(), "a plain CSV is cut");
+        assert!(finer(&scan_of(Arc::new(CsvSource::new(schema())), FileCompressionType::GZIP, three())).is_none(), "a gzipped CSV");
+        assert!(finer(&scan_of(Arc::new(ArrowSource::new_file_source(schema())), FileCompressionType::UNCOMPRESSED, three())).is_some(), "an Arrow file is cut");
+        assert!(finer(&scan_of(Arc::new(ArrowSource::new_stream_file_source(schema())), FileCompressionType::UNCOMPRESSED, three())).is_none(), "an Arrow stream");
     }
 }
