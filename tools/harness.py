@@ -7423,6 +7423,13 @@ def writes():
         shaped == [{"id": 7, "score": 0.5}, {"id": 8, "score": 1.5}] and read == [{"id": 7, "score": 0.5}, {"id": 8, "score": 1.5}]
     q("CREATE OR REPLACE TABLE swapped AS SELECT 3 AS id", port=A.port + 1)  # (Pondra's own, on a follower: its staged table made by the leader for it)
     checks["CREATE OR REPLACE TABLE through a follower"] = until(lambda: q("SELECT * FROM swapped", port=A.port + 1), [{"id": 3}], 30) == [{"id": 3}]
+    # (a keyed table replaced with rows: the staged table's rows are asked of the table it replaces, which no user may write)
+    q("CREATE TABLE kswap (k BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'iceberg')")
+    until(lambda: _try(lambda: cat.load_table("default.kswap")) is not None, True, 30)
+    tk = cat.load_table("default.kswap")
+    keyed = pa.schema([pa.field("k", pa.int64(), nullable=False), pa.field("v", pa.string())])
+    as_replace(tk, lambda tx: tx.append(pa.table({"k": [1, 2], "v": ["x", "y"]}, schema=keyed)))
+    checks["a keyed table replaced with rows through the catalog: the new rows"] = q("SELECT k, v FROM kswap ORDER BY k") == [{"k": 1, "v": "x"}, {"k": 2, "v": "y"}]
     checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
