@@ -279,8 +279,12 @@ async fn carry(lake: &Lake, table: &str, meta: &TableMeta, c: &FileCommit) -> Re
     use crate::lake_scan::deleted_rows;
     use crate::scan::Delete;
     let mut live = meta.files.clone();
-    for m in crate::manifest::list(lake, meta).await? {
-        live.extend(crate::manifest::files(lake, &m).await?.iter().cloned());
+    // Sealed files' records are read only when a file named is not one of the open ones: an INSERT,
+    // which names none, reads no manifest (with thousands of sealed files, that was most of its commit).
+    if c.removed.iter().chain(c.deleted.iter().map(|d| &d.0)).any(|p| !meta.files.iter().any(|f| &f.path == p)) {
+        for m in crate::manifest::list(lake, meta).await? {
+            live.extend(crate::manifest::files(lake, &m).await?.iter().cloned());
+        }
     }
     let here = |p: &str| live.iter().any(|f| f.path == p);
     let old = |p: &str| meta.replaced.iter().find(|f| f.path == p).cloned().with_context(|| format!("{}: {p} is no longer {table}'s (removed since the writer read it)", crate::iceberg::CONFLICT));

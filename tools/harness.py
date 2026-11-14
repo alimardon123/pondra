@@ -544,8 +544,10 @@ def external():
     # a DELETE of an attached Delta table read "no table" with its path.
     placed = err(f"CREATE TABLE placed (id BIGINT) LOCATION '{here}/placed/'")
     q(f"COPY (SELECT 1 AS id) TO '{here}/wh/s/t/' (FORMAT delta)"); q(f"ATTACH '{here}/wh' AS wh (TYPE delta)")
-    checks["CREATE TABLE … LOCATION refused by name, nothing made; DELETE of an attached Delta table refused by name"] = "LOCATION" in placed and "not found" in err("SELECT * FROM placed") \
-        and "another engine's table" in err("DELETE FROM wh.s.t WHERE id = 1") and q("SELECT count(*) AS n FROM wh.s.t") == [{"n": 1}]
+    said = {k: err(s) for k, s in {"DELETE": "DELETE FROM wh.s.t WHERE id = 1", "UPDATE": "UPDATE wh.s.t SET id = 2"}.items()}  # (the body as bytes: … escaped)
+    checks["CREATE TABLE … LOCATION refused by name, nothing made; DELETE and UPDATE of an attached Delta table refused saying what its format takes"] = "LOCATION" in placed and "not found" in err("SELECT * FROM placed") \
+        and all("another engine's table (delta), of which Pondra takes reads, AT, INSERT, COPY" in e and f"TO; {k}: not yet" in e for k, e in said.items()) \
+        and q("SELECT count(*) AS n FROM wh.s.t") == [{"n": 1}]
     q("DETACH wh")
     # The lake's own files (PUT /files/…) are the lake's: whoever reads the lake reads them as a
     # table too, and nothing else of its folder (ADR-032); /objects says what each object is.
@@ -7423,6 +7425,13 @@ def writes():
         shaped == [{"id": 7, "score": 0.5}, {"id": 8, "score": 1.5}] and read == [{"id": 7, "score": 0.5}, {"id": 8, "score": 1.5}]
     q("CREATE OR REPLACE TABLE swapped AS SELECT 3 AS id", port=A.port + 1)  # (Pondra's own, on a follower: its staged table made by the leader for it)
     checks["CREATE OR REPLACE TABLE through a follower"] = until(lambda: q("SELECT * FROM swapped", port=A.port + 1), [{"id": 3}], 30) == [{"id": 3}]
+    # (a keyed table replaced with rows: the staged table's rows are asked of the table it replaces, which no user may write)
+    q("CREATE TABLE kswap (k BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'iceberg')")
+    until(lambda: _try(lambda: cat.load_table("default.kswap")) is not None, True, 30)
+    tk = cat.load_table("default.kswap")
+    keyed = pa.schema([pa.field("k", pa.int64(), nullable=False), pa.field("v", pa.string())])
+    as_replace(tk, lambda tx: tx.append(pa.table({"k": [1, 2], "v": ["x", "y"]}, schema=keyed)))
+    checks["a keyed table replaced with rows through the catalog: the new rows"] = q("SELECT k, v FROM kswap ORDER BY k") == [{"k": 1, "v": "x"}, {"k": 2, "v": "y"}]
     checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
@@ -11035,7 +11044,7 @@ def server():
     found as such, or named so (`--lakes`). psql and HTTP reach each by name, and queries join
     across them; the console is at `/`; CREATE DATABASE makes one, and DROP DATABASE keeps one to be
     undropped (PURGE deletes it); a database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
-    database's node gets `pondra serve`'s options; a connection open (or a request in flight)
+    database's node runs in the server's own process (no child processes) and gets `pondra serve`'s options; a connection open (or a request in flight)
     keeps its database's node running; another node joins a database's cluster through
     the server; the server killed and started again serves the same databases; each database signs
     in on its own (a grant in one covers none of the others, an open one opens nothing of another);
@@ -11065,11 +11074,13 @@ def server():
     checks["the folder's lakes are its databases, none running until used"] = running() == {"crm": False, "lake": False, "sales": False}
     checks["psql and HTTP reach each database by name; no /db/ means the default (lake)"] = pq("sales", "SELECT sum(amount) FROM orders") == [(30.5,)] \
         and call(port, "POST", "/db/crm/sql", b"SELECT name FROM customers ORDER BY id") == [{"name": "ann"}, {"name": "bob"}] and call(port, "POST", "/sql", b"SELECT text FROM notes") == [{"text": "hi"}]
-    nodes_of = lambda: [p for p in subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
-                        if os.path.exists(f"/proc/{p}/cmdline") and "--attach-found" in open(f"/proc/{p}/cmdline").read() and folder in open(f"/proc/{p}/cmdline").read()]
-    # (a setting given to serve reaches each database's node as its environment, `env::given`; the other flags on its command line)
-    environ = lambda p: dict(kv.split("=", 1) for kv in open(f"/proc/{p}/environ").read().split("\0") if "=" in kv)
-    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = bool(nodes_of()) and all(environ(p).get("PONDRA_MEMORY_GB") == "1.5" for p in nodes_of())
+    # (each database's node is in the server's process, invariant 301: the server starts no child, and a setting given to
+    # serve is each node's, as its own /metrics says)
+    children = lambda: subprocess.run(["pgrep", "-P", str(srv.pid)], capture_output=True, text=True).stdout.split()
+    up = [d for d, r in running().items() if r]
+    checks["the databases' nodes run in the server's own process: it starts no child"] = len(up) >= 2 and children() == []
+    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = \
+        all(metrics_of(port, path=f"/db/{d}/metrics").get("pondra_memory_limit_bytes") == int(1.5 * (1 << 30)) for d in up)
     checks["a query joins across databases (name.schema.table)"] = pq("sales", "SELECT c.name, o.amount FROM orders o JOIN crm.customers c ON c.id = o.id ORDER BY o.id") == [("ann", 10.5), ("bob", 20.0)]
     checks["the console is at /"] = b"<html" in call(port, "GET", "/").lower() or b"<!doctype html" in call(port, "GET", "/").lower()
     pq("sales", "CREATE DATABASE hr")
@@ -11172,6 +11183,19 @@ def server():
     top = {"Authorization": "Basic " + base64.b64encode(b"top:top-password-1").decode()}
     checks["one of the nodes' tokens reads another database; a superuser of this one doesn't"] = until(lambda: _try(lambda: call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM hr.people", headers=tk)), [{"n": 1}], 15) == [{"n": 1}] \
         and "hr signs in on its own" in _raises_text(lambda: call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM hr.people", headers=top))
+    # (11-10 audit H1: the node's own work is not whoever runs the nodes, so a task made with a token, its tick the node's
+    # own, reads nothing of a database that signs in on its own; whoever made the task may be anyone)
+    call(port + 3, "POST", "/sql", b"CREATE TABLE copied (id BIGINT)", headers=tk)
+    call(port + 3, "POST", "/sql", b"CREATE TASK peek SCHEDULE '1 second' AS INSERT INTO copied SELECT id FROM hr.people", headers=tk)
+    peek = []
+    for _ in range(100):  # (a tick a second: its failed run within 30 s)
+        peek = _try(lambda: call(port + 3, "POST", "/sql", b"SELECT status, error FROM pondra.runs WHERE routine = 'peek' AND status = 'failed' LIMIT 1", headers=tk)) or []
+        if peek:
+            break
+        time.sleep(0.3)
+    call(port + 3, "POST", "/sql", b"DROP TASK peek", headers=tk)
+    checks["a task's tick is the node's own, not whoever runs the nodes: it reads nothing of a database that signs in on its own (11-10 audit H1)"] = \
+        bool(peek) and "hr signs in on its own" in str(peek[0]["error"]) and call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM copied", headers=tk) == [{"n": 0}]
     tokened.kill()
     refused = subprocess.run([BIN, "serve", folder, "--addr", f"127.0.0.1:{port + 5}", "--flight", "127.0.0.1:1"], capture_output=True, text=True, timeout=30)
     checks["--flight is refused by name (a Flight port is one lake's)"] = refused.returncode != 0 and "one lake" in refused.stderr
@@ -16446,6 +16470,7 @@ def waits():
 
     # READ ONLY, per transaction and by default.
     c5 = pg()
+    c5.execute("CREATE SEQUENCE ro_seq")
     c5.execute("BEGIN READ ONLY")
     ro = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
     ro_next = code(c5, "SELECT 1")  # (Postgres aborts the transaction too)
@@ -16463,6 +16488,15 @@ def waits():
     via_set = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
     checks["READ ONLY: a write refused (25006) and ends the transaction (25P02 after); default_transaction_read_only refuses writes outside one; SHOW says so"] = \
         ro == "25006" and ro_next == "25P02" and ro_read == 1000 and shown_ro == "on" and default_ro == "on" and outside == "25006" and wrote == "ok" and via_set == "25006"
+    # (11-10 audit M3: a sequence's move is a write, though a SELECT says it: refused 25006 by default and in READ ONLY)
+    seq_default = code(c5, "SELECT nextval('ro_seq')")
+    c5.execute("SET default_transaction_read_only = off")
+    c5.execute("BEGIN READ ONLY")
+    seq_in = code(c5, "SELECT setval('ro_seq', 100)")
+    c5.execute("ROLLBACK")
+    seq_after = c5.execute("SELECT nextval('ro_seq')").fetchone()[0]
+    checks["READ ONLY moves no sequence: nextval under default_transaction_read_only and setval in BEGIN READ ONLY are refused 25006, and the next nextval is the first (11-10 audit M3)"] = \
+        seq_default == "25006" and seq_in == "25006" and seq_after == 1
 
     # Eight clients on both nodes, READ COMMITTED: transfers wait for each other's rows (and deadlocks
     # are refused, and retried); none is refused with 40001, and the total is kept.
@@ -27768,9 +27802,11 @@ def dialects():
         got = {w: {"http": [r["id"] for r in q(f"SELECT id FROM dfg WHERE {w} ORDER BY id")],
                    "port": [r[0] for r in conn.execute(f"SELECT id FROM dfg WHERE {w} ORDER BY id").fetchall()]} for w in loose}
     got["the view"] = [r["id"] for r in q("SELECT id FROM dfv ORDER BY id")]
+    # (FROM first: text only the fallback dialect reads, grouped by the front on its tree, as a page groups any, 11-10 audit H3)
+    got["from first"] = {w: [r["id"] for r in q(f"FROM dfg SELECT id WHERE {w} ORDER BY id")] for w in loose}
     info["IS DISTINCT FROM before AND and OR"] = got
-    checks["IS [NOT] DISTINCT FROM before AND or OR compares only what Postgres compares: DuckDB 2.0's rows over HTTP, the port and a view"] = \
-        all(got[w] == {"http": want, "port": want} for w, want in loose.items()) and got["the view"] == [1, 3, 4]
+    checks["IS [NOT] DISTINCT FROM before AND or OR compares only what Postgres compares: DuckDB 2.0's rows over HTTP, the port, a view and FROM first"] = \
+        all(got[w] == {"http": want, "port": want} for w, want in loose.items()) and got["the view"] == [1, 3, 4] and got["from first"] == loose
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))

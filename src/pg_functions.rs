@@ -21,8 +21,7 @@ use std::sync::Arc;
 // ---------------------------------------------------------------- the builder
 // (how a function meets DataFusion: every Postgres function the core registers is made with these)
 
-/// The field metadata that marks an answer's column with its Postgres type (`uuid`, `json`, `jsonb`): the port reads it, other doors pass it by.
-pub const MARK: &str = "pg_type";
+pub use crate::store::MARK;
 
 type Body = dyn Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync;
 

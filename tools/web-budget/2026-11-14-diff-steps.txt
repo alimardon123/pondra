@@ -1,0 +1,6 @@
++6000
+
+Trellis T1c and T2 (#774): `pondra.diff`'s `data => 'db'` and `pondra.diff_steps`, on the page as in every form. On the
+train with main through #773 and #788 (budget 9,333,300): its wasm 59,494,942 and its brotli 9,336,071, 3.7 KB over the
+9,332,367 #773's run measured for main (wasm 59,455,290), which had left 0.9 KB of room. This raise keeps 3.2 KB of room
+above the module, as the README asks.

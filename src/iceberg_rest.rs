@@ -115,7 +115,7 @@ async fn create_namespace(axum::extract::State(app): axum::extract::State<crate:
     let [s] = &parts[..] else {
         return Err(bad(format!("namespace {}: a schema of this database is one part; an attached database's schemas are made by its own nodes", parts.join("."))));
     };
-    as_caller(&app, &who, &format!("CREATE SCHEMA {}", quoted(s)), false).await?;
+    as_caller(&app, &who, &format!("CREATE SCHEMA {}", quoted(s)), Doing::Other).await?;
     Ok(axum::Json(json!({"namespace": parts, "properties": {}})))
 }
 
@@ -126,7 +126,7 @@ async fn drop_namespace(axum::extract::State(app): axum::extract::State<crate::a
     if !std::sync::Arc::ptr_eq(&lake, &app.lake) {
         return Err(bad(format!("namespace {} is {}'s, an attached database: its schemas are dropped by its own nodes", parts.join("."), parts[0])));
     }
-    as_caller(&app, &who, &format!("DROP SCHEMA {}", quoted(&schema)), true).await?;
+    as_caller(&app, &who, &format!("DROP SCHEMA {}", quoted(&schema)), Doing::DropNamespace).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -157,25 +157,55 @@ fn sql_name(app: &crate::app::App, parts: &[String], lake: &std::sync::Arc<Lake>
 
 /// A statement for the catalog's table changes, run as the caller (DDL: an admin's). `drops_namespace`: the namespace DELETE route, whose
 /// 2BP01 is a namespace that isn't empty.
-async fn as_caller(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, drops_namespace: bool) -> Result<(), Refusal> { as_job(app, who, sql, drops_namespace, None).await }
+async fn as_caller(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, doing: Doing) -> Result<(), Refusal> { as_job(app, who, sql, doing, None).await }
 
 /// …as a job: a table it makes is the job's (`made_by`).
-async fn as_job(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, drops_namespace: bool, job: Option<String>) -> Result<(), Refusal> {
+async fn as_job(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, doing: Doing, job: Option<String>) -> Result<(), Refusal> {
     let (shows, who) = (who.scope.shows_code(), crate::routines::Who::signed(who.clone(), who.role, false));
-    Box::pin(crate::routines::one(app, sql, who, job)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::codes::told(&e, shows), drops_namespace))
+    Box::pin(crate::routines::one(app, sql, who, job)).await.map(|_| ()).map_err(|e| exception(crate::codes::of(&e), crate::codes::told(&e, shows), doing))
+}
+
+/// What a door's statement is to the engine that asked: a table's commit (an `updateTable`, a transaction's), a
+/// namespace's drop, or anything else (a namespace or table made, dropped or renamed), whose 409 an engine reads as
+/// AlreadyExists or NamespaceNotEmpty.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Doing {
+    Commit,
+    DropNamespace,
+    Other,
 }
 
 /// An error as the Iceberg REST catalog answers it: its exception by the error's SQLSTATE (`codes::kind`), the message as
-/// said. Something still depending on it is a namespace that isn't empty when the namespace is what's dropped.
-fn exception(code: &str, words: String, drops_namespace: bool) -> Refusal {
+/// said. Something still depending on it is a namespace that isn't empty when the namespace is what's dropped. On a
+/// commit, a statement to try again (a serialization failure) is a 409, which an engine retries; one whose outcome isn't
+/// known (an internal error, the leader cut off or silent, a timeout) a 500, CommitStateUnknownException: an engine
+/// deletes the files it wrote on any other error, and a commit that was taken with its answer lost would name deleted
+/// files. Elsewhere a 409 would say the name exists, so one to try again is a 503 and an internal error a 500 (11-14
+/// audit L2).
+fn exception(code: &str, words: String, doing: Doing) -> Refusal {
     use crate::codes::Kind;
     match (crate::codes::kind(code), code) {
         (Kind::Denied, _) => refused(403, "ForbiddenException", words),
         (Kind::Exists, _) => refused(409, "AlreadyExistsException", words),
-        (_, "2BP01") if drops_namespace => refused(409, "NamespaceNotEmptyException", words),
+        (_, "2BP01") if doing == Doing::DropNamespace => refused(409, "NamespaceNotEmptyException", words),
         (_, "3F000") => refused(404, "NoSuchNamespaceException", words),
         (_, "42P01") => refused(404, "NoSuchTableException", words),
+        (Kind::Retry | Kind::Unavailable | Kind::Timeout, _) if doing != Doing::Commit => refused(503, "ServiceUnavailableException", words),
+        (Kind::Internal, _) if doing != Doing::Commit => refused(500, "ServiceFailureException", words),
+        (Kind::Retry, _) => refused(409, "CommitFailedException", words),
+        (Kind::Internal | Kind::Unavailable | Kind::Timeout, _) => refused(500, "CommitStateUnknownException", words),
         _ => bad(words),
+    }
+}
+
+/// A commit whose outcome wasn't known (500, CommitStateUnknownException) once the server has undone what it made of it: the
+/// table its staged create made dropped and purged, or a replace's staged table gone. Nothing of it stays, so the engine
+/// is answered the failure as known, a 409 it sends again, and keeps no file nothing names (11-14 audit L3).
+fn undone(r: Refusal, what: &str) -> Refusal {
+    let unknown = r.0.as_u16() == 500 && r.1 .0["error"]["type"] == "CommitStateUnknownException";
+    match unknown {
+        true => refused(409, "CommitFailedException", format!("{}; {what}, so nothing of the commit stays: send it again", r.1 .0["error"]["message"].as_str().unwrap_or_default())),
+        false => r,
     }
 }
 
@@ -200,7 +230,7 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>
         let folder = crate::ddl::free_folder(&lake, &name).await.map_err(|e| bad(crate::ext::said(&e)))?.unwrap_or_else(|| name.clone()); // (as CREATE TABLE picks it)
         return Ok(axum::Json(json!({"metadata": staged(&lake.full(&format!("data/{folder}")), &asked), "config": {}})));
     }
-    as_caller(&app, &who, &sql, false).await?;
+    as_caller(&app, &who, &sql, Doing::Other).await?;
     for _ in 0..600 {
         if let Ok(v) = loaded(&lake, &name).await {
             return Ok(axum::Json(v)); // (its first version: published by the leader's next round)
@@ -266,10 +296,11 @@ fn assigned(asked: &Value) -> Option<&str> { asked["updates"].as_array()?.iter()
 /// were written, when they fit the table: no copy). If they can't be, the table is dropped again, so the statement
 /// leaves nothing.
 async fn made(app: &crate::app::App, who: &crate::auth::Principal, target: &str, lake: &std::sync::Arc<Lake>, name: &str, table: &str, asked: &Value, retried: bool) -> Reply {
+    // (made as the job its uuid names, so the table keeps the uuid the engine was given, or a new one: `iceberg::publish`)
+    let job = format!("{}{}", crate::iceberg::MADE, assigned(asked).map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string));
     if !retried {
-        // (made as the job its uuid names, so the table keeps the uuid the engine was given: `iceberg::publish`)
         let sql = create_sql(target, &staged_request(table, asked)).map_err(|e| bad(crate::ext::said(&e)))?;
-        as_job(app, who, &sql, false, assigned(asked).map(|u| format!("{}{u}", crate::iceberg::MADE))).await?;
+        as_job(app, who, &sql, Doing::Commit, Some(job.clone())).await?;
     }
     let mut current = None;
     for _ in 0..600 {
@@ -289,8 +320,19 @@ async fn made(app: &crate::app::App, who: &crate::auth::Principal, target: &str,
         Ok(None) => Ok(current),
         Err(e) => Err(e),
     };
+    let mut taken = taken;
     if taken.is_err() && !retried {
-        let _ = as_caller(app, who, &format!("DROP TABLE {target}"), false).await; // (all or nothing, as a CREATE TABLE … AS SELECT)
+        // (all or nothing, as a CREATE TABLE … AS SELECT: dropped as a statement drops the table it made, `write::made_drop`:
+        // purged, and only while it is the one this job made. Named as the SQL names it, so a table of an attached lake too)
+        if let Some(crate::write::Stmt::Ddl(mut ddl)) = crate::write::parse(&format!("DROP TABLE IF EXISTS {target}")) {
+            if let [crate::ddl::Ddl::DropTable { purge, made_by, .. }] = ddl.as_mut_slice() {
+                (*purge, *made_by) = (true, Some(job.clone()));
+                match crate::write::on_node_as(app, crate::write::Stmt::Ddl(ddl), None, false, who).await {
+                    Ok(_) => taken = taken.map_err(|r| undone(r, &format!("{name} is dropped again"))),
+                    Err(e) => eprintln!("left {name} as it is: the drop after its staged create's commit was refused didn't answer: {e:#}"),
+                }
+            }
+        }
     }
     taken.map(axum::Json)
 }
@@ -353,7 +395,7 @@ async fn replaced(app: &crate::app::App, who: &crate::auth::Principal, target: &
     let request = replacement(table, asked, meta, &publish);
     let sql = create_sql(target, &request).map_err(|e| bad(crate::ext::said(&e)))?.replacen("CREATE TABLE", "CREATE OR REPLACE TABLE", 1);
     let Some(Stmt::Create(c)) = crate::write::parse(&sql) else { return Err(bad(format!("{sql}: not a CREATE OR REPLACE TABLE"))) };
-    crate::rights::may_run(who.role, &Stmt::Create(c.clone())).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
+    crate::rights::may_run(who.role, &Stmt::Create(c.clone())).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), Doing::Commit))?;
     let data: Vec<Value> = asked["updates"].as_array().into_iter().flatten().filter(|u| ["add-snapshot", "set-snapshot-ref"].contains(&u["action"].as_str().unwrap_or_default())).cloned().collect();
     let snapshot = data.iter().find(|u| u["action"] == "add-snapshot").map(|u| u["snapshot"].clone());
     let job = format!("iceberg-replace:{name}:{}", snapshot.as_ref().map_or_else(|| uuid::Uuid::new_v4().to_string(), |s| s["snapshot-id"].to_string()));
@@ -363,7 +405,8 @@ async fn replaced(app: &crate::app::App, who: &crate::auth::Principal, target: &
         let (app, who, job) = (app_.clone(), who_.clone(), job_.clone());
         Box::pin(async move { crate::write::on_node_as(&app, stmt, Some(job), false, &who).await })
     };
-    let (app_, lake_) = (app.clone(), lake.clone());
+    let said = std::sync::Arc::new(std::sync::Mutex::new(None::<(Refusal, String)>)); // (the fill's commit's refusal, if it was refused, and its staged table)
+    let (app_, lake_, said_) = (app.clone(), lake.clone(), said.clone());
     let fill = move |staged: String| -> futures::future::BoxFuture<'static, Option<anyhow::Result<Value>>> {
         Box::pin(async move {
             if data.is_empty() {
@@ -375,10 +418,25 @@ async fn replaced(app: &crate::app::App, who: &crate::auth::Principal, target: &
                 Ok(None) => Ok(Value::Null),
                 Err(e) => Err(e),
             };
-            Some(taken.map_err(|(_, body)| anyhow::anyhow!("{}", body.0["error"]["message"].as_str().unwrap_or("the engine's files"))))
+            Some(taken.map_err(|r| {
+                let words = r.1 .0["error"]["message"].as_str().unwrap_or("the engine's files").to_string();
+                *said_.lock().unwrap() = Some((r, staged)); // (answered as the commit refused it: its status, not the replace's)
+                anyhow::anyhow!("{words}")
+            }))
         })
     };
-    crate::replace::replacing_with(&run, lake, &c, name, &job, false, &mut |_: &str| {}, &who.scope, fill).await.map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
+    let replaced = crate::replace::replacing_with(&run, lake, &c, name, &job, false, &mut |_: &str| {}, &who.scope, fill).await;
+    if let Err(e) = replaced {
+        let filled = said.lock().unwrap().take();
+        return Err(match filled {
+            // (the replace undone once its staged table is gone: the outcome is known)
+            Some((r, staged)) => match lake.table_meta_if(&staged).await {
+                Ok(None) => undone(r, &format!("{name} is as it was")),
+                _ => r,
+            },
+            None => exception(crate::codes::of(&e), crate::ext::said(&e), Doing::Commit),
+        });
+    }
     published(lake, name, current, true).await
 }
 
@@ -531,7 +589,7 @@ fn schema_sql(name: &str, meta: &Value, asked: &Value) -> Result<Vec<String>> {
 async fn drop_table(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Result<axum::http::StatusCode, Refusal> {
     let (parts, lake, schema) = space(&app, &ns, &who.scope).await?;
     loaded(&lake, &crate::text::join(&schema, &table)).await.map_err(|_| missing(&format!("table {}.{table}", parts.join(".")), "NoSuchTableException"))?;
-    as_caller(&app, &who, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table)), false).await?;
+    as_caller(&app, &who, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table)), Doing::Other).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -547,7 +605,7 @@ async fn rename(axum::extract::State(app): axum::extract::State<crate::app::App>
     }
     loaded(&lake, &crate::text::join(&schema, name)).await.map_err(|_| missing(&format!("table {}.{name}", parts.join(".")), "NoSuchTableException"))?;
     let sql = format!("ALTER TABLE {} RENAME TO \"{}\"", sql_name(&app, &parts, &lake, &schema, name), new.replace('"', "\"\""));
-    as_caller(&app, &who, &sql, false).await?;
+    as_caller(&app, &who, &sql, Doing::Other).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -557,7 +615,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::app::App>, 
     // metadata table `files` of `t`, as Spark does)
     let no_table = || missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException");
     let (_, lake, schema) = space(&app, &ns, &who.scope).await.map_err(|_| no_table())?;
-    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&crate::text::join(&schema, &table))).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?; // (a user's: an engine reads the whole files; one it doesn't know of is no such table, `Scope::knows`)
+    crate::rights::may_here(crate::rights::Action::SelectAll, crate::rights::Object::Table(&crate::text::join(&schema, &table))).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), Doing::Other))?; // (a user's: an engine reads the whole files; one it doesn't know of is no such table, `Scope::knows`)
     Ok(axum::Json(loaded(&lake, &crate::text::join(&schema, &table)).await.map_err(|_| no_table())?))
 }
 
@@ -574,7 +632,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::app::App>, 
 async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::Extension(who): axum::Extension<crate::auth::Principal>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (parts, lake, schema) = space(&app, &ns, &who.scope).await?;
     let name = crate::text::join(&schema, &table);
-    crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
+    crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), Doing::Commit))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
     let creates = asked["requirements"].as_array().into_iter().flatten().any(|r| r["type"] == "assert-create");
     let current = match loaded(&lake, &name).await {
@@ -604,7 +662,7 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
         // (as the host reads it: RESTORE is a MERGE from the table AT (…), `past.rs`)
         let asking = crate::host::Asking::of(&lake, &who.scope);
         let merge = crate::front::expand(&asking, &restore, &std::collections::HashMap::new()).await.map_err(|e| bad(crate::ext::said(&e)))?;
-        as_caller(&app, &who, &merge, false).await?;
+        as_caller(&app, &who, &merge, Doing::Commit).await?;
         return published(&lake, &name, &current, true).await;
     }
     let updates = asked["updates"].as_array().cloned().unwrap_or_default();
@@ -618,7 +676,7 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::app::App>
         };
         sql.extend(properties_sql(&target, &updates));
         for s in &sql {
-            as_caller(&app, &who, s, false).await?;
+            as_caller(&app, &who, s, Doing::Commit).await?;
         }
         return published(&lake, &name, &current, !sql.is_empty()).await;
     }
@@ -656,7 +714,7 @@ async fn transaction(axum::extract::State(app): axum::extract::State<crate::app:
         }
         let table = id["name"].as_str().unwrap_or_default();
         let name = crate::text::join(&schema, table);
-        crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
+        crate::rights::may_here(crate::rights::Action::Insert, crate::rights::Object::Table(&name)).map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), Doing::Commit))?;
         let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.join(".")), "NoSuchTableException"))?;
         instead(&name, change).map_err(door)?;
         if let Some(c) = prepare(&lake, &name, &current, change).await.map_err(door)? {
@@ -691,4 +749,30 @@ async fn commit(app: &crate::app::App, lake: &std::sync::Arc<Lake>, commits: Vec
             _ => refused(500, "CommitStateUnknownException", e),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// On a commit, a statement to try again is Iceberg's 409, which an engine retries; one whose outcome isn't known its
+    /// 500, CommitStateUnknownException, on which an engine keeps the files it wrote. Never a 400, on which it deletes them.
+    /// Elsewhere a 409 says the name exists: a retry is a 503, an internal error a 500 (11-14 audit L2).
+    #[test]
+    fn a_retry_is_a_409_and_an_unknown_outcome_a_500() {
+        use super::Doing;
+        let said = |code: &str, doing: Doing| {
+            let (status, body) = super::exception(code, "w".into(), doing);
+            (status.as_u16(), body.0["error"]["type"].as_str().unwrap_or_default().to_string())
+        };
+        assert_eq!(said("40001", Doing::Commit), (409, "CommitFailedException".into()));
+        for code in ["XX000", "57P03", "08006", "57014"] {
+            assert_eq!(said(code, Doing::Commit), (500, "CommitStateUnknownException".into()), "{code}");
+        }
+        assert_eq!(said("42601", Doing::Commit).0, 400);
+        for code in ["40001", "57P03", "08006", "57014"] {
+            assert_eq!(said(code, Doing::Other), (503, "ServiceUnavailableException".into()), "{code}");
+        }
+        assert_eq!(said("XX000", Doing::Other), (500, "ServiceFailureException".into()));
+        assert_eq!(said("42P07", Doing::Other), (409, "AlreadyExistsException".into()));
+        assert_eq!(said("2BP01", Doing::DropNamespace), (409, "NamespaceNotEmptyException".into()));
+    }
 }

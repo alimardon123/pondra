@@ -596,6 +596,18 @@ fn default_level() -> Result<Level> {
     }
 }
 
+/// Does the session being served read only now: its transaction was begun READ ONLY, or none is open and
+/// `default_transaction_read_only` is on? What moves anything without a write's words (`nextval`, `setval` in a SELECT:
+/// `seq::may_move`) asks it, as `gate` asks a statement's words (11-10 audit M3).
+pub fn reads_only(lake: &Lake) -> bool {
+    let open = crate::temp::current().and_then(|s| {
+        let at = crate::temp::sessions(lake)?;
+        let book = at.book.lock().unwrap();
+        book.txns.get(&s).filter(|t| t.state == State::Open).map(|t| t.read_only)
+    });
+    open.unwrap_or_else(default_read_only)
+}
+
 /// The session's default access mode (`default_transaction_read_only`).
 fn default_read_only() -> bool {
     crate::set::shown("default_transaction_read_only").is_some_and(|v| matches!(v.to_lowercase().as_str(), "on" | "true" | "1"))

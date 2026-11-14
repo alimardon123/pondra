@@ -26,6 +26,7 @@ pub static DELTA: crate::registry::BuiltIn = crate::registry::BuiltIn {
     requires: &[],
     register: |r| {
         r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::table_formats::TableFormats>().add(&FORMAT);
         r.section_mut::<crate::records::Prefixes>().add(crate::delta::PREFIXES);
         r.section_mut::<crate::store::Published>().add("delta logs", crate::delta::delta_log); // (written, never read: `store::published`)
         r.section_mut::<crate::lake_state::Registered>().add::<Logs>();
@@ -138,6 +139,22 @@ pub struct Found {
 }
 
 /// The table at `root` (its latest version, or `version`), as a table of files.
+/// Delta's table format (`table_formats`): `delta_scan('…')`, a folder's Delta log. (`USING delta` comes in 1.1.)
+#[cfg(feature = "lake")]
+pub const FORMAT: crate::table_formats::TableFormat = crate::table_formats::TableFormat {
+    name: "delta",
+    abilities: &[crate::table_formats::Ability::Read, crate::table_formats::Ability::AsOf, crate::table_formats::Ability::Insert, crate::table_formats::Ability::CopyTo],
+    options: &["version"],
+    past: &["version"],
+    resolve: |lake, spec, scope| {
+        Box::pin(async move {
+            let found = resolve(&crate::ext::Asking { lake, scope }, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?; // (a folder named relatively: from where the node runs)
+            Ok(crate::table_formats::Resolved { meta: crate::ext::table_meta(found), vouched: None, then: None })
+        })
+    },
+    prime: None,
+};
+
 pub async fn resolve(reach: &impl Reach, root: &str, version: Option<i64>) -> Result<Found> {
     let log = replay(reach, root, version).await?;
     table(root, &log.protocol, &log.metadata, log.files.values())

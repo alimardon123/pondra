@@ -58,12 +58,14 @@ pub mod memo;
 // The one walk of the SQL tree (every module's walks go through it: `walk.rs`).
 mod walk;
 // Postgres's grouping where the generic dialect groups otherwise: JSON operators, IS DISTINCT FROM's right side.
-#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its readers are the lake's doors)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its text's readers are the lake's doors; the front's regroup is every form's)
 mod grouping;
 // The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
 mod kept;
 pub mod extension;
 pub mod ext_names;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its entries are the lake's extensions')
+mod table_formats;
 pub mod lake_files;
 pub mod sketch;
 mod asof;

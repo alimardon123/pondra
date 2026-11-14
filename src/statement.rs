@@ -115,7 +115,16 @@ pub(crate) fn in_language(name: &str, sql: &str) -> Result<Option<String>> {
                     None => other(crate::set::node_language()),
                 };
             }
-            out.push(one.to_string());
+            // (what it carries, in the session's language: DECLARE's query, PREPARE's statement, COPY's query, a
+            // variable's value, so a cursor's or a prepared query's answer is the one the query sent alone gives, 11-13 audit H1)
+            let carried = language.zip(carried(one)).map(|(l, (from, to, value))| read_carried(l, &one[from..to], value).map(|c| (from, to, c)));
+            match carried.transpose()? {
+                Some((from, to, c)) if c != one[from..to] => {
+                    read = true;
+                    out.push(format!("{}{c}{}", &one[..from], &one[to..]));
+                }
+                _ => out.push(one.to_string()),
+            }
             continue;
         }
         let Some(l) = language else {
@@ -130,6 +139,54 @@ pub(crate) fn in_language(name: &str, sql: &str) -> Result<Option<String>> {
         });
     }
     Ok(read.then(|| out.join(";\n")))
+}
+
+/// Where the statement or value one of Pondra's own statements carries stands in it (`from..to`), and whether it is a
+/// value: `DECLARE c [options] CURSOR [WITH[OUT] HOLD] FOR query`, `PREPARE p [(types)] AS statement`, `COPY (query) TO …`,
+/// and a variable's value (`$v = …`, `SET [VARIABLE] $v = …`, `DECLARE $v [type] = …`).
+fn carried(one: &str) -> Option<(usize, usize, bool)> {
+    use std::sync::LazyLock;
+    static DECLARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^declare\s+(?:"[^"]+"|\w+)\s+(?:\w+\s+)*?cursor\s+(?:with(?:out)?\s+hold\s+)?for\s+"#).expect("a regex"));
+    static PREPARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^prepare\s+(?:"[^"]+"|\w+)\s*(?:\([^)]*\))?\s*as\s+"#).expect("a regex"));
+    static COPY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^copy\s*\(").expect("a regex"));
+    static VALUE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(?:\$|set\s+\$|set\s+variable\s+\$?|declare\s+(?:parameter\s+)?\$)[a-z_]\w*\b[^=;]*?(?::=|=|\bto\b|\bdefault\b)\s*").expect("a regex"));
+    let s = crate::text::first_word(one);
+    let lead = one.len() - s.len();
+    let end = one.trim_end().trim_end_matches(';').trim_end().len();
+    let after = |m: regex::Match| lead + m.end();
+    if let Some(m) = DECLARE.find(s).or_else(|| PREPARE.find(s)) {
+        return Some((after(m), end, false)).filter(|(from, to, _)| from < to);
+    }
+    if let Some(m) = COPY.find(s) {
+        let close = crate::text::closing(&s[m.end() - 1..])?;
+        return Some((after(m), lead + m.end() - 1 + close, false));
+    }
+    VALUE.find(s).map(|m| (after(m), end, true)).filter(|(from, to, _)| from < to)
+}
+
+/// What one of Pondra's own statements carries (`carried`), read with `l`'s parse and printed as Pondra's SQL: a
+/// statement as it is, a value as the one item of `SELECT value`.
+fn read_carried(l: &crate::languages::Language, text: &str, value: bool) -> Result<String> {
+    use datafusion::sql::sqlparser::ast::{SelectItem, SetExpr, Statement};
+    let refused = |e: anyhow::Error| match e.downcast_ref::<datafusion::sql::sqlparser::parser::ParserError>() {
+        Some(_) => crate::codes::coded("42601", format!("{e:#}")),
+        None => e,
+    };
+    if !value {
+        return (l.parse)(text).map(|stmts| stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n")).map_err(refused);
+    }
+    let stmts = (l.parse)(&format!("SELECT {text}")).map_err(refused)?;
+    let item = match &stmts[..] {
+        [Statement::Query(q)] => match q.body.as_ref() {
+            SetExpr::Select(s) if s.projection.len() == 1 => match &s.projection[0] {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e.to_string()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    Ok(item.unwrap_or_else(|| text.to_string()))
 }
 
 /// `sql` in the session's language (`set::language`) as Pondra's SQL (`in_language`): what `run` takes, and what a door's
@@ -442,9 +499,21 @@ mod tests {
         assert_eq!(read(r#"SET datafusion.sql_parser.dialect = 'mysql'; SELECT "x""#), None, "a dialect that names no language: the node's, Pondra's SQL");
         assert_eq!(read(r#"DISCARD ALL; SELECT "x""#), None);
         assert_eq!(in_language("pondra", r#"SET search_path = s; SELECT "x""#).unwrap(), None, "another setting: as written");
-        for own in ["SHOW language", "RESET language", "BEGIN", "COMMIT", "CHECKPOINT", "$n = 1", "CREATE SEQUENCE s", "COPY t TO 'x.csv'", "DISCARD ALL", r#"DECLARE c CURSOR WITH HOLD FOR SELECT "x""#, "FETCH 1 FROM c", "CLOSE ALL"] {
+        for own in ["SHOW language", "RESET language", "BEGIN", "COMMIT", "CHECKPOINT", "$n = 1", "CREATE SEQUENCE s", "COPY t TO 'x.csv'", "DISCARD ALL", "DECLARE c CURSOR WITH HOLD FOR SELECT x FROM t", "FETCH 1 FROM c", "CLOSE ALL"] {
             assert_eq!(read(own), None, "{own}: Pondra's own, as written");
         }
+        // (what one carries is read in the language, so it answers as the same query sent alone: 11-13 audit H1)
+        for (own, want) in [
+            (r#"DECLARE c CURSOR WITH HOLD FOR SELECT "x", 7 / 2 AS h"#, r#"DECLARE c CURSOR WITH HOLD FOR SELECT 'x' AS "x", spark_divide(7, 2) AS h"#),
+            (r#"/* psycopg */ declare "c 1" binary no scroll cursor without hold for select 7/2 AS h"#, r#"/* psycopg */ declare "c 1" binary no scroll cursor without hold for SELECT spark_divide(7, 2) AS h"#),
+            (r#"PREPARE p (INT) AS SELECT "x" WHERE $1 > 0"#, r#"PREPARE p (INT) AS SELECT 'x' AS "x" WHERE $1 > 0"#),
+            (r#"COPY (SELECT 7 / 2 AS h, ')' AS p) TO 'h.csv' (FORMAT csv)"#, r#"COPY (SELECT spark_divide(7, 2) AS h, ')' AS p) TO 'h.csv' (FORMAT csv)"#),
+            (r#"$h = 7 / 2"#, r#"$h = spark_divide(7, 2)"#),
+            (r#"SET VARIABLE h = "x""#, r#"SET VARIABLE h = 'x'"#),
+        ] {
+            assert_eq!(read(own).as_deref(), Some(want), "{own}");
+        }
+        assert_eq!(crate::codes::of(&in_language("spark", "PREPARE p AS FROM t SELECT a").unwrap_err()), "42601", "refused in Spark's words");
         assert_eq!(in_language("pondra", r#"SELECT "x" FROM t"#).unwrap(), None);
         assert_eq!(in_language(" Databricks ", "SELECT 1 / 2").unwrap().as_deref(), Some(r#"SELECT spark_divide(1, 2) AS "1 / 2""#)); // (its column named as Pondra's SQL names it)
         let refused = in_language("spark", "FROM t SELECT a").unwrap_err();

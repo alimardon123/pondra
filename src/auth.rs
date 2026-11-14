@@ -59,8 +59,10 @@ impl Principal {
     }
 
     /// The node's own work's (`as_node`: what no request asked for, a task's tick, a view's refresh, the history's
-    /// writer): an admin token's, over everything. With a token's and a superuser's sign-in, the only whole scope.
-    pub fn node() -> Principal { Principal::token(Role::Admin) }
+    /// writer): an admin's, over everything, but not whoever runs the nodes (`operator`). Whoever made the task or the
+    /// view may be anyone, so another database that signs in on its own opens nothing to it (`users::across`; 11-10
+    /// audit H1). With a token's and a superuser's sign-in, the only whole scope.
+    pub fn node() -> Principal { Principal::of(Role::Admin) }
 
     /// An admin token's rights, or a superuser's: an admin whose scope is whole.
     pub fn superuser(&self) -> bool { self.role == Role::Admin && self.scope.whole() }

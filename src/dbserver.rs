@@ -1,14 +1,17 @@
 //! `pondra serve <folder of lakes>` (ADR-030, ADR-032): every lake in a folder served as a database, as a
 //! database server serves its databases. The server holds no lake itself: each database is a
-//! node of its own (`pondra serve`), started the first time a connection or request names it and
+//! node of its own, in this process (`node::Options::database`, invariant 301), kept by a supervisor of
+//! its own (`node::kept`), started the first time a connection or request names it and
 //! stopped once nothing has used it for `PONDRA_DATABASE_IDLE_SECS` (600) and it has nothing
-//! left to tier. The server routes to them:
+//! left to tier. A database's node binds no port: the server reaches it here.
 //!
-//! * Postgres (`--pg`): by the startup message's `database`, then it passes the bytes through;
-//! * HTTP: `/db/{name}/…` is that database's whole API, `/databases` lists them, `/` is the
-//!   console, and anything else goes to the default database (`--default`, else `lake`, else the
-//!   only one).
+//! * Postgres (`--pg`): by the startup message's `database`, then the connection is its node's
+//!   (handed to its Postgres door, `pg::Door`);
+//! * HTTP: `/db/{name}/…` is that database's whole API (its node's router, called here), `/databases`
+//!   lists them, `/` is the console, and anything else goes to the default database (`--default`,
+//!   else `lake`, else the only one).
 //!
+//! A database's failure or restart is its own: the server and the other databases go on.
 //! Every database sees the others as `name.schema.table` (its node attaches the folder's lakes).
 //! Its node advertises `host:port/db/name`, so another node can join its cluster through here.
 use crate::auth::{Auth, Role};
@@ -26,21 +29,42 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-/// What a database's node is started with, besides its lake and ports.
-#[derive(Clone, Default)]
-pub struct Options {
-    pub python: Option<String>,
-    pub tier_secs: Option<f64>,
-    pub reader: bool, // (every database's node read-only: `--reader`)
-    pub node: Vec<String>, // the rest of `pondra serve`'s options, for each database's node
+/// A database's running node, kept by its supervisor (`node::kept::supervise`) in this process.
+struct Node {
+    /// What it is doing now: starting, running, restarting in place, failed or closed.
+    state: Arc<std::sync::Mutex<crate::node::State>>,
+    /// Its router and its Postgres door, while it runs.
+    running: crate::node::kept::Slot,
+    /// Its host, which the node tells of a failure or a restart, and the server of a close (`Host::beside`).
+    host: crate::node::Host,
+    /// Its supervisor, which ends once the node is closed.
+    kept: tokio::task::JoinHandle<()>,
+    activity: Arc<Activity>,
 }
 
-/// A database's running node.
-struct Node {
-    http: u16,
-    pg: u16,
-    child: tokio::process::Child,
-    activity: Arc<Activity>,
+impl Node {
+    /// Is it there to answer: not failed, nor closed? (A node restarting in place still is: it answers once started again.)
+    fn serves(&self) -> bool {
+        !self.kept.is_finished() && !matches!(*self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner), crate::node::State::Failed(_) | crate::node::State::Closed)
+    }
+
+    /// Its doors now, or why there are none (it is starting again in place).
+    fn doors(&self) -> Result<crate::node::kept::Running, String> {
+        if let Some(r) = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+            return Ok(r);
+        }
+        Err(match self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+            crate::node::State::Restarting(why) | crate::node::State::Failed(why) => why,
+            _ => "the database's node is starting".into(),
+        })
+    }
+
+    /// Drained (its requests in flight answered) and stopped, as on Ctrl-C, so the next node leads at once; its supervisor
+    /// waited for 20 s at most (past that it finishes the stop on its own).
+    async fn close(self) {
+        self.host.tell(crate::node::Event::Close);
+        let _ = tokio::time::timeout(Duration::from_secs(20), self.kept).await;
+    }
 }
 
 /// What reaches a database's node: the connections and requests in flight, and when the last one
@@ -77,7 +101,7 @@ struct Server {
     folder: String,
     addr: String,       // (where other nodes and clients reach this server)
     default: Option<String>,
-    options: Options,
+    start: crate::node::Start, // (what each database's node starts with: `pondra serve`'s flags for a lake)
     auth: Arc<Auth>,
     nodes: Mutex<HashMap<String, Node>>,
     starting: Mutex<()>, // (one database's node started at a time: two requests don't start two)
@@ -127,15 +151,6 @@ async fn databases(folder: &str) -> Vec<String> {
     }
 }
 
-/// Two ports nobody listens on, not the same one (the OS picks them, and both are held until both are known).
-fn free_ports() -> Result<(u16, u16)> {
-    let (a, b) = (std::net::TcpListener::bind("127.0.0.1:0")?, std::net::TcpListener::bind("127.0.0.1:0")?);
-    Ok((a.local_addr()?.port(), b.local_addr()?.port()))
-}
-
-/// Whether another socket holds `port` now: a listener, or a connection out that was given it.
-fn taken(port: u16) -> bool { std::net::TcpListener::bind(("127.0.0.1", port)).is_err() }
-
 impl Server {
     /// The database a request without `/db/` means.
     async fn default_db(&self) -> String {
@@ -143,25 +158,28 @@ impl Server {
         self.default.clone().or_else(|| all.iter().find(|d| *d == "lake").cloned()).or_else(|| (all.len() == 1).then(|| all[0].clone())).unwrap_or_else(|| "lake".into())
     }
 
-    /// The node of database `name`, started if it isn't running: its HTTP port, its Postgres
-    /// port, and the mark of this use (it isn't stopped until that is dropped).
+    /// The node of database `name`, started if it isn't running: its doors (or why it has none for now: it is starting
+    /// again in place), and the mark of this use (it isn't stopped until that is dropped).
     /// `create`: make the lake if there is none (the default database, on first use).
-    async fn node(&self, name: &str, create: bool) -> Result<(u16, u16, Busy)> {
+    async fn node(&self, name: &str, create: bool) -> Result<(Result<crate::node::kept::Running, String>, Busy)> {
         // (a new database's name is checked for the server's own; one that is there is only looked up)
         match create {
             true => crate::ddl::database_name(name)?,
             false => crate::ddl::check(name)?,
         }
-        if let Some(n) = self.nodes.lock().await.get_mut(name) {
-            if n.child.try_wait()?.is_none() {
-                return Ok((n.http, n.pg, Busy::new(&n.activity)));
-            }
+        if let Some(n) = self.nodes.lock().await.get(name).filter(|n| n.serves()) {
+            return Ok((n.doors(), Busy::new(&n.activity)));
         }
         let _one = self.starting.lock().await;
-        if let Some(n) = self.nodes.lock().await.get_mut(name) {
-            if n.child.try_wait()?.is_none() {
-                return Ok((n.http, n.pg, Busy::new(&n.activity))); // (another request started it meanwhile)
+        let gone = {
+            let mut nodes = self.nodes.lock().await;
+            if let Some(n) = nodes.get(name).filter(|n| n.serves()) {
+                return Ok((n.doors(), Busy::new(&n.activity))); // (another request started it meanwhile)
             }
+            nodes.remove(name) // (one that failed: it starts again, as a node that ended does)
+        };
+        if let Some(n) = gone {
+            n.close().await;
         }
         let dir = place(&self.folder, name);
         if let Some(k) = crate::undrop::lake_kept(&dir, None).await? {
@@ -170,85 +188,42 @@ impl Server {
         if !create && !is_lake(&dir).await? {
             bail!("database \"{name}\" does not exist (CREATE DATABASE {name})");
         }
-        // (a port picked here is free until the node binds it, and another process may take it meanwhile: a
-        // connection out is given a port from the same range. A node that stops as it starts while one of its
-        // ports is taken is started again on two others.)
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let (http, pg) = free_ports()?;
-            match self.start(name, &dir, http, pg).await? {
-                Some(child) => {
-                    let activity = Arc::new(Activity { busy: Default::default(), last: std::sync::Mutex::new(Instant::now()) });
-                    let busy = Busy::new(&activity);
-                    self.nodes.lock().await.insert(name.to_string(), Node { http, pg, child, activity });
-                    return Ok((http, pg, busy));
-                }
-                None if attempt < 3 => eprintln!("the node of database {name} couldn't listen on port {http} or {pg}, which another process took: starting it again"),
-                None => bail!("the node of database {name} couldn't listen on port {http} or {pg} three times: another process took them"),
-            }
+        let (host, told) = crate::node::Host::beside();
+        let options = crate::node::Options::database(&dir, format!("{}/db/{name}", self.addr), &self.folder, self.start.clone(), &self.addr, host.clone());
+        let (state, running) = (Arc::new(std::sync::Mutex::new(crate::node::State::Starting)), crate::node::kept::Slot::default());
+        let (first, started) = std::sync::mpsc::channel();
+        // (its own task, not the server's: the server's end with its doors, before its databases are closed)
+        let kept = crate::spawns::untracked(crate::node::kept::supervise(options, state.clone(), running.clone(), told, first));
+        let node = Node { state, running, host, kept, activity: Arc::new(Activity { busy: Default::default(), last: std::sync::Mutex::new(Instant::now()) }) };
+        let first = tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(120))).await?;
+        if let Err(why) = first.map_err(|_| "it didn't start in two minutes".to_string()).and_then(|r| r) {
+            node.close().await;
+            bail!("the node of database {name} stopped as it started: {why}");
         }
-    }
-
-    /// Start database `name`'s node on these ports and wait for it to answer. None: it stopped as it started while
-    /// one of them is taken (`node` starts it again on others).
-    async fn start(&self, name: &str, dir: &str, http: u16, pg: u16) -> Result<Option<tokio::process::Child>> {
-        let exe = std::env::current_exe()?;
-        let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{http}"), "--pg", &format!("127.0.0.1:{pg}"), "--attach-found", &self.folder,
-                  "--advertise", &format!("{}/db/{name}", self.addr), "--stop-with-stdin"]);
-        if let Some(p) = &self.options.python {
-            cmd.args(["--python", p]);
-        }
-        if self.options.reader {
-            cmd.arg("--reader");
-        }
-        cmd.args(&self.options.node);
-        if let Some(t) = self.options.tier_secs {
-            cmd.args(["--tier-secs", &t.to_string()]);
-        }
-        cmd.envs(crate::env::given()); // (the tokens: `env.rs`)
-        for v in ["PONDRA_TLS_CERT", "PONDRA_TLS_KEY", "PONDRA_TLS_CA"] {
-            cmd.env_remove(v); // (a database's node listens on this machine only: TLS is the server's)
-        }
-        cmd.env_remove("PONDRA_IDLE_EXIT_SECS"); // (the server stops an idle database's node: `reap`)
-        cmd.env(crate::tls::CLIENT_KEY, client_key()); // (its `x-pondra-client` is taken only with it)
-        cmd.env("PONDRA_SERVER_URL", format!("http://{}", self.addr)).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).kill_on_drop(true);
-        let mut child = cmd.spawn().context("starting a database's node")?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if taken(http) || taken(pg) {
-                    return Ok(None);
-                }
-                bail!("the node of database {name} stopped as it started ({status})");
-            }
-            let up = crate::net::process().client(crate::net::Policy::Local).get(format!("http://127.0.0.1:{http}/stats")).timeout(Duration::from_secs(1)).send().await.is_ok_and(|r| r.status().is_success());
-            if up {
-                break;
-            }
-            anyhow::ensure!(started.elapsed() < Duration::from_secs(120), "the node of database {name} didn't start in two minutes");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        Ok(Some(child))
+        let busy = Busy::new(&node.activity);
+        let doors = node.doors();
+        self.nodes.lock().await.insert(name.to_string(), node);
+        Ok((doors, busy))
     }
 
     /// Stop the nodes nobody used lately, once they have nothing left to tier.
     async fn reap(&self) {
-        let idle: Vec<(String, u16)> = self.nodes.lock().await.iter().filter(|(_, n)| n.activity.idle()).map(|(k, n)| (k.clone(), n.http)).collect();
-        for (name, http) in idle {
-            let stats: Option<Value> = async { crate::net::process().client(crate::net::Policy::Local).get(format!("http://127.0.0.1:{http}/stats")).send().await.ok()?.json().await.ok() }.await;
-            if stats.as_ref().and_then(|s| s["untiered_rows"].as_u64()).unwrap_or(0) > 0 {
+        let idle: Vec<(String, Option<axum::Router>)> = self.nodes.lock().await.iter().filter(|(_, n)| n.activity.idle()).map(|(k, n)| (k.clone(), n.doors().ok().map(|d| d.router))).collect();
+        for (name, router) in idle {
+            let untiered = match router {
+                Some(router) => untiered_rows(router).await,
+                None => 0, // (failed, or starting again: nothing of it to wait for)
+            };
+            if untiered > 0 {
                 continue; // (it tiers first: another look next time)
             }
             let mut nodes = self.nodes.lock().await;
             if !nodes.get(&name).is_some_and(|n| n.activity.idle()) {
                 continue; // (used again meanwhile)
             }
-            if let Some(mut n) = nodes.remove(&name) {
+            if let Some(n) = nodes.remove(&name) {
                 drop(nodes);
-                drop(n.child.stdin.take()); // (stops as on Ctrl-C: the next node leads at once)
-                let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
+                n.close().await;
             }
         }
     }
@@ -263,9 +238,9 @@ impl Server {
             anyhow::ensure!(if_exists, "database \"{name}\" does not exist");
             return Ok(j!({"database": name, "dropped": false}));
         }
-        if let Some(mut n) = self.nodes.lock().await.remove(name) {
-            drop(n.child.stdin.take());
-            let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
+        let running = self.nodes.lock().await.remove(name);
+        if let Some(n) = running {
+            n.close().await;
         }
         if purge {
             crate::ddl::delete_lake(&dir, None).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
@@ -288,8 +263,17 @@ impl Server {
     }
 }
 
-/// Run the server until stopped.
-pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Option<String>, options: Options, auth: Arc<Auth>) -> Result<()> {
+/// How many of a database's rows aren't tiered yet, as its `/stats` says (asked in this process, from this machine).
+async fn untiered_rows(router: axum::Router) -> u64 {
+    use tower::ServiceExt;
+    let Ok(req) = crate::node::request("GET", "/stats", &[], vec![], None) else { return 0 };
+    let res = router.oneshot(req).await.unwrap_or_else(|never| match never {});
+    let body = axum::body::to_bytes(res.into_body(), 16 << 20).await.unwrap_or_default();
+    serde_json::from_slice::<Value>(&body).ok().and_then(|s| s["untiered_rows"].as_u64()).unwrap_or(0)
+}
+
+/// Run the server until stopped. Each database's node starts with `start` (`pondra serve`'s flags for a lake).
+pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Option<String>, start: crate::node::Start, auth: Arc<Auth>) -> Result<()> {
     let folder = match folder.contains("://") {
         true => folder.trim_end_matches('/').to_string(), // (a bucket's prefix)
         false => {
@@ -298,7 +282,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
         }
     };
     let tasks = crate::spawns::Tasks::new(crate::node::native(false).life.clone()); // (a panic in a loop of its own stops the process, as a node's)
-    let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default(), tasks });
+    let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, start, auth, nodes: Default::default(), starting: Default::default(), tasks });
     let s = server.clone();
     server.tasks.spawn_node(crate::spawns::Vital::Stop, async move {
         for round in 0u64.. {
@@ -349,10 +333,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     axum::serve(listener, app.into_make_service_with_connect_info::<crate::tls::Peer>()).with_graceful_shutdown(stop).await?;
     server.tasks.abort_all(); // (its reaper and doors end before its databases' nodes are let go)
     let nodes: Vec<Node> = server.nodes.lock().await.drain().map(|(_, n)| n).collect();
-    for mut n in nodes {
-        drop(n.child.stdin.take());
-        let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
-    }
+    futures::future::join_all(nodes.into_iter().map(Node::close)).await; // (each drained and stopped, side by side)
     Ok(())
 }
 
@@ -409,41 +390,37 @@ async fn undrop_db(State(s): State<Shared>, Path(name): Path<String>, req: Reque
     }
 }
 
-/// A request for database `name`, passed to its node (the answer streamed back as it comes).
+/// A request for database `name`, passed to its node's router in this process, as from this machine (the answer streamed
+/// back as it comes). While the node starts again in place, 503 57P03 with why, which clients ask again on.
 async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
+    use tower::ServiceExt;
     let name = name.to_lowercase();
     let create = name == s.default_db().await && databases(&s.folder).await.is_empty();
-    let (http, _, busy) = match s.node(&name, create).await {
+    let (doors, busy) = match s.node(&name, create).await {
         Ok(p) => p,
         Err(e) => return error(StatusCode::NOT_FOUND, e),
     };
+    let router = match doors {
+        Ok(d) => d.router,
+        Err(why) => return (StatusCode::SERVICE_UNAVAILABLE, [("x-pondra-sqlstate", "57P03")], why).into_response(),
+    };
     let (parts, body) = req.into_parts();
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let url = format!("http://127.0.0.1:{http}{path}{query}");
-    let mut out = crate::net::process().client(crate::net::Policy::Local).request(parts.method, url).body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let mut out = axum::http::Request::builder().method(parts.method).uri(format!("{path}{query}"));
     for (k, v) in parts.headers.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length" | "transfer-encoding" | "connection")) {
         out = out.header(k, v);
     }
-    match out.send().await {
-        Ok(res) => {
-            let mut resp = Response::builder().status(res.status().as_u16());
-            for (k, v) in res.headers().iter().filter(|(k, _)| !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection")) {
-                resp = resp.header(k, v);
-            }
-            let answer = futures::StreamExt::map(res.bytes_stream(), move |chunk| {
-                let _ = &busy; // (in use until the whole answer has gone: a live query's for as long as it runs)
-                chunk
-            });
-            resp.body(Body::from_stream(answer)).unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
-        }
-        Err(e) => error(StatusCode::BAD_GATEWAY, e.into()),
-    }
-}
-
-/// The key this server's `x-pondra-client` carries, made once a process and given to its databases' nodes.
-fn client_key() -> &'static str {
-    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+    let Ok(mut out) = out.body(body) else { return StatusCode::BAD_REQUEST.into_response() };
+    // (from this machine, as the node's own door would see this server: who the client is, the `plain` layer said)
+    let here = crate::tls::Peer { addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)), tls: false, signed: false, local: true };
+    out.extensions_mut().insert(axum::extract::ConnectInfo(here));
+    let res = router.oneshot(out).await.unwrap_or_else(|never| match never {});
+    let (parts, body) = res.into_parts();
+    let answer = futures::StreamExt::map(body.into_data_stream(), move |chunk| {
+        let _ = &busy; // (in use until the whole answer has gone: a live query's for as long as it runs)
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(answer))
 }
 
 // ---------------------------------------------------------------- Postgres
@@ -476,11 +453,11 @@ async fn plain(State(s): State<Shared>, axum::extract::ConnectInfo(peer): axum::
     }
     // (who the client is, for the node to count its failed sign-ins by, with the key this server gave its
     // nodes: `Peer::client`, behind a trusted proxy the client it names; whatever the client said goes)
-    let client = format!("{} {}", client_key(), peer.client(req.headers()));
+    let client = format!("{} {}", crate::tls::lakes_key(), peer.client(req.headers()));
     req.headers_mut().insert(crate::tls::CLIENT, client.parse().expect("a key and an address are a header value"));
     // (and where it reached this server, with its database's path: a sign-in's redirect address, `Peer::origin`)
     let db = req.uri().path().strip_prefix("/db/").and_then(|r| r.split('/').next()).map(|d| format!("/db/{d}")).unwrap_or_default();
-    match peer.origin(req.headers(), req.uri()).and_then(|o| format!("{} {o}{db}", client_key()).parse().ok()) {
+    match peer.origin(req.headers(), req.uri()).and_then(|o| format!("{} {o}{db}", crate::tls::lakes_key()).parse().ok()) {
         Some(origin) => req.headers_mut().insert(crate::tls::ORIGIN, origin),
         None => req.headers_mut().remove(crate::tls::ORIGIN),
     };
@@ -519,37 +496,51 @@ async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
     let name = param("database").or_else(|| param("user")).unwrap_or_else(|| fallback.clone()).to_lowercase();
     let known = databases(&s.folder).await;
     let create = name == fallback && known.is_empty();
-    let (pg, _busy) = match s.node(&name, create).await {
-        Ok((_, pg, busy)) => (pg, busy),
+    let fatal = |code: &str, text: &str| {
+        let fields = [("S", "FATAL"), ("V", "FATAL"), ("C", code), ("M", text)];
+        let body: Vec<u8> = fields.iter().flat_map(|(k, v)| [k.as_bytes(), v.as_bytes(), b"\0"].concat()).chain([0u8]).collect();
+        [b"E".to_vec(), ((body.len() + 4) as i32).to_be_bytes().to_vec(), body].concat()
+    };
+    let (door, _busy) = match s.node(&name, create).await {
+        Ok((Ok(d), busy)) => (d.pg, busy),
+        Ok((Err(why), _)) => {
+            client.write_all(&fatal("57P03", &why)).await?; // (starting again in place: the client connects again)
+            return Ok(());
+        }
         Err(e) => {
             let text = crate::ext::said(&e); // (the words a client is sent; "does not exist" survives said, so the code reads the same)
             let code = if text.contains("does not exist") { "3D000" } else { "XX000" };
-            let fields = [("S", "FATAL"), ("V", "FATAL"), ("C", code), ("M", text.as_str())];
-            let body: Vec<u8> = fields.iter().flat_map(|(k, v)| [k.as_bytes(), v.as_bytes(), b"\0"].concat()).chain([0u8]).collect();
-            client.write_all(&[b"E".to_vec(), ((body.len() + 4) as i32).to_be_bytes().to_vec(), body].concat()).await?;
+            client.write_all(&fatal(code, &text)).await?;
             return Ok(());
         }
     };
-    let mut node = tokio::net::TcpStream::connect(("127.0.0.1", pg)).await?;
-    node.set_nodelay(true)?;
-    node.write_all(&startup).await?;
-    tokio::io::copy_bidirectional(&mut client, &mut node).await?;
+    // (the connection is the node's from here: its startup message, then the client's bytes as they come)
+    let door = door.context("a database's node has a Postgres door")?;
+    let mut ours = handed(&door, (addr, client.is_tls())).await?;
+    ours.write_all(&startup).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut ours).await?;
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_nodes_two_ports_are_free_and_told_apart_from_taken_ones() {
-        let (a, b) = super::free_ports().unwrap();
-        assert_ne!(a, b);
-        assert!(!super::taken(a) && !super::taken(b));
-        let held = std::net::TcpListener::bind(("127.0.0.1", a)).unwrap();
-        assert!(super::taken(a), "a listener holds it");
-        #[cfg(target_os = "linux")]
-        {
-            let out = std::net::TcpStream::connect(held.local_addr().unwrap()).unwrap();
-            assert!(super::taken(out.local_addr().unwrap().port()), "a connection out holds the port it was given");
+/// A connection handed to a database's Postgres door, and this end of it: a pair of sockets in this process, no port.
+#[cfg(unix)]
+async fn handed(door: &crate::pg::Door, peer: crate::pg::Peer) -> Result<tokio::net::UnixStream> {
+    let (ours, theirs) = tokio::net::UnixStream::pair()?;
+    door.take_passed(theirs, peer);
+    Ok(ours)
+}
+
+/// (Windows has no pair of sockets: a listener on this machine for this one connection, which takes ours alone)
+#[cfg(not(unix))]
+async fn handed(door: &crate::pg::Door, peer: crate::pg::Peer) -> Result<tokio::net::TcpStream> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let ours = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+    ours.set_nodelay(true)?;
+    loop {
+        let (theirs, from) = listener.accept().await?;
+        if from == ours.local_addr()? {
+            door.take_handed(theirs, peer);
+            return Ok(ours);
         }
     }
 }

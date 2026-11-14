@@ -268,11 +268,14 @@ pub async fn expand<H: Host + 'static>(host: &H, sql: &str, views: &HashMap<Stri
     let read_apart = crate::parsed::generic(sql).is_err();
     // (a view's `sum(x) AS MEASURE revenue`, which the fallback dialect reads as an alias, ADR-065 §3: `measures::passes`)
     let measured = measured || (read_apart && crate::measures::marked(&stmts));
+    // (Postgres's grouping where generic groups otherwise, `grouping.rs`: here, on the tree whichever dialect read, so a
+    // page, FROM first and every door group alike, 11-10 audit H3; a node's door grouped text generic reads already)
+    let grouped = crate::grouping::wanted(sql) && crate::grouping::regroup(&mut stmts);
     let facts = Facts { name: Host::name(host), sql, views, routines, outside, measure_views, measured, read_apart, expands: AtomicBool::new(expands) };
     // (the registry's tree passes, in order (`Trees`): `pondra.diff`, the measures at the query's own grain (ADR-065 §3),
     // the expander, MATCH_RECOGNIZE as SQL around one window, Postgres's casts and JSON set functions, DuckDB's and
     // Snowflake's forms; each asks the host as a `Front`)
-    let mut changed = facts.read_apart; // (a tree the fallback read is printed whatever the passes do)
+    let mut changed = facts.read_apart || grouped; // (a tree the fallback read, or one regrouped, is printed whatever the passes do)
     let trees = trees();
     for (i, pass) in trees.all().iter().enumerate() {
         // (while the tree is still the text's, a pass runs only where one of its looks finds something in the text)

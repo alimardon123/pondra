@@ -231,10 +231,9 @@ Do not set these. Pondra sets them for its own processes, and some are copies of
 | Variable | Set by | Meaning |
 |---|---|---|
 | `PONDRA_OWNER_KEY` | the shell, `pondra.connect("lake")`, and `connect("lake")` in JavaScript | a random key: the node answers only the program that started it (and tokens and signed-in users), and lets that program read files on this machine through it. Nobody else may |
-| `PONDRA_CLIENT_KEY` | `pondra serve` on a folder of lakes, for each database's node | the key the server names each client's address with (`x-pondra-client`), so the node counts failed sign-ins by client and knows a page on this machine. A node takes that header only with this key |
 | `PONDRA_REPLICAS` | `pondra serve`, from `--ack` and `--replicas` | how many nodes hold a write before it is acknowledged, for the rest of the node. Setting it in the environment has no effect: `serve` overwrites it. Use the flags |
 | `PONDRA_TRIES` | `pondra sql` | how many times a write has started over after another node took the lake |
-| `PONDRA_SERVER_URL` | `pondra serve` on a folder of lakes, for each database's node | where the process that serves the folder is, for `DROP DATABASE` |
+| `PONDRA_SERVER_URL` | `pondra serve` on a folder of lakes, in each database's node's settings (its nodes run in its process) | where the process that serves the folder is, for `DROP DATABASE` |
 | `PONDRA_NODE_KEY` | `pondra serve`, from the lake's own key, when this isn't set | the key nodes call each other with when no admin or other token is set. Every node of a lake has the same one |
 | `PONDRA_REACH` | a node, for a `pondra lead` it starts to write a backup | the places this node reaches with a secret (a backup in another bucket), and how, so the process it starts reaches them the same way |
 | `PONDRA_LAUNCHER` | `pondra.connect()`, for the node it opens in the process | the `pondra` executable the node starts its helpers with (a `pondra lead` of a lake nobody leads). A library has no executable of its own to start again |

@@ -73,7 +73,8 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         Some(f) => f.to_lowercase(),
         None => format_of(to.trim_end_matches('/')).map(|f| f.0).with_context(|| format!("COPY … TO {to}: which FORMAT? (parquet, csv, json, delta, iceberg)"))?,
     };
-    if format == "delta" || format == "iceberg" {
+    if crate::table_formats::is(&format) {
+        crate::table_formats::may(to.trim_end_matches('/'), &format, crate::table_formats::Ability::CopyTo)?; // (11-14 audit L8)
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
         let ctx = crate::query::session_for(lake, &query, "", None, scope).await?;
         let (append, overwrite) = (on("append"), on("overwrite"));

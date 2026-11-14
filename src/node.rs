@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use crate::members::Members;
 
 #[cfg(feature = "doors")] mod run;
+#[cfg(feature = "doors")] pub(crate) mod kept;
 #[cfg(feature = "doors")] pub use run::{Node, Options};
+#[cfg(feature = "doors")] pub use kept::State;
 #[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
 pub use crate::lifecycle::{Guest, Restarting};
@@ -64,11 +66,16 @@ fn stop(why: String, host: Option<&Host>) {
 /// A node's host: what it is told when the node's own work fails or must start again (`Event`), and where the node's
 /// lake moves go (`memory::set_location`). A library's supervisor and `pondra serve` each make one (`Host::new`) and give
 /// it to every node they start (`Options::host`): it outlives each node, as the host does. A node with none (a guest, a
-/// command's own, a test's) stops its process on a failure, and can't move its lake.
+/// command's own, a test's) stops its process on a failure, and can't move its lake. A folder of lakes' server keeps
+/// each of its databases' nodes in its own process (`Host::beside`).
 #[derive(Clone)]
 pub struct Host {
     events: mpsc::UnboundedSender<Event>,
     moves: mpsc::UnboundedSender<crate::lifecycle::Move>,
+    /// Does the host keep the node in its process beside others, and reach it there (each database of `pondra serve
+    /// <folder>`, `dbserver.rs`)? Then the node binds no port of its own (`Options::database`), a restart is in place, as a
+    /// library's is, and the process isn't the node's: the host and its other nodes go on.
+    beside: bool,
 }
 
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a library's and `pondra serve`'s, the doors half's)
@@ -84,8 +91,21 @@ impl Host {
     pub fn new() -> (Host, Told) {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (moves, moves_rx) = mpsc::unbounded_channel();
-        (Host { events, moves }, Told { events: events_rx, moves: moves_rx })
+        (Host { events, moves, beside: false }, Told { events: events_rx, moves: moves_rx })
     }
+
+    /// A host that keeps its node in its process beside others (`beside`), and its end of what the node tells it. Its
+    /// node's lake can't move: a database is its folder's (its end of the moves is let go of at once).
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a lakes server's: the doors half's)
+    pub(crate) fn beside() -> (Host, Told) {
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (moves, _) = mpsc::unbounded_channel();
+        let (_, moves_rx) = mpsc::unbounded_channel();
+        (Host { events, moves, beside: true }, Told { events: events_rx, moves: moves_rx })
+    }
+
+    /// Does it keep its node in its process beside others (`Host::beside`)?
+    pub(crate) fn keeps_beside(&self) -> bool { self.beside }
 
     /// Tells the host `e` (a library's close, which is the host's own).
     #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close sends it)
@@ -139,7 +159,7 @@ impl crate::lifecycle::Lifecycle for Native {
         }
     }
     fn one_off(&self) -> bool { self.guest }
-    fn owns_process(&self) -> bool { !hosted() }
+    fn owns_process(&self) -> bool { !hosted() && !self.host.as_ref().is_some_and(Host::keeps_beside) }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
     fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings, reaches)) }
     fn movable(&self) -> bool { self.host.as_ref().is_some_and(Host::movable) }
@@ -215,9 +235,9 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
             held.values().for_each(|(_, f)| crate::terms::say(f, &format!("restarting {}", crate::log::now_ms())));
         }
     }
-    if hosted() {
+    if hosted() || host.is_some_and(Host::keeps_beside) {
         if let Some(h) = host {
-            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
+            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process, a lakes server its other databases)
         }
         std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
     }
@@ -981,6 +1001,59 @@ mod tests {
             assert_eq!(a.folder.as_deref(), Some("a__2"), "the renamed table keeps folder a: the new one takes the next");
             assert_eq!(free_folder(&lake, "a").await.unwrap().as_deref(), Some("a__3"), "a, kept for the dropped a2, and a__2 are used");
             assert_eq!(free_folder(&lake, "d").await.unwrap(), None);
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A table's JSON column is marked as one where queries plan over it (`TableMeta::read_schema`, step 5 piece 14c,
+    /// E1): from its rows in memory and from its files, and through a view. Every write that
+    /// reads the table back (an UPDATE, a DELETE, an INSERT … SELECT from itself, a CREATE TABLE AS, a tiering round, a
+    /// union with text) takes the marked columns as before. (Here, with the node: an UPDATE needs the leader's sequencer.)
+    #[tokio::test]
+    async fn a_tables_json_column_is_marked_where_queries_plan_over_it() {
+        use datafusion::arrow::array::{Array, AsArray};
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            let run = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let stmt = crate::write::parse(sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                }
+            };
+            // (each answer's columns, first row, as text, and its rows: `arrow_metadata` reads a field's mark as planned)
+            let first = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let b = app.query(sql, Some("0"), &node.scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    let b = datafusion::arrow::compute::concat_batches(&b[0].schema(), &b).unwrap();
+                    let text = |c: &dyn Array| datafusion::arrow::compute::cast(c, &datafusion::arrow::datatypes::DataType::Utf8).unwrap();
+                    let row = b.columns().iter().map(|c| text(c.as_ref())).map(|c| c.as_string::<i32>().is_valid(0).then(|| c.as_string::<i32>().value(0).to_string())).collect::<Vec<_>>();
+                    (row, b.num_rows())
+                }
+            };
+            let s = |v: &str| Some(v.to_string());
+            let marked = "SELECT arrow_metadata(doc, 'pg_type'), arrow_metadata(js, 'pg_type'), arrow_metadata(t, 'pg_type') FROM j WHERE id = 1";
+            run("CREATE TABLE j (id BIGINT, doc JSONB, js JSON, t TEXT)").await;
+            run(r#"INSERT INTO j VALUES (1, '{"a": 1}', '{"b": 2}', 'x'), (2, '{"a": 2}', '[3]', 'y')"#).await;
+            let want = (vec![s("jsonb"), s("json"), None], 1);
+            assert_eq!(first(marked).await, want, "its rows in memory");
+            app.tier_all(0).await.unwrap();
+            assert_eq!(first(marked).await, want, "its rows in a file");
+            run(r#"UPDATE j SET doc = '{"a": 3}' WHERE id = 2"#).await;
+            run("DELETE FROM j WHERE id = 1").await;
+            run("INSERT INTO j SELECT id + 10, doc, js, t FROM j").await;
+            run("CREATE TABLE c AS SELECT * FROM j").await;
+            run("CREATE VIEW v AS SELECT id, doc FROM j").await;
+            app.tier_all(0).await.unwrap();
+            assert_eq!(first("SELECT doc FROM j ORDER BY id").await, (vec![s(r#"{"a": 3}"#)], 2));
+            assert_eq!(first("SELECT count(*) FROM c").await.0, vec![s("2")]);
+            assert_eq!(first("SELECT arrow_metadata(doc, 'pg_type') FROM v").await, (vec![s("jsonb")], 2), "through a view");
+            assert_eq!(first("SELECT doc FROM j UNION ALL SELECT t FROM j").await.1, 4);
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })
