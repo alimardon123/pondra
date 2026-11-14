@@ -27735,9 +27735,11 @@ def dialects():
         got = {w: {"http": [r["id"] for r in q(f"SELECT id FROM dfg WHERE {w} ORDER BY id")],
                    "port": [r[0] for r in conn.execute(f"SELECT id FROM dfg WHERE {w} ORDER BY id").fetchall()]} for w in loose}
     got["the view"] = [r["id"] for r in q("SELECT id FROM dfv ORDER BY id")]
+    # (FROM first: text only the fallback dialect reads, grouped by the front on its tree, as a page groups any, 11-10 audit H3)
+    got["from first"] = {w: [r["id"] for r in q(f"FROM dfg SELECT id WHERE {w} ORDER BY id")] for w in loose}
     info["IS DISTINCT FROM before AND and OR"] = got
-    checks["IS [NOT] DISTINCT FROM before AND or OR compares only what Postgres compares: DuckDB 2.0's rows over HTTP, the port and a view"] = \
-        all(got[w] == {"http": want, "port": want} for w, want in loose.items()) and got["the view"] == [1, 3, 4]
+    checks["IS [NOT] DISTINCT FROM before AND or OR compares only what Postgres compares: DuckDB 2.0's rows over HTTP, the port, a view and FROM first"] = \
+        all(got[w] == {"http": want, "port": want} for w, want in loose.items()) and got["the view"] == [1, 3, 4] and got["from first"] == loose
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))

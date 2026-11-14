@@ -532,6 +532,7 @@ pub(crate) mod tests {
                 (Phase::Wants, "diff.diffs"), // (a tree pass since Trellis T1a: the parse reads a side that is a query)
                 (Phase::Wants, "pattern.wanted"),
                 (Phase::Wants, "text.names_a_type"),
+                (Phase::Wants, "grouping.regroups"),
                 (Phase::Parse, "friendly.comprehension"),
                 (Phase::Parse, "friendly.lambda"),
                 (Phase::Parse, "friendly.pivot"),

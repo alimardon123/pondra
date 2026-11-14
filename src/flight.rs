@@ -966,7 +966,9 @@ impl FlightSqlService for Sql {
         let who = crate::routines::Who::signed(caller(&req), role, false); // (planned for its sign-in)
         let session = in_txn(crate::temp::sessions(&self.0.lake).as_deref(), who.name(), txn)?;
         let w = Worded::of(&who.scope);
-        let read = statement::as_pondra(&q.query).map_err(w.err())?; // (the looks read Pondra's SQL; the ticket keeps the text as sent, which `statement::run` reads)
+        // (the looks read Pondra's SQL, in the language of the session it runs in, as its stream is: 11-13 audit L3; the
+        // ticket keeps the text as sent, which `statement::run` reads)
+        let read = in_session(crate::temp::named(&self.0.lake, session.clone()), async { statement::as_pondra(&q.query).map(|r| r.into_owned()).map_err(w.err()) }).await?;
         if crate::routines::runs_procedure(&read) || crate::returning::of(&read).is_some() {
             // A CALL (or DO), or a write with RETURNING: run now, as every door runs one; the ticket reads back what it answered.
             return kept(&self.0, &q.query, who, session, req.into_inner()).await;

@@ -117,6 +117,9 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let expands = crate::diff::rewrite(host, &mut stmts).await? || expands;
     // (a view's `sum(x) AS MEASURE revenue`, which the fallback dialect reads as an alias, ADR-065 §3: `measures::passes`)
     let measured = measured || (read_apart && crate::measures::marked(&stmts));
+    // (Postgres's grouping where generic groups otherwise, `grouping.rs`: here, on the tree whichever dialect read, so a
+    // page, FROM first and every door group alike, 11-10 audit H3; a node's door grouped text generic reads already)
+    let grouped = crate::grouping::wanted(sql) && crate::grouping::regroup(&mut stmts);
     let name = host.name();
     let me = format!("{name}.");
     // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
@@ -136,7 +139,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let typed = crate::pg_casts::rewrite(host, &mut stmts).await?; // (JSON's set functions, uuid and json casts, pg_typeof, a lateral generate_series, array literals, an enum's casts as text)
     // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
     let friendly = crate::friendly::rewrite(host, &mut stmts).await?;
-    if !expands && !friendly && !typed && !patterned && !read_apart {
+    if !expands && !friendly && !typed && !patterned && !read_apart && !grouped {
         return as_written();
     }
     Ok(crate::text::text_kept(stmts)) // (kept as the printed text's parse: the engine plans from the tree, `parsed::keep`)
