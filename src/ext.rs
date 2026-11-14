@@ -487,6 +487,9 @@ async fn resolve(lake: &Lake, spec: &Spec, scope: &crate::rights::Scope) -> Resu
         _ => {}
     }
     if let Some(f) = crate::table_formats::named(&spec.format) {
+        if f.past.iter().any(|o| spec.options.contains_key(*o)) {
+            crate::table_formats::may(&crate::ext_names::readable(&crate::ext_names::name(spec)), &spec.format, crate::table_formats::Ability::AsOf)?; // (11-14 audit L8)
+        }
         let r = (f.resolve)(lake, spec, scope).await?; // (another engine's table: its format's entry)
         check_files(lake, &r.meta, r.vouched.as_deref(), scope).await?;
         let mut entry = r.meta;

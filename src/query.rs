@@ -1170,7 +1170,7 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
         // what `big` measures, so a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
         let batch = match &send { Some(format) => crate::answer::as_sent(batch, format.as_deref()), None => batch };
         if held.try_grow(counted.count_batch(&batch)).is_err() {
-            return Err(too_big(room_of(&pool)));
+            return Err(too_big(&pool));
         }
         out.push(batch);
         if let Some(format) = &send {
@@ -1192,19 +1192,21 @@ pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Optio
     Some(held)
 }
 
-/// The memory a statement's answer may take at most now: its database's room in the node's line (`ledger::LakePool`), at
-/// most the node's memory for queries.
-pub(crate) fn room_of(pool: &Arc<dyn MemoryPool>) -> usize {
+/// The memory a statement's answer may take at most now, and its node's memory for queries: its database's room in the
+/// node's line (`ledger::LakePool`), at most that line, the node's own, not the process's (11-10 audit L2: a folder's
+/// databases are nodes in one process). A pool on no node's line: the process's.
+fn room_of(pool: &Arc<dyn MemoryPool>) -> (usize, usize) {
+    let line = crate::ledger::line_of(pool).unwrap_or_else(memory_limit);
     match pool.memory_limit() {
-        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => n.min(memory_limit()),
-        _ => memory_limit(),
+        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => (n.min(line), line),
+        _ => (line, line),
     }
 }
 
-/// The refusal of an answer bigger than the query memory (53200), with the way out. `room`: what the statement's database
-/// has of it now (`room_of`), less than the node's while the node's other databases' queries hold some (11-06 audit M10).
-pub(crate) fn too_big(room: usize) -> anyhow::Error {
-    let line = memory_limit();
+/// The refusal of an answer bigger than the query memory (53200), with the way out. What the statement's database has of
+/// it now (`room_of`) is less than the node's while the node's other databases' queries hold some (11-06 audit M10).
+pub(crate) fn too_big(pool: &Arc<dyn MemoryPool>) -> anyhow::Error {
+    let (room, line) = room_of(pool);
     let what = match room < line {
         true => format!("the memory this database has for queries now ({} MB of the node's {} MB: its other databases' queries hold the rest)", room >> 20, line >> 20),
         false => format!("this node's memory for queries ({} MB)", line >> 20),
@@ -1331,7 +1333,7 @@ async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<
                 None => break, // (none is ready: what is goes now)
             }
         }
-        held.try_grow(size).map_err(|_| too_big(room_of(pool)))?;
+        held.try_grow(size).map_err(|_| too_big(pool))?;
         for piece in crate::answer::pieces(ready) {
             rows += piece.num_rows() as u64;
             step_to(enc, tx, Some(&piece)).await?;
