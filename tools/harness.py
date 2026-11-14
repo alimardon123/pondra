@@ -19963,7 +19963,9 @@ def uuids():
     uuid.UUID (text, binary, RETURNING, DECLARE and named cursors) and takes them as parameters; asyncpg and
     SQLAlchemy's Uuid(as_uuid=True) work the same. The catalog says uuid; SHOW CREATE TABLE shows UUID and runs again
     after a DROP; ADD COLUMN and RENAME COLUMN keep the type; ALTER COLUMN … TYPE and CREATE OR ALTER refuse a
-    VARCHAR turned into one (42804) and turn a uuid into text."""
+    VARCHAR turned into one (42804) and turn a uuid into text. A table's uuid, json and jsonb columns go out in an Arrow
+    answer named by their Arrow extension types, and a Parquet file of it with the names reads back through Pondra, DuckDB
+    and pyarrow."""
     import asyncio
     import psycopg
     import sqlalchemy as sa
@@ -20268,6 +20270,30 @@ def uuids():
         info["ORM ids after flush"] = [repr(i) for i in ids]
         return all(isinstance(i, uuid.UUID) for i in ids) and back is not None and back.name == "orm-a" and names == ["orm-a", "orm-b"]
 
+    def types_go_out():
+        """Step 5's column types (5-TY-b): a table's uuid, json and jsonb columns go out in an Arrow answer named by their Arrow
+        extension types (`column_types::EXTENSION`: Arrow's own arrow.json, which pyarrow reads as its JSON type; pondra.uuid,
+        pondra.jsonb), and a Parquet file pyarrow writes of it, which keeps the names, reads as the table's rows through
+        Pondra's reader, DuckDB's and pyarrow's."""
+        import tempfile, duckdb, pyarrow as pa, pyarrow.parquet as pq
+        q("CREATE TABLE typed_out (id INT, u UUID, j JSON, b JSONB)")
+        q("""INSERT INTO typed_out VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{"a": 1}', '{"b": [2]}')""")
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql?format=arrow", b"SELECT * FROM typed_out", {})
+        answer = pa.ipc.open_stream(c.getresponse().read()).read_all()
+        c.close()
+        named = lambda schema: {f.name: getattr(f.type, "extension_name", None) or (f.metadata or {}).get(b"ARROW:extension:name", b"").decode() for f in schema}
+        path = os.path.join(tempfile.mkdtemp(prefix="pondra-types-"), "typed.parquet")
+        pq.write_table(answer, path)
+        want = ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", '{"a": 1}', '{"b": [2]}']
+        rows = {"pyarrow": [[str(v) for v in r.values()] for r in pq.read_table(path).to_pylist()],
+                "duckdb": [[str(v) for v in r] for r in duckdb.sql(f"SELECT * FROM read_parquet('{path}')").fetchall()],
+                "pondra": [cli(f"SELECT * FROM '{path}'").stdout, cli("SELECT * FROM typed_out").stdout]}  # (a path on this disk: a node of its own)
+        info["types out: the extension names in the Arrow answer and in pyarrow's Parquet file of it; its rows by pyarrow, DuckDB, Pondra (as the table's)"] = \
+            [named(answer.schema), named(pq.read_schema(path)), rows]
+        return named(answer.schema) == named(pq.read_schema(path)) == {"id": "", "u": "pondra.uuid", "j": "arrow.json", "b": "pondra.jsonb"} \
+            and rows["pyarrow"] == rows["duckdb"] == [["1", *want]] and rows["pondra"][0] == rows["pondra"][1] and all(w in rows["pondra"][0] for w in want)
+
     def catalog():
         with psycopg.connect(url, autocommit=True) as conn:
             oids = conn.execute("SELECT a.atttypid FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
@@ -20362,6 +20388,8 @@ def uuids():
         check("CREATE OR ALTER TABLE turning the VARCHAR name into UUID is refused 42804, and the column stays text", create_or_alter)
         check("ALTER COLUMN … TYPE: VARCHAR to UUID refused 42804, UUID to UUID no change, UUID to TEXT is text from then on "
               "(psycopg 25, 'nope' taken), as is CREATE OR ALTER's VARCHAR", alter_type)
+        check("a table's uuid, json and jsonb columns go out in an Arrow answer named by their Arrow extension types (pondra.uuid, "
+              "arrow.json, pondra.jsonb); a Parquet file of it with the names reads as the table's rows through Pondra, DuckDB and pyarrow", types_go_out)
     finally:
         if node is not None:
             node.kill()
