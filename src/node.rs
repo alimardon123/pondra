@@ -1053,6 +1053,9 @@ mod tests {
             assert_eq!(first("SELECT doc FROM j ORDER BY id").await, (vec![s(r#"{"a": 3}"#)], 2));
             assert_eq!(first("SELECT count(*) FROM c").await.0, vec![s("2")]);
             assert_eq!(first("SELECT arrow_metadata(doc, 'pg_type') FROM v").await, (vec![s("jsonb")], 2), "through a view");
+            run("CREATE TABLE k (u UUID)").await;
+            run("INSERT INTO k VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')").await;
+            assert_eq!(first("SELECT arrow_metadata(u, 'pg_type') FROM k").await, (vec![s("uuid")], 1), "a uuid column, marked by its entry too");
             assert_eq!(first("SELECT doc FROM j UNION ALL SELECT t FROM j").await.1, 4);
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
