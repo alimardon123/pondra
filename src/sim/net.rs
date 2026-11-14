@@ -25,6 +25,22 @@ struct Door {
     peer: std::net::SocketAddr,
 }
 
+impl Door {
+    /// `req` answered by `router` on a task this member's kill ends (`Net::down`).
+    async fn answered(&self, router: axum::Router, req: http::Request<axum::body::Body>) -> Result<axum::response::Response, tokio::task::JoinError> {
+        let answered = crate::spawns::untracked(async move {
+            use tower::ServiceExt;
+            router.oneshot(req).await.unwrap_or_else(|never| match never {})
+        });
+        {
+            let mut answering = lock(&self.answering);
+            answering.retain(|a| !a.is_finished());
+            answering.push(answered.abort_handle());
+        }
+        answered.await
+    }
+}
+
 /// A sim cluster's network.
 #[derive(Default)]
 pub struct Net {
@@ -70,6 +86,15 @@ impl Net {
     /// The dial member `me` calls the others with (`NodeState::dial`).
     pub fn dial(self: &Arc<Self>, me: &str) -> Arc<dyn Dial> { Arc::new(Dialer { net: self.clone(), me: me.to_string() }) }
 
+    /// `req` from outside the cluster (the test's own) to member `to`, answered as a member's call is (`reach`): on a task
+    /// its kill ends, so a killed member's requests change nothing more.
+    pub async fn answer(&self, to: &str, req: http::Request<axum::body::Body>) -> Result<axum::response::Response> {
+        let none = |why: &str| crate::dial::no_answer(format!("{to}: {why} (the sim)"));
+        let Some(door) = lock(&self.doors).get(to).cloned() else { return Err(none("no member answers there")) };
+        let Some(router) = lock(&door.running).clone().map(|r| r.router) else { return Err(none("it is starting, or stopped")) };
+        door.answered(router, req).await.map_err(|_| none("it went down while answering"))
+    }
+
     /// `c` from `me` (node `node`) to member `to`, answered by its router, or no answer: within `c.timeout` if it has one,
     /// from the call's start to its answer's last piece, as the nodes' HTTP client times a call (reqwest's `timeout`).
     async fn call(&self, me: &str, node: &crate::node_state::NodeState, to: &str, c: Call) -> Result<Reply> {
@@ -106,16 +131,7 @@ impl Net {
         let Some(router) = lock(&door.running).clone().map(|r| r.router) else { return Err(none("it is starting, or stopped")) };
         let from = mine.map_or(std::net::SocketAddr::from(([127, 0, 0, 1], 7000)), |d| d.peer);
         let req = request(node, from, c.verb, &c.path, c.json, c.bearer, c.user, c.headers, c.body)?;
-        let answered = crate::spawns::untracked(async move {
-            use tower::ServiceExt;
-            router.oneshot(req).await.unwrap_or_else(|never| match never {})
-        });
-        {
-            let mut answering = lock(&door.answering);
-            answering.retain(|a| !a.is_finished());
-            answering.push(answered.abort_handle());
-        }
-        let res = answered.await.map_err(|_| none("it went down while answering"))?;
+        let res = door.answered(router, req).await.map_err(|_| none("it went down while answering"))?;
         if lost {
             return Err(none("its answer was lost"));
         }

@@ -12,6 +12,9 @@ use anyhow::{anyhow, bail, Result};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+/// How long the test's own request waits for its answer (`Cluster::ask`): the harness's `call`'s 30 s.
+const ASKED: Duration = Duration::from_secs(30);
+
 /// One member: its name and faults, and while it is up, its supervisor and the node its last start made.
 struct Member {
     name: String,
@@ -51,6 +54,8 @@ pub struct Cluster {
     /// The members' network.
     pub net: Arc<Net>,
     members: Vec<Arc<Member>>,
+    /// What each start gives its member besides its lake (`pondra serve`'s flags: `set_start`).
+    start: Mutex<crate::node::Start>,
 }
 
 impl Cluster {
@@ -74,7 +79,7 @@ impl Cluster {
                 })
             })
             .collect();
-        Cluster { seed, name, bucket, net, members }
+        Cluster { seed, name, bucket, net, members, start: Default::default() }
     }
 
     /// Member `m`'s lake (0-based): `sim://<cluster>-<member>/lake`, the cluster's one bucket through its faults.
@@ -107,6 +112,7 @@ impl Cluster {
             })),
         };
         let mut options = crate::node::Options::member(&self.dir(m), &member.name, given);
+        options.start = lock(&self.start).clone();
         options.host = Some(host.clone());
         *lock(&member.host) = Some(host);
         self.net.join(&member.name, member.running.clone(), member.faults.clone());
@@ -123,6 +129,12 @@ impl Cluster {
             }
         }
     }
+
+    /// Each start from now on is given these (`pondra serve`'s flags: `--flush-ms`, `--tier-secs`, …).
+    pub fn set_start(&self, set: impl FnOnce(&mut crate::node::Start)) { set(&mut lock(&self.start)); }
+
+    /// Is member `m` up: started, and not killed since (by the test or a point it stopped at)?
+    pub fn up(&self, m: usize) -> bool { lock(&self.members[m].supervisor).as_ref().is_some_and(|s| !s.is_finished()) }
 
     /// Kills member `m` (`Member::kill`).
     pub fn kill(&self, m: usize) { self.members[m].kill(); }
@@ -146,15 +158,17 @@ impl Cluster {
     }
 
     /// One request to member `m`'s router, from no member: its status and whole body.
+    /// Answered on a task its kill ends (`Net::answer`), within `ASKED` on the sim's clock, as the harness's `call` waits.
     pub async fn ask(&self, m: usize, method: &str, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
-        use tower::ServiceExt;
-        self.members[m].faults.thawed().await; // (a frozen member answers no one until it is thawed)
-        let Some(router) = lock(&self.members[m].running).clone().map(|r| r.router) else { bail!("{} isn't serving", self.members[m].name) };
-        let req = crate::node::request(method, path, &[], body, None)?;
-        let res = router.oneshot(req).await.unwrap_or_else(|never| match never {});
-        let status = res.status().as_u16();
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
-        Ok((status, body.to_vec()))
+        let name = &self.members[m].name;
+        let asked = async {
+            self.members[m].faults.thawed().await; // (a frozen member answers no one until it is thawed)
+            let res = self.net.answer(name, crate::node::request(method, path, &[], body, None)?).await?;
+            let status = res.status().as_u16();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+            Ok((status, body.to_vec()))
+        };
+        tokio::time::timeout(ASKED, asked).await.unwrap_or_else(|_| Err(anyhow!("{name}: no answer in {} s", ASKED.as_secs())))
     }
 
     /// Member `m`'s `/stats`, or None while it doesn't answer.
