@@ -601,7 +601,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
     if data.len() > inline_bytes() {
         f.path = format!("log/{}-{:015}.seg", uuid::Uuid::new_v4().simple(), now_ms()); // (a random first part: every node's flushes spread over the key range, C5; the catalog holds each path)
         lake.put(&f.path, data).await?;
-        maybe_crash("after_seg_put", &*lake.node.life);
+        maybe_crash("after_seg_put", &lake.node);
     } else {
         f.data = data.into();
     }
@@ -1202,7 +1202,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
             drop(ms);
             lake.cat.stage("commit", t0); // (from `order` to here: the commit /stats times)
-            maybe_crash("after_commit", &*lake.node.life);
+            maybe_crash("after_commit", &lake.node);
             lake.advance(hwm);
             for (reply, outcome) in replies {
                 let _ = reply.send(outcome);

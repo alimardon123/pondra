@@ -30,6 +30,8 @@ pub struct Options {
     /// Its host (`node::Host`): told when the node's own work fails or must start again, and takes its lake's moves. None
     /// for a guest, a command's own node and a test's: a failure ends the process, and the lake can't move.
     pub(crate) host: Option<crate::node::Host>,
+    /// What its host gives it beside its process's own (`node_state::Given`): nothing, but for the sim's member.
+    pub(crate) given: crate::node_state::Given,
 }
 
 impl Options {
@@ -37,7 +39,14 @@ impl Options {
     /// library opens (ADR-061 §2).
     pub fn local(dir: &str, listen: &str) -> Options {
         Options { dir: dir.into(), listen: listen.into(), advertise: None, start: Start::default(),
-                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach: vec![], attach_found: None, guest: None, settings: crate::settings::Values::now(), move_failed: None, host: None }
+                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach: vec![], attach_found: None, guest: None, settings: crate::settings::Values::now(), move_failed: None, host: None, given: Default::default() }
+    }
+
+    /// The sim's member `name` of the lake at `dir` (`sim::Cluster`): a node that lives, and what the sim gives it (`given`).
+    /// Its host keeps it beside the others (`Host::beside`): no port of its own, its router reached by the sim's network.
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn member(dir: &str, name: &str, given: crate::node_state::Given) -> Options {
+        Options { advertise: Some(name.to_string()), given, ..Options::local(dir, "") }
     }
 
     /// A guest for `dir`: the node a program starts for its own statements, which answers them and ends. No
@@ -50,7 +59,7 @@ impl Options {
         let guest = if crate::memory_lake::in_memory(dir) { Guest::Writes } else { guest };
         let auth = auth::Auth::from_env().owned_by(Some(uuid::Uuid::new_v4().simple().to_string()));
         Options { dir: dir.into(), listen: String::new(), advertise: None, start: Start { tier_secs: 0.0, auth: Arc::new(auth), ..Start::default() },
-                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest), settings: crate::settings::Values::now(), move_failed: None, host: None }
+                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest), settings: crate::settings::Values::now(), move_failed: None, host: None, given: Default::default() }
     }
 
     /// Database `dir` of a folder of lakes (`pondra serve <folder>`, `dbserver.rs`): a node that lives in its server's
@@ -62,7 +71,7 @@ impl Options {
     pub(crate) fn database(dir: &str, advertise: String, folder: &str, start: Start, server: &str, host: crate::node::Host) -> Options {
         let settings = crate::settings::Values::now().with("PONDRA_SERVER_URL", format!("http://{server}")).without("PONDRA_IDLE_EXIT_SECS");
         Options { dir: dir.into(), listen: String::new(), advertise: Some(advertise), start, pg: None, kafka: None, kafka_advertise: None, flight: None,
-                  attach: vec![], attach_found: Some(folder.into()), guest: None, settings, move_failed: None, host: Some(host) }
+                  attach: vec![], attach_found: Some(folder.into()), guest: None, settings, move_failed: None, host: Some(host), given: Default::default() }
     }
 }
 
@@ -204,7 +213,7 @@ impl Node {
     /// Everything `pondra serve` did before it served, then the HTTP door served on a task of its own.
     /// `held` takes what this start takes (the term, then the lake), so a stop during the start gives it back.
     pub(crate) async fn start(o: Options, held: Arc<Held>) -> anyhow::Result<Node> {
-        let Options { dir, listen, advertise, start, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest, settings, move_failed, host } = o;
+        let Options { dir, listen, advertise, start, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest, settings, move_failed, host, given } = o;
         // (a guest answers one program's statements and ends: none of the loops and doors a node that lives keeps, so
         // every `lives` below keeps them for a node that lives only)
         let lives = guest.is_none();
@@ -214,7 +223,10 @@ impl Node {
         crate::net::install(Arc::new(crate::os::Net::default()));
         // (what this node does when it must stop or start again, and what its stop waits for: its lakes and its member hold it)
         let routed = host.as_ref().is_some_and(crate::node::Host::keeps_beside); // (its host reaches it in this process: no door of its own, `Options::database`)
-        let here = crate::node::native_with(!lives, settings, host);
+        let here = crate::node::native_with(!lives, settings, host, &given);
+        if let Some(started) = &given.started {
+            started(&here); // (the sim keeps it, to end its tasks when it kills the member)
+        }
         let _ = held.node.set(here.clone()); // (a stop drains and closes this node's door: `Held::stop`)
         if let Some(why) = move_failed {
             let _ = here.move_failed.set(why); // (its lake stayed in memory: `/stats` and `pondra.databases` say why)

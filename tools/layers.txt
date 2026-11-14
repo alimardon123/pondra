@@ -266,6 +266,7 @@ hosted hosts
 idle hosts
 lib hosts
 library hosts
+sim hosts
 main hosts
 memory hosts
 memory_lake catalog

@@ -1342,7 +1342,7 @@ impl Encoding {
         let (buf, file) = blocking(move || self.finish(typed)).await?;
         let path = format!("data/{}/{}.parquet", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
         lake.put(&path, buf).await?;
-        maybe_crash("after_parquet_put", &*lake.node.life);
+        maybe_crash("after_parquet_put", &lake.node);
         if !hot.is_empty() {
             let cache = lake.hot();
             let (room, held) = (cache.room_for(lake), path.clone());

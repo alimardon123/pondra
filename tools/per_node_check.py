@@ -56,6 +56,7 @@ PROCESS = {
     "ai.rs:TURNS": SETTING + " (PONDRA_AI_CALLS)",
     "audit.rs:C": SETTING + " (PONDRA_AUDIT)",
     "ai.rs:CALLS": "requests to the AI endpoint that were answered: the endpoint and its turns are the process's environment's (`PONDRA_AI_URL`, `PONDRA_AI_CALLS`)",
+    "store.rs:BUCKETS": "the sim's members' buckets by name (sim/store.rs, a test or sim build's): each test's cluster names its own, and forgets them as it ends",
     "ai.rs:FAILED": "requests to the AI endpoint that failed for good: the process's, as CALLS",
     "ai.rs:RETRIED": "requests to the AI endpoint that were tried again: the process's, as CALLS",
     "ai.rs:SAID": "when a failed AI request was last said on standard error: the process's, which says it",
