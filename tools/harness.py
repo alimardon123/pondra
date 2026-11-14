@@ -10622,6 +10622,118 @@ def movereaders():
     print(json.dumps({"movereaders": checks, "info": info, "ok": ok}, indent=1, default=str))
 
 
+def diffs():
+    """`pondra.diff(a, b)` over views and queries (Trellis T1, `diff.rs`): two views, a table and a query, a table's past
+    and its present. Sides other than two tables, with no key, match whole, as multisets, so each answer is DuckDB's
+    `b EXCEPT ALL a` as inserts and `a EXCEPT ALL b` as deletes, each copy counted, with no `_changed`. Sides with a key (a
+    table's, a view's PRIMARY KEY … NOT ENFORCED, or `key =>`) match by it, with update rows naming what changed; a key
+    held twice (21000), a key column the sides lack (42703) and two declared keys (42P10) are refused. (Two tables match by their rows' ids,
+    a branch's: environments_check.py, where an update names the columns it changed.) The answer has b's columns in b's
+    order; sides of other columns are refused with 42804, naming the first."""
+    import duckdb
+    setup = ["CREATE TABLE t (id BIGINT, n BIGINT, s TEXT)",
+             "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 20, 'b'), (4, 30, 'c'), (5, 40, NULL), (6, 40, NULL)",
+             "CREATE VIEW low AS SELECT n, s FROM t WHERE n <= 30",
+             "CREATE VIEW high AS SELECT n, s FROM t WHERE n >= 20"]
+    checks, info = {}, {}
+    duck = duckdb.connect()
+    for s_ in setup:
+        duck.execute(s_)
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    for s_ in setup:
+        sql(A.port, s_)
+    key = lambda rows: sorted(rows, key=repr)
+
+    def typed(text):  # (a plain JSON row leaves out its NULL columns: `typed` names them all, in order, and keeps NULLs)
+        return call(A.port, "POST", "/sql?format=typed", text.encode())
+
+    def header(text):
+        return [c["name"] for c in typed(text)["columns"]]
+
+    def diffed(a, b):
+        return [tuple(r) for r in typed(f"SELECT * FROM pondra.diff({a}, {b})")["rows"]]
+
+    def duck_side(side):
+        return f"SELECT * FROM {side.strip(chr(39))}" if side.startswith("'") else side[1:-1]
+
+    def same(name, a, b, duck_a=None, duck_b=None):
+        got = diffed(a, b)
+        da, db = duck_a or duck_side(a), duck_b or duck_side(b)
+        want = [("insert", *r) for r in duck.execute(f"({db}) EXCEPT ALL ({da})").fetchall()] + [("delete", *r) for r in duck.execute(f"({da}) EXCEPT ALL ({db})").fetchall()]
+        info[name] = got
+        checks[f"{name}: == DuckDB's EXCEPT ALL both ways ({len(want)} rows), no _changed"] = \
+            key([r[:-1] for r in got]) == key(want) and all(r[-1] is None for r in got)
+
+    same("two views", "'low'", "'high'")
+    same("a table and a query, a copy more counted once", "'t'", "(SELECT * FROM t UNION ALL SELECT * FROM t WHERE id = 2)")
+    same("two queries, NULLs alike", "(SELECT n, s FROM t WHERE id > 3)", "(SELECT n, s FROM t WHERE id > 4)")
+    same("a diff inside a side", "(SELECT n, s FROM pondra.diff('low', 'high'))", "(SELECT n, s FROM low)",
+         duck_a="SELECT n, s FROM ((SELECT * FROM high EXCEPT ALL SELECT * FROM low) UNION ALL (SELECT * FROM low EXCEPT ALL SELECT * FROM high))")
+    # (the answer's columns are b's, in b's order, then _changed; and it is a FROM's relation as any other)
+    order = header("SELECT * FROM pondra.diff((SELECT s, n FROM t), (SELECT n, s FROM t WHERE id > 1))")
+    counted = sql(A.port, "SELECT d._change_type, count(*) AS c FROM pondra.diff('low', 'high') AS d GROUP BY 1 ORDER BY 1")
+    info["order, counted"] = [order, counted]
+    checks["the answer has b's columns in b's order, then _changed"] = order == ["_change_type", "n", "s", "_changed"]
+    checks["a diff with an alias, grouped"] = counted == [{"_change_type": "delete", "c": 1}, {"_change_type": "insert", "c": 2}]
+    # A table's past and its present: one row changed, one gone, one new
+    first = sql(A.port, "SELECT max(_version) AS v FROM t")[0]["v"]
+    duck.execute("CREATE TABLE t_past AS SELECT * FROM t")
+    for s_ in ["UPDATE t SET n = n + 1 WHERE id = 1", "DELETE FROM t WHERE id = 6", "INSERT INTO t VALUES (7, 20, 'b')"]:
+        sql(A.port, s_)
+        duck.execute(s_)
+    same("a table's past and its present", f"(SELECT * FROM t VERSION AS OF {first})", "'t'", duck_a="SELECT * FROM t_past")
+    checks["the past's diff is the three writes"] = key([r[:-1] for r in info["a table's past and its present"]]) == \
+        key([("delete", 1, 10, "a"), ("delete", 6, 40, None), ("insert", 1, 11, "a"), ("insert", 7, 20, "b")])
+    # Keys (Trellis T1b): a table's key, a view's fact, `key =>`; then update rows, naming what changed
+    for s_ in ["CREATE TABLE kt (id BIGINT PRIMARY KEY, n BIGINT, s TEXT)", "INSERT INTO kt SELECT id, n, s FROM t",
+               "CREATE TABLE kt2 (id BIGINT PRIMARY KEY, n BIGINT, s TEXT)", "INSERT INTO kt2 SELECT id, n, s FROM t",
+               "CREATE VIEW kv (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id, CASE WHEN id = 2 THEN 21 ELSE n END AS n, s FROM t WHERE id <> 4 UNION ALL SELECT 8, 80, 'h'",
+               "CREATE VIEW kv2 (PRIMARY KEY (id, s) NOT ENFORCED) AS SELECT id, n, s FROM t"]:
+        sql(A.port, s_)
+    key = lambda rows: sorted(rows, key=repr)
+    keyed = {
+        "a table's key and a view's fact, the same": ("'kt'", "'kv'", [("delete", 4, 30, "c", None), ("insert", 8, 80, "h", None), ("update_postimage", 2, 21, "b", ["n"]), ("update_preimage", 2, 20, "b", ["n"])]),
+        "a view's fact against a query": ("'kv'", "(SELECT id, n, s FROM t WHERE id <> 8)", [("delete", 8, 80, "h", None), ("insert", 4, 30, "c", None), ("update_postimage", 2, 20, "b", ["n"]), ("update_preimage", 2, 21, "b", ["n"])]),
+        "key => on two queries": ("(SELECT id, n, s FROM t)", "(SELECT id, n + 1 AS n, s FROM t WHERE id < 3), key => 'id'",
+                                  [("delete", 3, 20, "b", None), ("delete", 4, 30, "c", None), ("delete", 5, 40, None, None), ("delete", 7, 20, "b", None),
+                                   ("update_postimage", 1, 12, "a", ["n"]), ("update_postimage", 2, 21, "b", ["n"]), ("update_preimage", 1, 11, "a", ["n"]), ("update_preimage", 2, 20, "b", ["n"])]),
+        "key => on two tables, which else match by row": ("'kt'", "'kt2', key => 'id'", []),
+    }
+    for name, (a, b, want) in keyed.items():
+        got = diffed(a, b)
+        info[f"keyed: {name}"] = got
+        checks[f"keyed, {name}: inserts, deletes and updates naming what changed"] = key(got) == key(want)
+    sql(A.port, "UPDATE kt2 SET n = 0, s = 'x' WHERE id = 1")
+    moved = diffed("'kt'", "'kt2', key => 'id'")
+    info["keyed: kt2 changed"] = moved
+    checks["keyed: an update names both columns it changed"] = key(moved) == key([("update_postimage", 1, 0, "x", ["n", "s"]), ("update_preimage", 1, 11, "a", ["n", "s"])])
+    for name, text, code, said in [
+        ("a key held on two rows of a side", "SELECT * FROM pondra.diff((SELECT n, s FROM t), (SELECT n, s FROM t), key => 'n')", "21000", "holds n = 20 on more than one row"),
+        ("a key column the sides lack", "SELECT * FROM pondra.diff('kt', 'kv', key => 'nope')", "42703", "nope is not a column of the two sides"),
+        ("two sides declaring other keys", "SELECT * FROM pondra.diff('kv', 'kv2')", "42P10", "kv's is (id) and kv2's (id, s): key => 'id, s' picks one"),
+    ]:
+        status, state, body = _sqlstate_of(A.port, text)
+        info[f"refused: {name}"] = [status, state, body[:300]]
+        checks[f"refused, {name}: {code}, saying so"] = status >= 400 and state == code and said in body
+    # Refusals
+    status, state, body = _sqlstate_of(A.port, "SELECT * FROM pondra.diff('low', 't')")
+    info["other columns"] = [status, state, body[:300]]
+    checks["sides of other columns: 42804, naming the first by b's order"] = status == 400 and state == "42804" and "id is a column of t and not of low" in body
+    status, state, body = _sqlstate_of(A.port, "SELECT * FROM pondra.diff('low', (SELECT n, CAST(s AS BIGINT) AS s FROM t))")
+    info["other types"] = [status, state, body[:300]]
+    checks["a column of two types: 42804, naming it and both types"] = status == 400 and state == "42804" and "s is Utf8" in body and "Int64" in body
+    status, state, body = _sqlstate_of(A.port, "SELECT * FROM pondra.diff('low')")
+    info["one side"] = [status, state, body[:300]]
+    checks["one side: refused with 42883, as Postgres refuses a call it has no function for, saying the form"] = status >= 400 and state == "42883" and "pondra.diff takes two sides" in body
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"diffs": checks, "info": info, "ok": ok}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"pondra.diff over views and queries: {len(checks)} checks pass"
+
+
 def viewtext():
     """A view's query as written (L6, Alimardon 11-02: people document views in their SQL): `CREATE VIEW` and `CREATE
     MATERIALIZED VIEW` keep their `--` and `/* … */` comments and line breaks, `SHOW CREATE` gives them as written (over
@@ -10802,7 +10914,7 @@ def server():
     found as such, or named so (`--lakes`). psql and HTTP reach each by name, and queries join
     across them; the console is at `/`; CREATE DATABASE makes one, and DROP DATABASE keeps one to be
     undropped (PURGE deletes it); a database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
-    database's node gets `pondra serve`'s options; a connection open (or a request in flight)
+    database's node runs in the server's own process (no child processes) and gets `pondra serve`'s options; a connection open (or a request in flight)
     keeps its database's node running; another node joins a database's cluster through
     the server; the server killed and started again serves the same databases; each database signs
     in on its own (a grant in one covers none of the others, an open one opens nothing of another);
@@ -10832,11 +10944,13 @@ def server():
     checks["the folder's lakes are its databases, none running until used"] = running() == {"crm": False, "lake": False, "sales": False}
     checks["psql and HTTP reach each database by name; no /db/ means the default (lake)"] = pq("sales", "SELECT sum(amount) FROM orders") == [(30.5,)] \
         and call(port, "POST", "/db/crm/sql", b"SELECT name FROM customers ORDER BY id") == [{"name": "ann"}, {"name": "bob"}] and call(port, "POST", "/sql", b"SELECT text FROM notes") == [{"text": "hi"}]
-    nodes_of = lambda: [p for p in subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
-                        if os.path.exists(f"/proc/{p}/cmdline") and "--attach-found" in open(f"/proc/{p}/cmdline").read() and folder in open(f"/proc/{p}/cmdline").read()]
-    # (a setting given to serve reaches each database's node as its environment, `env::given`; the other flags on its command line)
-    environ = lambda p: dict(kv.split("=", 1) for kv in open(f"/proc/{p}/environ").read().split("\0") if "=" in kv)
-    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = bool(nodes_of()) and all(environ(p).get("PONDRA_MEMORY_GB") == "1.5" for p in nodes_of())
+    # (each database's node is in the server's process, invariant 301: the server starts no child, and a setting given to
+    # serve is each node's, as its own /metrics says)
+    children = lambda: subprocess.run(["pgrep", "-P", str(srv.pid)], capture_output=True, text=True).stdout.split()
+    up = [d for d, r in running().items() if r]
+    checks["the databases' nodes run in the server's own process: it starts no child"] = len(up) >= 2 and children() == []
+    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = \
+        all(metrics_of(port, path=f"/db/{d}/metrics").get("pondra_memory_limit_bytes") == int(1.5 * (1 << 30)) for d in up)
     checks["a query joins across databases (name.schema.table)"] = pq("sales", "SELECT c.name, o.amount FROM orders o JOIN crm.customers c ON c.id = o.id ORDER BY o.id") == [("ann", 10.5), ("bob", 20.0)]
     checks["the console is at /"] = b"<html" in call(port, "GET", "/").lower() or b"<!doctype html" in call(port, "GET", "/").lower()
     pq("sales", "CREATE DATABASE hr")
@@ -30633,7 +30747,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents, diffs)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -30834,7 +30948,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "diffs", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -30847,7 +30961,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "diffs": diffs, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
