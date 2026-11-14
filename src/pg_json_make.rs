@@ -245,7 +245,11 @@ fn unmarked(e: Expr, schema: &DFSchema) -> Transformed<Expr> {
 }
 
 fn field_marked(name: &str, t: DataType, mark: &str) -> Field {
-    Field::new(name, t, true).with_metadata([(MARK.to_string(), mark.to_string())].into())
+    let field = Field::new(name, t, true);
+    match crate::column_types::named(mark) {
+        Some(ty) => crate::column_types::mark(field, ty), // (the section's one writer of the mark)
+        None => field,
+    }
 }
 
 /// Whether a field is JSON text, by its mark.
