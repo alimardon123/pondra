@@ -67,12 +67,8 @@ impl Ty {
     /// The type a `sql_types` entry names, if the port names it (a `varchar(n)` isn't one).
     #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a stored type's name: only a node keeps them)
     pub fn of(sql_type: &str) -> Option<Ty> {
-        match sql_type {
-            "uuid" => Some(Ty::Uuid),
-            "json" => Some(Ty::Json),
-            "jsonb" => Some(Ty::Jsonb),
-            _ => None,
-        }
+        let t = crate::column_types::named(sql_type)?; // (the column type's entry: `pg_column_types`)
+        [Ty::Uuid, Ty::Json, Ty::Jsonb].into_iter().find(|ty| ty.name() == t.name)
     }
 
     /// Its name, as `sql_types` and the field mark keep it.
