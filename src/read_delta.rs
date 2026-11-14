@@ -145,6 +145,7 @@ pub const FORMAT: crate::table_formats::TableFormat = crate::table_formats::Tabl
     name: "delta",
     abilities: &[crate::table_formats::Ability::Read, crate::table_formats::Ability::AsOf, crate::table_formats::Ability::Insert, crate::table_formats::Ability::CopyTo],
     options: &["version"],
+    past: &["version"],
     resolve: |lake, spec, scope| {
         Box::pin(async move {
             let found = resolve(&crate::ext::Asking { lake, scope }, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?; // (a folder named relatively: from where the node runs)

@@ -551,7 +551,7 @@ async fn set(lake: &Lake, name: &str, value: i64, called: bool) -> Result<i64> {
 /// INSERT or UPDATE a table that takes values from it (`takers`), and UPDATE one for `setval` (`set`), which can make
 /// later rows take values already taken, as Postgres asks UPDATE on the sequence for it. A user granted only SELECT, a
 /// read token, and work that lost its caller never move one; the node's own work does (`auth::as_node`). Nor does any
-/// caller at a door that reads only (`auth::reading`), whoever it is.
+/// caller at a door that reads only (`auth::reading`), whoever it is, nor in a transaction that reads only (`txn::reads_only`).
 async fn may_move(lake: &Lake, name: &str, s: &Sequence, set: bool) -> Result<()> {
     use crate::rights::{Action, Object};
     let call = if set { "setval" } else { "nextval" };
@@ -564,6 +564,10 @@ async fn may_move(lake: &Lake, name: &str, s: &Sequence, set: bool) -> Result<()
     if p.reads {
         // (Postgres's words, as a read-only transaction says them: a door that reads only writes nothing, a sequence's move neither)
         return Err(crate::codes::coded("25006", format!("cannot execute {call}() in a read-only transaction: this door reads only, and {call} moves sequence {name}")));
+    }
+    if crate::txn::reads_only(lake) {
+        // (a transaction begun READ ONLY, or `default_transaction_read_only`: Postgres's 25006, whoever asks; 11-10 audit M3)
+        return Err(crate::codes::coded("25006", format!("cannot execute {call}() in a read-only transaction: {call} moves sequence {name}")));
     }
     if p.scope.whole() {
         return match p.role >= crate::auth::Role::Write {

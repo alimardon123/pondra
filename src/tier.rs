@@ -579,17 +579,22 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
     let meta = crate::sys::with_sys(&meta); // (files carry every row's system columns)
     // A job holds its rows and the Parquet file it is writing, so what a node runs at once is
     // bounded by the data behind them, not by their number: small merges go side by side, big
-    // ones take turns (however many the leader deals out — it waits for them all anyway).
+    // ones take turns (however many the leader deals out — it waits for them all anyway). Twice:
+    // a quarter of the node's memory for queries (its own PONDRA_MEMORY_GB where it has one), and
+    // of the process's, which every node in it shares (a folder's databases: 11-10 audit L2).
+    // Taken in that order by every job, so no two wait on each other.
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    let budget = (crate::store::memory_limit() / 4 >> 20).max(256);
-    let slots = SLOTS.get_or_init(|| tokio::sync::Semaphore::new(budget));
+    let quarter = |memory: usize| (memory / 4 >> 20).max(256);
+    let (node, process) = (quarter(crate::store::node_memory(&lake.node)), quarter(crate::store::memory_limit()));
+    let slots = [(lake.node.jobs.get_or_init(|| tokio::sync::Semaphore::new(node)), node), (SLOTS.get_or_init(|| tokio::sync::Semaphore::new(process)), process)];
     let mb = |files: &[DataFile]| (files.iter().map(|f| f.bytes).sum::<u64>() >> 20) as usize;
     let takes = match &kind {
         Kind::Merge { files } | Kind::Squash { files } | Kind::Positions { files, .. } => mb(files),
         Kind::Compact { .. } => mb(&meta.files),
         Kind::Fold { .. } => 32,
     };
-    let _slot = slots.acquire_many(takes.clamp(1, budget) as u32).await?;
+    let _node = slots[0].0.acquire_many(takes.clamp(1, slots[0].1) as u32).await?;
+    let _process = slots[1].0.acquire_many(takes.clamp(1, slots[1].1) as u32).await?;
     // (Clustered append tables get what keyed tables get for their key: small row groups, bloom filters.)
     // A keyed table's first file has nothing older to shadow: it drops delete markers (and expired
     // rows, and a view's emptied groups) like a full compaction, and is as complete as one. Only

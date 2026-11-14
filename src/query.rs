@@ -1170,7 +1170,7 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
         // what `big` measures, so a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
         let batch = match &send { Some(format) => crate::answer::as_sent(batch, format.as_deref()), None => batch };
         if held.try_grow(counted.count_batch(&batch)).is_err() {
-            return Err(too_big(room_of(&pool)));
+            return Err(too_big(&pool));
         }
         out.push(batch);
         if let Some(format) = &send {
@@ -1192,19 +1192,21 @@ pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Optio
     Some(held)
 }
 
-/// The memory a statement's answer may take at most now: its database's room in the node's line (`ledger::LakePool`), at
-/// most the node's memory for queries.
-pub(crate) fn room_of(pool: &Arc<dyn MemoryPool>) -> usize {
+/// The memory a statement's answer may take at most now, and its node's memory for queries: its database's room in the
+/// node's line (`ledger::LakePool`), at most that line, the node's own, not the process's (11-10 audit L2: a folder's
+/// databases are nodes in one process). A pool on no node's line: the process's.
+fn room_of(pool: &Arc<dyn MemoryPool>) -> (usize, usize) {
+    let line = crate::ledger::line_of(pool).unwrap_or_else(memory_limit);
     match pool.memory_limit() {
-        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => n.min(memory_limit()),
-        _ => memory_limit(),
+        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => (n.min(line), line),
+        _ => (line, line),
     }
 }
 
-/// The refusal of an answer bigger than the query memory (53200), with the way out. `room`: what the statement's database
-/// has of it now (`room_of`), less than the node's while the node's other databases' queries hold some (11-06 audit M10).
-pub(crate) fn too_big(room: usize) -> anyhow::Error {
-    let line = memory_limit();
+/// The refusal of an answer bigger than the query memory (53200), with the way out. What the statement's database has of
+/// it now (`room_of`) is less than the node's while the node's other databases' queries hold some (11-06 audit M10).
+pub(crate) fn too_big(pool: &Arc<dyn MemoryPool>) -> anyhow::Error {
+    let (room, line) = room_of(pool);
     let what = match room < line {
         true => format!("the memory this database has for queries now ({} MB of the node's {} MB: its other databases' queries hold the rest)", room >> 20, line >> 20),
         false => format!("this node's memory for queries ({} MB)", line >> 20),
@@ -1331,7 +1333,7 @@ async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<
                 None => break, // (none is ready: what is goes now)
             }
         }
-        held.try_grow(size).map_err(|_| too_big(room_of(pool)))?;
+        held.try_grow(size).map_err(|_| too_big(pool))?;
         for piece in crate::answer::pieces(ready) {
             rows += piece.num_rows() as u64;
             step_to(enc, tx, Some(&piece)).await?;
@@ -1670,9 +1672,12 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         let entries = other.cat.scan_raw("t/", "t0").await?;
         other.cat.settle().await?; // (as this lake's own, above)
         let upto = Some(other.visible()); // (one end for its tables too, as this lake's above)
+        // (its views the statement names, their names read in it: the tables they read are named then, below)
+        let theirs = their_views(&other, &ns, &text, listing, scope).await?;
+        let read = theirs.iter().fold(text.clone(), |t, (_, s)| format!("{t} {s}"));
         for (key, raw) in entries {
             let name = &key[2..];
-            if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
+            if crate::sys::hidden(name) || !(listing || mentions(&read, name)) {
                 continue;
             }
             let meta = other.cat.parsed(&key, &raw)?;
@@ -1684,7 +1689,22 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             }
             catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
         }
-        ctx.register_catalog(ns, catalog);
+        ctx.register_catalog(ns.clone(), catalog.clone());
+        for (name, sql) in theirs {
+            // (planned over its tables, now registered; refused as its tables are, by the grants naming it)
+            let df = match self::sql(&ctx, &crate::sys::planned(&sql)?).await {
+                Ok(df) => df,
+                Err(_) if listing => continue, // (a listing shows what it can, as of this lake's own views)
+                Err(e) => return Err(e.context(format!("{ns}.{name}"))),
+            };
+            let view: Arc<dyn TableProvider> = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql))));
+            let Some(view) = across(scope, &format!("{ns}.{name}"), view, listing, &locked, &asked) else { continue };
+            let (s, t) = split(&name);
+            if old && s == PUBLIC {
+                default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;
+            }
+            catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
+        }
     }
     if (crate::runs::mentioned(&text) || !crate::lists::mentioned(&text).is_empty()) && default.schema("pondra").is_none() {
         // (`pondra.runs`, `pondra.routines`, `pondra.tasks`, the lists; a lake's own schema called pondra is one made before 0.80, which wins as it did: 0.80 refuses a new one, 42939)
@@ -1900,6 +1920,24 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool, scope: &crate::
             views.push((k[2..].to_string(), sql));
         }
     }
+}
+
+/// The stored views of `other`, attached as `ns`, that `text` names (every one, for a listing), by their names in it, each
+/// as the query it reads there: its macros expanded as its own lake's views are (`stored_views`), its tables named in
+/// `ns` and the views of `other` it reads inlined (`redirect.rs`). So `ns.sales.v` reads as `sales.v` does in `other`.
+async fn their_views(other: &Lake, ns: &str, text: &str, listing: bool, scope: &crate::rights::Scope) -> Result<Vec<(String, String)>> {
+    let host = crate::host::Asking::of(other, scope);
+    let mut out = vec![];
+    for (key, raw) in other.cat.scan_raw("q/", "q0").await? {
+        let name = &key[2..];
+        if !(listing || crate::text::mentions(text, name)) {
+            continue;
+        }
+        let v: crate::ddl::StoredView = serde_json::from_slice(&raw)?;
+        let sql = crate::routines::expand_stored(other, &v.sql, scope).await?;
+        out.push((name.to_string(), crate::redirect::redirect(&host, sql, ns.to_string(), 0).await?));
+    }
+    Ok(out)
 }
 
 /// Stored views over the tables `ctx` has now — again, if they are there already: a node's shares

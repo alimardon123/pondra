@@ -964,8 +964,21 @@ impl TableMeta {
     /// The stored columns' Arrow schema (`columns`), each nullable: a file's, as the table writes it.
     pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema_of(self.columns()) }
 
-    /// `schema` as a scan reads it, text as Utf8View (`query::read_schema`).
-    pub fn read_schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::read_schema_of(self.columns()) }
+    /// `schema` as a scan reads it, text as Utf8View (`query::read_schema`), a JSON column's field marked as one
+    /// (`MARK`), so what plans over it knows it is JSON (`x['k']`, `->`) as the column's own, not traced from the text.
+    pub fn read_schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let schema = crate::answer::read_schema_of(self.columns())?;
+        fn json(c: &Col) -> Option<&str> { c.held.as_deref().filter(|h| matches!(*h, "json" | "jsonb")) }
+        if !self.list().columns.iter().any(|c| json(c).is_some()) {
+            return Ok(schema);
+        }
+        let fields: Vec<Field> = schema.fields().iter().zip(&self.list().columns).map(|(f, c)| match json(c) {
+            Some(h) => f.as_ref().clone().with_metadata([(MARK.to_string(), h.to_string())].into()),
+            None => f.as_ref().clone(),
+        }).collect();
+        Ok(std::sync::Arc::new(Schema::new(fields)))
+    }
     /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
     pub fn into_columns(self) -> Vec<(String, String)> { self.record.list.columns.into_iter().map(|c| (c.stored.unwrap_or(c.name), c.dtype)).collect() }
 
@@ -1407,6 +1420,11 @@ impl Segment {
         parts + self.files.get(table).map_or(0, |f| f.added.iter().map(|d| d.rows).sum::<u64>())
     }
 }
+
+/// The field metadata that marks a column with its SQL type where its Arrow type doesn't say it (`json`, `jsonb`, `uuid`):
+/// a table's JSON column (`TableMeta::read_schema`), and an answer's (`pg_functions`). The Postgres port types its
+/// answer's columns by it; other doors pass it by.
+pub const MARK: &str = "pg_type";
 
 pub fn table_key(t: &str) -> String { format!("t/{t}") }
 

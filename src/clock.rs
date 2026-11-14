@@ -56,12 +56,14 @@ mod tests {
     /// With time paused, a minute's sleep ends at once, and the clock says a minute passed: on `Instant` and on the wall.
     #[tokio::test(start_paused = true)]
     async fn paused_time_moves_the_clock() {
-        let (at, wall, real) = (now(), wall_ms(), std::time::Instant::now());
+        let (at, wall, real) = (now(), wall_us(), std::time::Instant::now());
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert!(real.elapsed() < Duration::from_secs(5), "the sleep didn't wait");
         assert_eq!(at.elapsed(), Duration::from_secs(60));
-        let passed = wall_ms() - wall;
-        assert!((60_000..65_000).contains(&passed), "the wall clock ran a minute ahead too: {passed} ms");
+        // (in microseconds, and a little under a minute allowed: the machine's two clocks, which `ahead` compares, drift
+        // apart by a few microseconds between the two reads; in whole milliseconds that was once 59 999)
+        let passed = wall_us() - wall;
+        assert!((59_900_000..65_000_000).contains(&passed), "the wall clock ran a minute ahead too: {passed} µs");
     }
 
     /// Time that isn't paused: the wall clock is the machine's, and never goes back.

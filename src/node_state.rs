@@ -63,6 +63,8 @@ pub struct NodeState {
     /// Its budget of the process's memory (`ledger::Ledger` on the process's `ledger::Root`): the line its lakes' queries
     /// and caches share, made as its first lake opens (`store::lake_pool`).
     pub(crate) line: std::sync::OnceLock<Arc<crate::ledger::Ledger>>,
+    /// Its tiering jobs' slots, in MB of the data behind them: a quarter of its memory for queries (`tier::run_job`).
+    pub(crate) jobs: std::sync::OnceLock<tokio::sync::Semaphore>,
     /// A short id of its own, random, made with it: what tells its files in its process's space from another node's
     /// here, which would name them alike (a shuffle's folders: `spill::dir`).
     pub id: String,
@@ -102,7 +104,7 @@ impl NodeState {
 
     fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>, given: &Given) -> Arc<NodeState> {
         let reaches = crate::reaches::Reaches::inherited(settings.get(crate::reaches::REACH_VAR));
-        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] dial: given.dial.clone().unwrap_or_else(crate::calls::native), stops: given.stops.clone(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: datafusion::common::instant::Instant::now() })
+        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] dial: given.dial.clone().unwrap_or_else(crate::calls::native), stops: given.stops.clone(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), jobs: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: datafusion::common::instant::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).

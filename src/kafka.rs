@@ -512,7 +512,7 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// Its answer is one the producer can act on: a batch is acknowledged, or refused, only once it is known to be in the
 /// table or known not to be. A batch whose answer was lost on its way back from the leader (`log::unanswered`: the
 /// leader may have committed it) goes again from here, as the same producer and seq, so it is in once at most, until
-/// it is answered or the request's `timeout` passes. Answered REQUEST_TIMED_OUT at once, the producer sent it again
+/// it is answered or half the request's `timeout` passes (its answer then still reaches the producer in time). Answered REQUEST_TIMED_OUT at once, the producer sent it again
 /// too, as the same seq and so once at most, unless it gave up on older records meanwhile: then it begins a new epoch
 /// and numbers what it still holds from 0 again (librdkafka's drain and bump), and a batch already in went in twice
 /// (#783's resilience run: records 13720 to 13724).
@@ -569,7 +569,9 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Arc<
         }
     }
     let table = table.to_string();
-    let until = Instant::now() + timeout;
+    // (half the producer's wait, counted from here: an answer sent at the end of it can still reach the producer before it
+    // gives up and bumps its epoch, after which a batch sent again could go in twice; 11-10 audit L15)
+    let until = Instant::now() + timeout / 2;
     async move {
         let mut first = None;
         for (ack, src, rows) in acks {
