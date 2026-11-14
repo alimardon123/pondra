@@ -24,6 +24,7 @@ pub static ICEBERG: crate::registry::BuiltIn = crate::registry::BuiltIn {
     requires: &[],
     register: |r| {
         r.section_mut::<crate::connections::ConnectionTypes>().add(&TABLES);
+        r.section_mut::<crate::table_formats::TableFormats>().add(&crate::read_iceberg::FORMAT);
         r.section_mut::<crate::records::Prefixes>().add(crate::iceberg::PREFIXES);
         r.section_mut::<crate::store::Published>().add("iceberg metadata", crate::iceberg::metadata_file); // (written, never read: `store::published`)
         r.section_mut::<crate::lake_state::Registered>().add::<crate::read_iceberg::Manifests>();

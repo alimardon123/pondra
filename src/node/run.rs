@@ -52,6 +52,18 @@ impl Options {
         Options { dir: dir.into(), listen: String::new(), advertise: None, start: Start { tier_secs: 0.0, auth: Arc::new(auth), ..Start::default() },
                   pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest), settings: crate::settings::Values::now(), move_failed: None, host: None }
     }
+
+    /// Database `dir` of a folder of lakes (`pondra serve <folder>`, `dbserver.rs`): a node that lives in its server's
+    /// process, which `host` is (`Host::beside`), reached there (its router called, its Postgres door handed the
+    /// connections), so it binds no port. It sees the folder's other lakes (`attach_found`), and other nodes reach it at
+    /// `advertise`, its path on the server. Its settings are the process's, with the server's address
+    /// (`PONDRA_SERVER_URL`: where its DROP and UNDROP DATABASE go) and without `--idle-exit`'s, since the server stops it
+    /// once idle.
+    pub(crate) fn database(dir: &str, advertise: String, folder: &str, start: Start, server: &str, host: crate::node::Host) -> Options {
+        let settings = crate::settings::Values::now().with("PONDRA_SERVER_URL", format!("http://{server}")).without("PONDRA_IDLE_EXIT_SECS");
+        Options { dir: dir.into(), listen: String::new(), advertise: Some(advertise), start, pg: None, kafka: None, kafka_advertise: None, flight: None,
+                  attach: vec![], attach_found: Some(folder.into()), guest: None, settings, move_failed: None, host: Some(host) }
+    }
 }
 
 /// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (ADR-061, invariant 300).
@@ -132,6 +144,8 @@ pub struct Node {
     served: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     /// What the door serves: a library's host calls it straight (`library::Opened::ask`).
     router: axum::Router,
+    /// The Postgres door its host hands the connections to, for a node a host reaches in its process (`Options::database`).
+    pg: Option<Arc<pg::Door>>,
     /// The key this node's own calls are signed with (`Auth::owner_key`): `ask` sends it as the owner.
     owner: Option<String>,
     /// A guest's App, for `finish`: what it drains and waits for before it stops.
@@ -199,6 +213,7 @@ impl Node {
         crate::machine::install(Arc::new(crate::os::Os::default()));
         crate::net::install(Arc::new(crate::os::Net::default()));
         // (what this node does when it must stop or start again, and what its stop waits for: its lakes and its member hold it)
+        let routed = host.as_ref().is_some_and(crate::node::Host::keeps_beside); // (its host reaches it in this process: no door of its own, `Options::database`)
         let here = crate::node::native_with(!lives, settings, host);
         let _ = held.node.set(here.clone()); // (a stop drains and closes this node's door: `Held::stop`)
         if let Some(why) = move_failed {
@@ -379,10 +394,11 @@ impl Node {
         // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
         // Postgres, Kafka and Flight ports do the same).
         tr("listening");
-        let listener = match lives {
+        let listener = match lives && !routed {
             true => Some(tls::Doors::bind(&listen, tls::Door::Http, &here.tasks, crate::auth::Door).await?.for_node(here.clone())), // (TLS too: `tls.rs`)
             false => None,
         };
+        let pg_door = routed.then(|| Arc::new(pg::Door::new(app.clone()))); // (its host hands it the connections: `Node::pg`)
         node::keep(&app, &start);
         let guest_app = (!lives).then(|| app.clone());
         let work = crate::idle::Work::of(&app);
@@ -399,7 +415,18 @@ impl Node {
                 out
             })
         });
-        Ok(Node { held, served, router, owner, guest: guest_app, work })
+        if routed {
+            // (its host's routes are its door: open from here, and closed once its stop begins closing it, so the streams
+            // that never end by themselves end then, as behind a door of its own: `drain::close_door`. The door's work, as
+            // a door of its own's is: `auth::Door`)
+            let door = here.clone();
+            door.drain.door_open();
+            here.tasks.spawn_as(crate::auth::Door, async move {
+                door.drain.closing().await;
+                door.drain.door_closed();
+            });
+        }
+        Ok(Node { held, served, router, pg: pg_door, owner, guest: guest_app, work })
     }
 
     /// The node's state (`node_state.rs`): its lifecycle, its drain and its uses.
@@ -423,6 +450,9 @@ impl Node {
 
     /// What the HTTP door serves, for a request made in this process (`library::Opened::ask`).
     pub(crate) fn router(&self) -> axum::Router { self.router.clone() }
+
+    /// The Postgres door its host hands connections to, for a node its host reaches in this process (`Options::database`).
+    pub(crate) fn pg(&self) -> Option<Arc<pg::Door>> { self.pg.clone() }
 
     /// Until the HTTP door stops. An error ends the program, as it did when `serve` ran the door inline. A guest has
     /// no door: nothing ends this, and the program ends with its statement.

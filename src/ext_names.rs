@@ -113,11 +113,9 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     let known: Vec<&str> = match format {
         "csv" => [CSV_OPTIONS, LISTING_OPTIONS, &["types", "compression"][..]].concat(),
         "json" => [LISTING_OPTIONS, &["compression"][..]].concat(),
-        "delta" => vec!["version"],
-        "iceberg" => vec!["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
-        _ => LISTING_OPTIONS.to_vec(),
+        f => crate::table_formats::named(f).map_or_else(|| LISTING_OPTIONS.to_vec(), |t| t.options.to_vec()),
     };
-    if ["delta", "iceberg"].contains(&format) && urls.len() != 1 {
+    if crate::table_formats::is(format) && urls.len() != 1 {
         return Err(crate::codes::coded("0A000", format!("{f}: one table at a time")));
     }
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {

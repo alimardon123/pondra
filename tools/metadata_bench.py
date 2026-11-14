@@ -80,7 +80,7 @@ def main():
         return sql(port, f"SELECT count(*) AS n, sum(v) AS s FROM events WHERE ts >= TIMESTAMP '{iso(now - DAY - i)}' AND name <> 'bulk'")[0]
 
     def measure():
-        return {"append_ack_ms": timed(append, 20), "tier_commit_ms": timed(tier), "insert_ms": timed(insert), "query_today_ms": timed(query)}
+        return {"append_ack_ms": timed(append, 20), "tier_commit_ms": timed(tier, 15), "insert_ms": timed(insert), "query_today_ms": timed(query)}
 
     for i in range(20):
         append(i)

@@ -101,6 +101,8 @@ defaults engine
 dialect_fns engine
 dialect_stmts engine
 diff engine
+redirect engine
+diff_steps engine
 divide engine
 eager engine
 engine engine
@@ -108,6 +110,7 @@ expander engine
 explain engine
 ext engine
 ext_names engine
+table_formats engine
 facts engine
 find engine
 finish engine
