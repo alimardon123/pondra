@@ -119,11 +119,15 @@ impl Faults {
         stops
     }
 
+    /// Waits while the member is frozen: what each piece of an answer to or from it meets too (`net`).
+    pub async fn thawed(&self) {
+        let _ = self.frozen.subscribe().wait_for(|f| !f).await; // (the sender lives as long as these faults)
+    }
+
     /// What a call of kind `op` (to `what`) meets: it waits while the member is frozen, then as long as the dice say up to
     /// its odds' `slow`; then it goes, fails, or goes and loses its answer.
     pub async fn meet(&self, op: Op, what: &(dyn std::fmt::Display + Sync)) -> Verdict {
-        let mut frozen = self.frozen.subscribe();
-        let _ = frozen.wait_for(|f| !f).await; // (the sender lives as long as these faults)
+        self.thawed().await;
         if self.cut.load(SeqCst) {
             self.note(format!("{op:?} {what}: cut off"));
             return Verdict::Fail;

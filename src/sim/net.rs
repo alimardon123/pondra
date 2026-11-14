@@ -7,6 +7,7 @@ use super::faults::{Faults, Op, Verdict};
 use crate::dial::{Call, Dial, Reply, Verb};
 use anyhow::{anyhow, Result};
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -17,6 +18,8 @@ struct Door {
     router: Arc<Mutex<Option<axum::Router>>>,
     faults: Arc<Faults>,
     answering: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Up while it is on the network: `down` says it isn't, and the answers it was sending break off (`carried`).
+    up: tokio::sync::watch::Sender<bool>,
     /// The address its peers see a call from it come from: one of this machine's, as the harness's members are on one
     /// machine, so the nodes' key in the clear is taken from it (`users::nodes_key`, `tls::Peer::own`).
     peer: std::net::SocketAddr,
@@ -38,12 +41,13 @@ impl Net {
     pub fn join(&self, name: &str, router: Arc<Mutex<Option<axum::Router>>>, faults: Arc<Faults>) {
         let mut doors = lock(&self.doors);
         let peer = std::net::SocketAddr::from(([127, 0, 0, doors.len() as u8 + 2], 7000));
-        doors.insert(name.to_string(), Arc::new(Door { router, faults, answering: Default::default(), peer }));
+        doors.insert(name.to_string(), Arc::new(Door { router, faults, answering: Default::default(), up: tokio::sync::watch::Sender::new(true), peer }));
     }
 
     /// Member `name` is down: the calls it is answering end, unanswered, and nothing reaches it until it joins again.
     pub fn down(&self, name: &str) {
         if let Some(door) = lock(&self.doors).remove(name) {
+            door.up.send_replace(false);
             lock(&door.answering).drain(..).for_each(|a| a.abort());
         }
     }
@@ -66,15 +70,26 @@ impl Net {
     /// The dial member `me` calls the others with (`NodeState::dial`).
     pub fn dial(self: &Arc<Self>, me: &str) -> Arc<dyn Dial> { Arc::new(Dialer { net: self.clone(), me: me.to_string() }) }
 
-    /// `c` from `me` (node `node`) to member `to`, answered by its router, or no answer.
+    /// `c` from `me` (node `node`) to member `to`, answered by its router, or no answer: within `c.timeout` if it has one,
+    /// from the call's start to its answer's last piece, as the nodes' HTTP client times a call (reqwest's `timeout`).
     async fn call(&self, me: &str, node: &crate::node_state::NodeState, to: &str, c: Call) -> Result<Reply> {
+        let Some(limit) = c.timeout else { return self.reach(me, node, to, c, None).await };
+        let at = crate::clock::now() + limit;
+        let late = || crate::dial::no_answer(format!("{to}: no answer in {} s (the sim)", limit.as_secs_f64()));
+        tokio::time::timeout_at(at, self.reach(me, node, to, c, Some(at))).await.unwrap_or_else(|_| Err(late()))
+    }
+
+    /// `call`'s way there and back: the caller's faults, the link, the called member's faults, its router on a task its
+    /// kill ends, and its answer carried back (`carried`), its body ending by `deadline`.
+    async fn reach(&self, me: &str, node: &crate::node_state::NodeState, to: &str, c: Call, deadline: Option<crate::clock::Instant>) -> Result<Reply> {
         let none = |why: &str| crate::dial::no_answer(format!("{to}: {why} (the sim)"));
         let (mine, theirs) = {
             let doors = lock(&self.doors);
             (doors.get(me).cloned(), doors.get(to).cloned())
         };
         let shown = format!("{me} -> {to}{}", c.path);
-        let lost = match mine.as_ref().map(|d| d.faults.clone()) {
+        let my_faults = mine.as_ref().map(|d| d.faults.clone());
+        let lost = match &my_faults {
             Some(f) => match f.meet(Op::Call, &shown).await {
                 Verdict::Fail => return Err(none("its call failed")),
                 v => v == Verdict::Lose,
@@ -95,12 +110,12 @@ impl Net {
             use tower::ServiceExt;
             router.oneshot(req).await.unwrap_or_else(|never| match never {})
         });
-        lock(&door.answering).push(answered.abort_handle());
-        let answer = async { answered.await.map_err(|_| none("it went down while answering")) };
-        let res = match c.timeout {
-            Some(limit) => tokio::time::timeout(limit, answer).await.map_err(|_| none(&format!("no answer in {} s", limit.as_secs_f64())))??,
-            None => answer.await?,
-        };
+        {
+            let mut answering = lock(&door.answering);
+            answering.retain(|a| !a.is_finished());
+            answering.push(answered.abort_handle());
+        }
+        let res = answered.await.map_err(|_| none("it went down while answering"))?;
         if lost {
             return Err(none("its answer was lost"));
         }
@@ -108,9 +123,48 @@ impl Net {
         let sqlstate = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
         let headers = res.headers().clone();
         let failed = (!res.status().is_success()).then(|| anyhow!("HTTP status {} for {shown}", res.status()));
-        let body = res.into_body().into_data_stream().map_err(anyhow::Error::from).boxed();
+        let body = carried(res.into_body().into_data_stream().map_err(anyhow::Error::from).boxed(), &door, my_faults, deadline, to);
         Ok(Reply::new(status, sqlstate, failed, body).with_headers(headers))
     }
+}
+
+/// An answer's body on its way back from member `door` to a caller meeting `mine`: each piece waits while either is
+/// frozen (a stopped process sends nothing more, and one stopped reads nothing), and the answer breaks off with no
+/// answer when its member goes down (as a killed process's connection is reset) or past `deadline`.
+fn carried(
+    body: BoxStream<'static, Result<bytes::Bytes>>,
+    door: &Door,
+    mine: Option<Arc<Faults>>,
+    deadline: Option<crate::clock::Instant>,
+    to: &str,
+) -> BoxStream<'static, Result<bytes::Bytes>> {
+    let (theirs, up, to) = (door.faults.clone(), door.up.subscribe(), to.to_string());
+    futures::stream::unfold(Some((body, up)), move |state| {
+        let (theirs, mine, to) = (theirs.clone(), mine.clone(), to.clone());
+        async move {
+            let (mut body, mut up) = state?;
+            let broken = |why: &str| Some((Err(crate::dial::no_answer(format!("{to}: {why} (the sim)"))), None));
+            let late = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                piece = body.next() => {
+                    let piece = piece?;
+                    theirs.thawed().await;
+                    if let Some(m) = &mine {
+                        m.thawed().await;
+                    }
+                    Some((piece, Some((body, up))))
+                }
+                () = async { let _ = up.wait_for(|up| !*up).await; } => broken("it went down while answering"), // (its `Ref` let go at once: Send)
+                () = late => broken("no answer in time"),
+            }
+        }
+    })
+    .boxed()
 }
 
 /// A member's request as a node's HTTP client would send it (`cluster::send_call`, `cluster::client`): signed with its

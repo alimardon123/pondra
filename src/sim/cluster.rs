@@ -105,6 +105,7 @@ impl Cluster {
                 stops
             })),
             no_port: true,
+            in_place: true,
         };
         let mut options = crate::node::Options::member(&self.dir(m), &member.name, given);
         options.host = Some(host.clone());
@@ -148,6 +149,7 @@ impl Cluster {
     /// One request to member `m`'s router, from no member: its status and whole body.
     pub async fn ask(&self, m: usize, method: &str, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
         use tower::ServiceExt;
+        self.members[m].faults.thawed().await; // (a frozen member answers no one until it is thawed)
         let Some(router) = lock(&self.members[m].router).clone() else { bail!("{} isn't serving", self.members[m].name) };
         let req = crate::node::request(method, path, &[], body, None)?;
         let res = router.oneshot(req).await.unwrap_or_else(|never| match never {});

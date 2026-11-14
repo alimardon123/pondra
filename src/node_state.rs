@@ -22,6 +22,9 @@ pub struct Given {
     pub stops: Option<Stops>,
     pub started: Option<Arc<dyn Fn(&Arc<NodeState>) + Send + Sync>>,
     pub no_port: bool,
+    /// Its restarts and failures are its host's alone, in this process, as a library's node's are (`node::hosted`), though
+    /// the process isn't a library's: the sim's members, whose process is the test's.
+    pub in_place: bool,
 }
 
 impl NodeState {

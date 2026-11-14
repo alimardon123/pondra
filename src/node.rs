@@ -49,11 +49,11 @@ impl Default for Start {
 /// serve` then ends with status 1 (`cli.rs`). A node with no host in a library's process (a command's own) only says
 /// why: the process is the host program's. Elsewhere (a guest, a command of the command line's) the process ends here
 /// with status 1, as a supervisor expects of a stop and with no core: what it made goes first (an exit runs no destructor).
-fn stop(why: String, host: Option<&Host>) {
+fn stop(why: String, host: Option<&Host>, in_place: bool) {
     eprintln!("stopping: {why}");
     match host {
         Some(h) if !h.events.is_closed() => drop(h.events.send(Event::Failed(why))),
-        _ if hosted() => {}
+        _ if hosted() || in_place => {}
         _ => {
             crate::memory::leave();
             std::process::exit(1)
@@ -117,6 +117,7 @@ pub struct Native {
     settings: crate::settings::Values, // (the node's, which the processes it starts are handed: `lead_elsewhere`)
     host: Option<Host>, // (who is told of its failures and restarts, and takes its lake's moves: `Options::host`)
     claims: Arc<crate::node_state::Claims>, // (the node's: its restart says in them that it is coming back, `restart_with`)
+    in_place: bool, // (`Given::in_place`: hosted though the process isn't a library's)
 }
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
@@ -126,12 +127,12 @@ pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(gu
 /// `native`, the node starting with `settings` (`Options::settings`) under `host` (`Options::host`).
 pub(crate) fn native_with(guest: bool, settings: crate::settings::Values, host: Option<Host>, given: &crate::node_state::Given) -> Arc<crate::node_state::NodeState> {
     let claims = Arc::<crate::node_state::Claims>::default();
-    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone() }), settings, claims, given)
+    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone(), in_place: given.in_place }), settings, claims, given)
 }
 
 impl crate::lifecycle::Lifecycle for Native {
-    fn stop(&self, why: String) { stop(why, self.host.as_ref()) }
-    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, &self.claims, why, carried, self.host.as_ref()) }
+    fn stop(&self, why: String) { stop(why, self.host.as_ref(), self.in_place) }
+    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, &self.claims, why, carried, self.host.as_ref(), self.in_place) }
     /// (a library's host and a `pondra sql` guest's shell show only trouble, so there it is not said)
     fn say(&self, line: &str) {
         if !hosted() && !self.guest {
@@ -139,7 +140,7 @@ impl crate::lifecycle::Lifecycle for Native {
         }
     }
     fn one_off(&self) -> bool { self.guest }
-    fn owns_process(&self) -> bool { !hosted() }
+    fn owns_process(&self) -> bool { !hosted() && !self.in_place }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
     fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings, reaches)) }
     fn movable(&self) -> bool { self.host.as_ref().is_some_and(Host::movable) }
@@ -200,7 +201,7 @@ impl crate::lifecycle::Lifecycle for PageLife {
 /// task that asked unwinds, past the panic hook (a host's error reporting sees no panic for a takeover). In the
 /// program the same binary runs again (`run::exec_again`). On a page there is no program to run again, so a restart
 /// is a stop until the page decides otherwise (L2's answer in the design).
-fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carried: &[(&str, String)], host: Option<&Host>) -> ! {
+fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carried: &[(&str, String)], host: Option<&Host>, in_place: bool) -> ! {
     if guest && crate::write::tries() >= 5 {
         eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
         crate::memory::leave();
@@ -215,7 +216,7 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
             held.values().for_each(|(_, f)| crate::terms::say(f, &format!("restarting {}", crate::log::now_ms())));
         }
     }
-    if hosted() {
+    if hosted() || in_place {
         if let Some(h) = host {
             h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
         }
@@ -226,7 +227,7 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
     #[cfg(not(feature = "doors"))]
     {
         let _ = carried; // (a page carries nothing: nothing runs again)
-        stop(format!("{why}"), host); // (a page: a restart is a stop, until the page decides otherwise)
+        stop(format!("{why}"), host, in_place); // (a page: a restart is a stop, until the page decides otherwise)
         unreachable!("stop ends an unhosted process")
     }
 }
@@ -856,7 +857,7 @@ mod tests {
         use crate::lifecycle::{Lifecycle, Move, NO_MOVE};
         let to = |to: &str| Move { from: "memory://a".into(), to: to.into(), copied: Default::default() };
         let (host, mut told) = super::Host::new();
-        let node = super::Native { guest: false, settings: crate::settings::Values::now(), host: Some(host), claims: Default::default() };
+        let node = super::Native { guest: false, settings: crate::settings::Values::now(), host: Some(host), claims: Default::default(), in_place: false };
         assert!(node.movable());
         node.move_lake(to("/tmp/b")).unwrap();
         assert_eq!(told.moves.try_recv().map(|m| m.to).ok().as_deref(), Some("/tmp/b"));
@@ -865,7 +866,7 @@ mod tests {
         drop(told); // (the host is gone)
         assert!(!node.movable());
         assert_eq!(node.move_lake(to("/tmp/c")).unwrap_err().to_string(), NO_MOVE);
-        let alone = super::Native { guest: false, settings: crate::settings::Values::now(), host: None, claims: Default::default() };
+        let alone = super::Native { guest: false, settings: crate::settings::Values::now(), host: None, claims: Default::default(), in_place: false };
         assert!(!alone.movable());
         assert_eq!(alone.move_lake(to("/tmp/d")).unwrap_err().to_string(), NO_MOVE);
     }

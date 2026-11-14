@@ -46,7 +46,7 @@ impl Options {
     /// router, which the sim's network reaches by its name, and what the sim gives it (`given`).
     #[cfg(any(test, feature = "sim"))]
     pub(crate) fn member(dir: &str, name: &str, given: crate::node_state::Given) -> Options {
-        Options { advertise: Some(name.to_string()), given: crate::node_state::Given { no_port: true, ..given }, ..Options::local(dir, "") }
+        Options { advertise: Some(name.to_string()), given: crate::node_state::Given { no_port: true, in_place: true, ..given }, ..Options::local(dir, "") }
     }
 
     /// A guest for `dir`: the node a program starts for its own statements, which answers them and ends. No
