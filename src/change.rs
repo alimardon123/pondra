@@ -9,6 +9,7 @@
 //! The leader carries out a change under the lake's lock, from one snapshot of the lake, in one
 //! commit: the new versions, the old ones, and what views derive from them. So a change applies
 //! once (its job id), all or nothing, and streams like any other write.
+use crate::rights::Privilege;
 use crate::log::{pack, Append, Outcome, Sequencer, Src};
 use crate::store::*;
 use crate::sys;
@@ -78,16 +79,16 @@ impl Merge {
     }
 
     /// The privileges on its table it needs: what its clauses do (`rights::asks`).
-    pub fn privileges(&self) -> Vec<&'static str> {
-        let mut all: Vec<&'static str> = self.clauses.iter().map(|c| match c.action {
-            Action::Update(_) => "update",
-            Action::Delete => "delete",
-            Action::Insert(..) => "insert",
+    pub fn privileges(&self) -> Vec<Privilege> {
+        let mut all: Vec<Privilege> = self.clauses.iter().map(|c| match c.action {
+            Action::Update(_) => Privilege::Update,
+            Action::Delete => Privilege::Delete,
+            Action::Insert(..) => Privilege::Insert,
         }).collect();
         if let Some(u) = &self.upsert {
-            all.push("insert");
+            all.push(Privilege::Insert);
             if u.update.is_some() {
-                all.push("update");
+                all.push(Privilege::Update);
             }
         }
         all.sort();
@@ -584,7 +585,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
     // a MERGE's must still differ from each other (an upsert's keep their own rule: `Upsert::merge` keeps a key's first row, or refuses 21000).
     // A writer a filter on the table's rows holds matched only the rows it reads: its new keys are looked up in every row, so a
     // key a row it doesn't read holds is refused (23505), as a plain INSERT's is, and that row isn't replaced.
-    let read_whole = scope.rows("select", &table).is_none();
+    let read_whole = scope.rows(&Privilege::Select, &table).is_none();
     let plain = match &stmt {
         crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..) => true,
         crate::write::Stmt::Merge(m) if m.upsert.is_some() => !(read_whole && m.on_key(&meta)),
@@ -622,16 +623,16 @@ pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<cra
     let (old, new) = match stmt {
         crate::write::Stmt::Update(_, set, cond) => {
             crate::txn::refuse_change(lake, table, meta, stmt).await?;
-            update(lake, table, meta, set, cond, upto, &scope.writing("update", table)).await?
+            update(lake, table, meta, set, cond, upto, &scope.writing(&Privilege::Update, table)).await?
         }
-        crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto, &scope.writing("delete", table)).await?.0, vec![]),
+        crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto, &scope.writing(&Privilege::Delete, table)).await?.0, vec![]),
         crate::write::Stmt::Merge(m) => merge(lake, table, meta, rules, m, upto, scope).await?,
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     };
     // (its new versions: UPDATE's; the rows a MERGE inserts, which carry no id: INSERT's)
-    for privilege in ["update", "insert"] {
-        if let Some(f) = scope.rows(privilege, table) {
-            crate::row_filter::holds(&lake.session_with(1), table, &new, &f, &privilege.to_uppercase()).await?;
+    for privilege in [Privilege::Update, Privilege::Insert] {
+        if let Some(f) = scope.rows(&privilege, table) {
+            crate::row_filter::holds(&lake.session_with(1), table, &new, &f, &privilege.to_string()).await?;
         }
     }
     Ok((old, new))
@@ -764,9 +765,9 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                         return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
                     }
                     ensure!(set.iter().all(|(c, _)| meta.columns().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
-                    select_as(lake, meta, Some(set), None, &rest, upto, &a, &scope.writing("update", table)).await?
+                    select_as(lake, meta, Some(set), None, &rest, upto, &a, &scope.writing(&Privilege::Update, table)).await?
                 }
-                (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a, &scope.writing("delete", table)).await?,
+                (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a, &scope.writing(&Privilege::Delete, table)).await?,
                 (Action::Insert(columns, values), _) => {
                     // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
                     let given = if columns.is_empty() { crate::write::implicit(&meta.sql_names(), Some(values.len())).to_vec() } else { columns.clone() }; // (SQL's order)
