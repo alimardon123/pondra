@@ -399,7 +399,8 @@ impl Ledger {
     /// the node's own memory that can't spill), so a node that grew alone is held to it at its next grow once another node
     /// runs queries, and spills. A spiller holding nothing yet has its node's share though the other nodes leave less: it
     /// has nothing to spill, so a refusal would fail its query (a sort's first batch), and that one grow is all it holds
-    /// past the line, until the other nodes' spillers are refused at their next grow and spill. A node alone on its root
+    /// past the line, until the other nodes' spillers are refused at their next grow and spill; and the root is passed by
+    /// one share at most, however many nodes' first grows come at once (11-10 audit M1). A node alone on its root
     /// has its own line, whatever the root's: one node in a process, every node until several run in one, holds what it
     /// held before the root.
     fn line_now(&self, spills: bool, holds: bool) -> usize {
@@ -412,7 +413,7 @@ impl Ledger {
         self.line.min(match (spills, holds) {
             (false, _) => free,
             (true, true) => free.min(share()),
-            (true, false) => share(),
+            (true, false) => share().min(self.root.line.saturating_add(self.root.share()).saturating_sub(others)),
         })
     }
 
@@ -859,6 +860,15 @@ impl MemoryPool for LakePool {
     }
 
     fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.room(&self.part(), true, false)) }
+}
+
+/// The node's line a pool is on (`Ledger::line`): a lake's pool's, or a frugal retry's of one (`Halved`). None for a pool
+/// of another kind.
+pub fn line_of(pool: &Arc<dyn MemoryPool>) -> Option<usize> {
+    match pool.downcast_ref::<Halved>() {
+        Some(halved) => line_of(&halved.inner),
+        None => Some(pool.downcast_ref::<LakePool>()?.ledger().line()),
+    }
 }
 
 /// A frugal retry's pool when the memory watch stopped its first try (`query::frugally`): the lake's, but held to half
@@ -1444,6 +1454,22 @@ mod tests {
         assert!(held.try_grow(1).is_err(), "what can't spill has what a leaves, nothing");
         drop((sort_a, held));
         assert_eq!((root.reserved(), root.unspillable.load(Relaxed), root.spilling.load(Relaxed), root.busy.load(Relaxed)), (0, 0, 0, 0));
+    }
+
+    /// However many nodes' spillers holding nothing grow at once, the root is passed by one share at most (11-10 audit M1):
+    /// each first grow has its share while the others leave room within that, and is refused past it.
+    #[test]
+    fn first_grows_pass_the_root_by_one_share_at_most() {
+        let root = Root::new(150, usize::MAX);
+        let (a, b, c) = (Ledger::on(&root, 150, usize::MAX), Ledger::on(&root, 150, usize::MAX), Ledger::on(&root, 150, usize::MAX));
+        let (pa, pb, pc) = (a.pool(), b.pool(), c.pool());
+        let sort_a = consumer(&pa, "a's sort", true);
+        sort_a.try_grow(140).expect("alone, a's sort has the root");
+        let (sort_b, sort_c) = (consumer(&pb, "b's sort", true), consumer(&pc, "c's sort", true));
+        sort_b.try_grow(30).expect("b's first batch, past the line: 50 is its share");
+        assert!(sort_c.try_grow(31).is_err(), "c's first batch would pass the root by more than one share, 50");
+        sort_c.try_grow(30).expect("c's, to one share past the line");
+        assert_eq!(root.reserved(), 200, "the root's line and one share, no more");
     }
 
     /// Past the root's whole line, a grow takes cache bytes back from its own node's caches first, then from the other

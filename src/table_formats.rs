@@ -67,6 +67,8 @@ pub struct TableFormat {
     pub abilities: &'static [Ability],
     /// The options a table of it takes (`version`, …).
     pub options: &'static [&'static str],
+    /// Those of `options` that read its past (`AsOf`): a read asking one is refused where the format doesn't declare it.
+    pub past: &'static [&'static str],
     /// Its current files, with their columns.
     pub resolve: for<'a> fn(&'a Lake, &'a Spec, &'a crate::rights::Scope) -> BoxFuture<'a, Result<Resolved>>,
     /// Before a node reads its share of a spread query: what it needs that the coordinator's list doesn't carry (an
@@ -94,6 +96,9 @@ impl crate::registry::Section for TableFormats {
             }
             if !f.takes(Ability::Read) {
                 return Err(format!("{}: a table format reads its tables", f.name));
+            }
+            if f.past.iter().any(|o| !f.options.contains(o)) {
+                return Err(format!("{}: a table format's options for its past are among its options", f.name));
             }
         }
         Ok(())
@@ -143,9 +148,9 @@ mod tests {
 
     #[test]
     fn a_format_is_named_once_and_reads() {
-        static A: TableFormat = TableFormat { name: "a", abilities: &[Ability::Read], options: &[], resolve: none, prime: None };
-        static UPPER: TableFormat = TableFormat { name: "B", abilities: &[Ability::Read], options: &[], resolve: none, prime: None };
-        static BLIND: TableFormat = TableFormat { name: "c", abilities: &[Ability::Insert], options: &[], resolve: none, prime: None };
+        static A: TableFormat = TableFormat { name: "a", abilities: &[Ability::Read], options: &[], past: &[], resolve: none, prime: None };
+        static UPPER: TableFormat = TableFormat { name: "B", abilities: &[Ability::Read], options: &[], past: &[], resolve: none, prime: None };
+        static BLIND: TableFormat = TableFormat { name: "c", abilities: &[Ability::Insert], options: &[], past: &[], resolve: none, prime: None };
         for (two, said) in [([&A, &A], "a: a table format's name"), ([&A, &UPPER], "B: a table format's name"), ([&A, &BLIND], "c: a table format reads")] {
             let built = std::panic::catch_unwind(|| {
                 static TWO: std::sync::Mutex<Vec<&'static TableFormat>> = std::sync::Mutex::new(vec![]);

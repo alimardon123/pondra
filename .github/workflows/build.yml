@@ -79,6 +79,7 @@ jobs:
       binary: ${{ steps.plan.outputs.binary }}
       event: ${{ steps.plan.outputs.event }}
       profile: ${{ steps.plan.outputs.profile }}
+      lto: ${{ steps.plan.outputs.lto }}
       packages: ${{ steps.plan.outputs.packages }}
       unit: ${{ steps.plan.outputs.unit }}
       docs: ${{ steps.plan.outputs.docs }}
@@ -190,6 +191,12 @@ jobs:
             echo "linux-x64 in the dist profile, against glibc 2.17: this changes the lock file, a build script or the dist profile, which only that build tries." >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          # (a release's packages, a version commit's or a run started by hand, link with fat LTO, his pick 11-14: TPC-DS at
+          # SF10 2.4% faster, TPC-H even, the library 6% smaller, but 38 minutes to build against thin's 24, so every other
+          # build stays thin: single-node-wip/STATE.md)
+          lto=thin
+          if [ "$release" = true ]; then lto=fat; echo "Fat LTO: a release's packages (a version commit, or a run started by hand)." >> "$GITHUB_STEP_SUMMARY"; fi
+          echo "lto=$lto" >> "$GITHUB_OUTPUT"
           echo "packages=$packages" >> "$GITHUB_OUTPUT"
           if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
           code=false; unit=false; harness=false; docs=false; site=false; deploy=false; full=false
@@ -346,7 +353,8 @@ jobs:
           cache-on-failure: true # (a failed run keeps what it compiled: the dist profile's dependencies take most of a cold build)
           # (main's caches only: every branch reads them, and a branch's own would push them out of
           # the repository's 10 GB; the dependencies are what is cached, and they rarely change)
-          save-if: ${{ needs.plan.outputs.event != 'pull_request' }}
+          # (and not a fat LTO build's: a release's own, rare, which the everyday thin builds after it would not use)
+          save-if: ${{ needs.plan.outputs.event != 'pull_request' && needs.plan.outputs.lto != 'fat' }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
@@ -366,7 +374,17 @@ jobs:
           # (only builds that ship pay for the startup layout, about 45 s more a link: tools/startup_layout.rs.
           # linux-x64's alone so far: zig's lld has linked it with the script, and arm64's hasn't been tried)
           PONDRA_STARTUP_LAYOUT: ${{ needs.plan.outputs.event != 'pull_request' && matrix.platform == 'linux-x64' && '1' || '' }}
+          CARGO_PROFILE_DIST_LTO: ${{ needs.plan.outputs.lto }} # (fat for a release's packages, else thin: the plan's `lto`)
         run: |
+          # (a runner that fat LTO doesn't fit, by memory or time, builds thin from then on and says so: a release ships
+          # rather than fails on it)
+          dist() {
+            "$@" && return
+            [ "$CARGO_PROFILE_DIST_LTO" = fat ] || return 1
+            echo "::warning::fat LTO failed on ${{ matrix.platform }}: its packages are built with thin LTO"
+            export CARGO_PROFILE_DIST_LTO=thin
+            "$@"
+          }
           if [ "${{ needs.plan.outputs.profile }}" = release ]; then
             # (without setup-python's PKG_CONFIG_PATH, as the host job that saves this cache builds: aws-lc-sys's build
             # script watches it, so with it set every run rebuilt aws-lc-sys and the 12 crates over it, 2.3 of the
@@ -375,11 +393,11 @@ jobs:
           elif [ -n "${{ matrix.zig }}" ]; then
             pip install -r tools/zig-requirements.txt
             # (zig's linker says, on every build, that it ignores the -Wl,-O1 rustc passes it: not a warning of ours)
-            RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace --lib
-            RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace
+            RUSTFLAGS="-A linker_messages" dist cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace --lib
+            RUSTFLAGS="-A linker_messages" dist cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace
           else
-            cargo build --profile dist --target ${{ matrix.target }} --workspace --lib
-            cargo build --profile dist --target ${{ matrix.target }} --workspace
+            dist cargo build --profile dist --target ${{ matrix.target }} --workspace --lib
+            dist cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
       - name: The program within its size budget # (tools/size_check.py: its bytes as shipped and its download, against tools/size-budget.txt; a change that needs more raises the budget there, saying why)

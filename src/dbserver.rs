@@ -516,7 +516,7 @@ async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
     };
     // (the connection is the node's from here: its startup message, then the client's bytes as they come)
     let door = door.context("a database's node has a Postgres door")?;
-    let mut ours = handed(&door).await?;
+    let mut ours = handed(&door, (addr, client.is_tls())).await?;
     ours.write_all(&startup).await?;
     tokio::io::copy_bidirectional(&mut client, &mut ours).await?;
     Ok(())
@@ -524,22 +524,22 @@ async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
 
 /// A connection handed to a database's Postgres door, and this end of it: a pair of sockets in this process, no port.
 #[cfg(unix)]
-async fn handed(door: &crate::pg::Door) -> Result<tokio::net::UnixStream> {
+async fn handed(door: &crate::pg::Door, peer: crate::pg::Peer) -> Result<tokio::net::UnixStream> {
     let (ours, theirs) = tokio::net::UnixStream::pair()?;
-    door.take_passed(theirs);
+    door.take_passed(theirs, peer);
     Ok(ours)
 }
 
 /// (Windows has no pair of sockets: a listener on this machine for this one connection, which takes ours alone)
 #[cfg(not(unix))]
-async fn handed(door: &crate::pg::Door) -> Result<tokio::net::TcpStream> {
+async fn handed(door: &crate::pg::Door, peer: crate::pg::Peer) -> Result<tokio::net::TcpStream> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let ours = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
     ours.set_nodelay(true)?;
     loop {
         let (theirs, from) = listener.accept().await?;
         if from == ours.local_addr()? {
-            door.take(theirs);
+            door.take_handed(theirs, peer);
             return Ok(ours);
         }
     }
