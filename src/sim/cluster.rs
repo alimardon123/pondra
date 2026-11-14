@@ -1,12 +1,13 @@
 //! A sim cluster (redesign step 3, piece 3e: l7-wip/step3-sim-plan.md): N members of one lake in this process, on the
-//! test's runtime. Each is a node as a library runs it (`library::supervise`: started again in place when its own work
-//! says so), whose lake is the cluster's one bucket seen through its own faults (`store.rs`), who listens on no port and
-//! is reached by name over the sim's network (`net.rs`). A test starts, kills, freezes and cuts members, and asks any of
+//! test's runtime. Each is kept as a lakes server keeps each of its databases (`kept::supervise` under `Host::beside`:
+//! started again in place when its own work says so, with no port of its own), its lake the cluster's one bucket seen
+//! through its own faults (`store.rs`), reached by name over the sim's network (`net.rs`). A test starts, kills, freezes and cuts members, and asks any of
 //! them as its HTTP door is asked.
 use super::faults::Faults;
 use super::net::Net;
 use super::store::Bucket;
-use crate::library::State;
+use crate::node::kept::Slot;
+use crate::node::State;
 use anyhow::{anyhow, bail, Result};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -16,8 +17,8 @@ struct Member {
     name: String,
     faults: Arc<Faults>,
     net: Arc<Net>,
-    /// What answers it while it serves (`library::supervise` keeps it).
-    router: Arc<Mutex<Option<axum::Router>>>,
+    /// Its doors while it serves (`kept::supervise` holds them).
+    running: Slot,
     state: Arc<Mutex<State>>,
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Its host's end: dropped as it is killed, so nothing is told to a supervisor that's gone.
@@ -36,7 +37,7 @@ impl Member {
             node.tasks.abort_all();
         }
         lock(&self.host).take();
-        lock(&self.router).take();
+        lock(&self.running).take();
         self.net.down(&self.name);
     }
 }
@@ -65,7 +66,7 @@ impl Cluster {
                     name: format!("m{i}"),
                     faults,
                     net: net.clone(),
-                    router: Default::default(),
+                    running: Default::default(),
                     state: Arc::new(Mutex::new(State::Closed)),
                     supervisor: Default::default(),
                     host: Default::default(),
@@ -86,7 +87,7 @@ impl Cluster {
     pub async fn start(&self, m: usize) -> Result<()> {
         let member = self.members[m].clone();
         anyhow::ensure!(lock(&member.supervisor).is_none(), "{} is up already", member.name);
-        let (host, told) = crate::node::Host::new();
+        let (host, told) = crate::node::Host::beside(); // (kept beside the others, reached through its router: no port of its own, restarted in place)
         let (kept, killed) = (Arc::downgrade(&member), Arc::downgrade(&member));
         let given = crate::node_state::Given {
             dial: Some(self.net.dial(&member.name)),
@@ -104,16 +105,14 @@ impl Cluster {
                 }
                 stops
             })),
-            no_port: true,
-            in_place: true,
         };
         let mut options = crate::node::Options::member(&self.dir(m), &member.name, given);
         options.host = Some(host.clone());
         *lock(&member.host) = Some(host);
-        self.net.join(&member.name, member.router.clone(), member.faults.clone());
+        self.net.join(&member.name, member.running.clone(), member.faults.clone());
         let (first, started) = std::sync::mpsc::channel();
-        let supervised = crate::library::supervise(options, member.state.clone(), member.router.clone(), told, first);
-        *lock(&member.supervisor) = Some(crate::spawns::untracked(crate::auth::as_node(supervised)));
+        let supervised = crate::node::kept::supervise(options, member.state.clone(), member.running.clone(), told, first);
+        *lock(&member.supervisor) = Some(crate::spawns::untracked(supervised));
         // (the supervisor says when the first start serves, or why it didn't: asked as the test's time passes)
         loop {
             match started.try_recv() {
@@ -150,7 +149,7 @@ impl Cluster {
     pub async fn ask(&self, m: usize, method: &str, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
         use tower::ServiceExt;
         self.members[m].faults.thawed().await; // (a frozen member answers no one until it is thawed)
-        let Some(router) = lock(&self.members[m].router).clone() else { bail!("{} isn't serving", self.members[m].name) };
+        let Some(router) = lock(&self.members[m].running).clone().map(|r| r.router) else { bail!("{} isn't serving", self.members[m].name) };
         let req = crate::node::request(method, path, &[], body, None)?;
         let res = router.oneshot(req).await.unwrap_or_else(|never| match never {});
         let status = res.status().as_u16();

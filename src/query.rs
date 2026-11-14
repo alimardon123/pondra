@@ -278,7 +278,7 @@ async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
     if dead.is_empty() {
         return raw(lake, ctx, name, meta, upto, scope).await;
     }
-    let (touched, clean): (Vec<DataFile>, Vec<DataFile>) = meta.files.iter().cloned().partition(|f| crate::sys::holds(&dead, &f.stats));
+    let (touched, clean): (Vec<DataFile>, Vec<DataFile>) = meta.files.iter().cloned().partition(|f| crate::sys::holds(&dead, f));
     let meta = with_sys(meta);
     let clean = raw(lake, ctx, name, &{ let mut entry = meta.clone(); entry.files = clean; entry }, Some(meta.tiered), scope).await?; // (the log goes with the touched files)
     let touched = raw(lake, ctx, name, &{ let mut entry = meta; entry.files = touched; entry }, upto, scope).await?;
@@ -755,7 +755,7 @@ async fn view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMet
 pub struct Facts {
     pub schema: SchemaRef,
     pub manifests: Vec<crate::manifest::Manifest>,
-    pub ranges: crate::manifest::Stats,
+    pub ranges: crate::manifest::Values,
     pub count: datafusion::common::Statistics,
     pub known: Arc<std::collections::HashMap<String, crate::hot::Known>>,
 }
@@ -788,7 +788,7 @@ const FACTS_BYTES: usize = 64 << 20;
 /// What a version's facts count against `FACTS_BYTES`: each manifest by its path and its statistics (as JSON), and 128 bytes
 /// for the record itself. A list of ten thousand manifests counts its ten thousand records, not only the first few.
 fn facts_bytes(facts: &Facts) -> usize {
-    facts.manifests.iter().map(|m| 128 + m.path.len() + crate::store::json(&m.stats).len()).sum()
+    facts.manifests.iter().map(|m| 128 + m.path.len() + crate::store::json(&m.stats).len() + crate::store::json(&m.bounds).len()).sum()
 }
 
 impl FactsMemo {
@@ -859,7 +859,7 @@ pub async fn facts_once(lake: &Lake, meta: &TableMeta, sys: bool) -> Result<Fact
 /// A table's statistics for planning (`Pruned::sized`): its rows and bytes (a slice's `share`, else the entry's: its
 /// sealed manifests' totals and its files'), and each column's range and distinct values (`sketch.rs`, no more than its
 /// range or its rows could hold).
-fn count(meta: &TableMeta, schema: &SchemaRef, ranges: &crate::manifest::Stats, share: Option<(u64, u64)>) -> datafusion::common::Statistics {
+fn count(meta: &TableMeta, schema: &SchemaRef, ranges: &crate::manifest::Values, share: Option<(u64, u64)>) -> datafusion::common::Statistics {
     use datafusion::common::stats::Precision;
     let (rows, bytes) = share.unwrap_or_else(|| {
         let sealed = meta.sealed.clone().unwrap_or_default();
@@ -869,8 +869,7 @@ fn count(meta: &TableMeta, schema: &SchemaRef, ranges: &crate::manifest::Stats, 
     let mut stats = datafusion::common::Statistics::new_unknown(schema);
     (stats.num_rows, stats.total_byte_size) = (Precision::Inexact(rows as usize), Precision::Inexact(bytes as usize));
     for (i, f) in schema.fields().iter().enumerate() {
-        let parse = |v: &String| datafusion::common::ScalarValue::try_from_string(v.clone(), f.data_type()).ok();
-        let range = ranges.get(f.name()).and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?)));
+        let range = ranges.get(f.name()).cloned();
         // Distinct values: what the table's sketch saw (`sketch.rs`), no more than its range could hold, nor than its rows.
         let sketched = meta.sketch.get(f.name()).and_then(|s| crate::sketch::estimate(s));
         if let Some(n) = crate::sketch::distinct(sketched, range.as_ref().map(|(lo, hi)| (lo, hi)), rows) {
@@ -2154,7 +2153,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("pondra-probe-{}", uuid::Uuid::new_v4()));
             let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
             crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"], ["v", "Int64"]]}"#).await?;
-            let ann = Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec!["v".into()] }])));
+            let ann = Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec!["v".into()], rows: None }])));
             let scans = |p: &LogicalPlan| p.exists(|n| Ok(matches!(n, LogicalPlan::TableScan(_)))).unwrap();
             let probes = ["SELECT * FROM t LIMIT 0", "SELECT * FROM t WHERE 1 = 0", "SELECT k FROM t WHERE false", "SELECT * FROM t a JOIN t b ON FALSE",
                 "SELECT * FROM t JOIN (SELECT 1 AS x WHERE false) e ON true", "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM t u LIMIT 0)"];
@@ -2261,7 +2260,7 @@ mod tests {
 
     /// A manifest whose path is `path` bytes long (its size is what `facts_bytes` counts).
     fn manifest(path: usize) -> crate::manifest::Manifest {
-        crate::manifest::Manifest { path: "m".repeat(path), files: 1, rows: 1, bytes: 1, stats: Default::default(), nulls: None }
+        crate::manifest::Manifest { path: "m".repeat(path), files: 1, rows: 1, bytes: 1, ..Default::default() }
     }
 
     /// The planning facts memo holds at most `FACTS_BYTES` of manifests and `FACTS_ENTRIES` versions: a big table's

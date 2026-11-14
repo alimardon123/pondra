@@ -131,8 +131,9 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
     requires: &[],
     register: |r| {
         r.section_mut::<Functions>().add("engine", own);
+        r.section_mut::<crate::languages::Languages>().add(&crate::parsed::LANGUAGE);
         let passes = r.section_mut::<crate::passes::Passes>();
-        for p in [crate::kept::pass(), crate::dialect_stmts::pass(), crate::diff::pass(), crate::past_names::pass(), crate::text::types_pass()].into_iter().chain(crate::friendly::passes()) {
+        for p in [crate::kept::pass(), crate::dialect_stmts::pass(), crate::diff::pass(), crate::past_names::pass(), crate::text::types_pass(), crate::grouping::pass()].into_iter().chain(crate::friendly::passes()) {
             passes.add(p);
         }
         r.section_mut::<crate::lists::Lists>().add(crate::lists::List { name: "functions", columns: FUNCTION_COLUMNS, rows: functions });

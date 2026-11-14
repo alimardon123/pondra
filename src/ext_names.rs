@@ -113,11 +113,9 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     let known: Vec<&str> = match format {
         "csv" => [CSV_OPTIONS, LISTING_OPTIONS, &["types", "compression"][..]].concat(),
         "json" => [LISTING_OPTIONS, &["compression"][..]].concat(),
-        "delta" => vec!["version"],
-        "iceberg" => vec!["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
-        _ => LISTING_OPTIONS.to_vec(),
+        f => crate::table_formats::named(f).map_or_else(|| LISTING_OPTIONS.to_vec(), |t| t.options.to_vec()),
     };
-    if ["delta", "iceberg"].contains(&format) && urls.len() != 1 {
+    if crate::table_formats::is(format) && urls.len() != 1 {
         return Err(crate::codes::coded("0A000", format!("{f}: one table at a time")));
     }
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
@@ -698,6 +696,7 @@ pub async fn data_files(state: &SessionState, format: &Arc<dyn FileFormat>, sche
             let (store, o) = (hit.store, hit.object);
             let s = if parquet { Some(format.infer_stats(&state, &store, schema.clone(), &o).await?) } else { None };
             let mut f = data_file(full, o.size, s.as_ref(), &schema);
+            f.modified = o.last_modified.timestamp_nanos_opt(); // (its reads open it as listed: `scan::Files`)
             f.stats.retain(|c, _| as_stored.contains(c));
             if missing {
                 f.nulls = None; // (a column declared that the files don't hold is all NULL)
@@ -845,6 +844,42 @@ mod tests {
         ctx.sql("SET datafusion.execution.parquet.schema_force_view_types = false").await.unwrap().collect().await.unwrap();
         let plain = schema_of(&ctx.state(), &spec, &found).await.unwrap();
         assert_eq!(plain.field(0).data_type(), &DataType::Utf8);
+    }
+
+    /// A Parquet file outside the lake (no page index, as DuckDB and pyarrow write one) is read by the footer its
+    /// planning cached: each query lists it and reads it, and the footer is cached as of its listing's time, found
+    /// again by each read. (Opened as of another time, every query's planning and every range's open parsed it again.)
+    #[tokio::test]
+    async fn a_files_footer_is_parsed_once_for_its_queries() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::execution::cache::Cache;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
+        let ctx = SessionContext::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let props = WriterProperties::builder().set_statistics_enabled(EnabledStatistics::Chunk).set_offset_index_disabled(true).set_max_row_group_row_count(Some(100)).build();
+        let mut body = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut body, schema.clone(), Some(props)).unwrap();
+        writer.write(&RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..1000))]).unwrap()).unwrap();
+        writer.close().unwrap();
+        store.put(&Path::from("p/n.parquet"), PutPayload::from(bytes::Bytes::from(body))).await.unwrap();
+        let listed_at = store.head(&Path::from("p/n.parquet")).await.unwrap().last_modified;
+        ctx.register_object_store(&url::Url::parse("mem://").unwrap(), store);
+        let spec = Spec { urls: vec!["mem:///p/*.parquet".to_string()], format: "parquet".to_string(), options: BTreeMap::new() };
+        for _ in 0..2 {
+            let (_, files) = files_table(&ctx.state(), &spec, None, &[], None, |_| None).await.unwrap(); // (a query's planning)
+            assert_eq!(files[0].modified, listed_at.timestamp_nanos_opt());
+            let found = listed(&ctx.state(), &spec, |_| None).await.unwrap();
+            let schema = schema_of(&ctx.state(), &spec, &found).await.unwrap();
+            let rows: usize = read(&ctx, &files.iter().collect::<Vec<_>>(), &schema, &spec).await.unwrap().collect().await.unwrap().iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 1000);
+        }
+        let cached = ctx.runtime_env().cache_manager.get_file_metadata_cache().list_entries();
+        let entry = &cached[&Path::from("p/n.parquet")];
+        assert_eq!(entry.value.meta.last_modified, listed_at, "the footer is cached as of its listing, not of another time");
+        assert!(entry.hits >= 1, "the last query's read found the footer its planning cached");
     }
 
     /// An Arrow IPC file as arrow-rs writes it (64-byte padding after its magic) and a stream, from a store that

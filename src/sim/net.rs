@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// What answers a member's address: its router while it runs (none while it starts or is down), its faults, and the calls
 /// it is answering, which its kill ends.
 struct Door {
-    router: Arc<Mutex<Option<axum::Router>>>,
+    running: crate::node::kept::Slot,
     faults: Arc<Faults>,
     answering: Mutex<Vec<tokio::task::AbortHandle>>,
     /// Up while it is on the network: `down` says it isn't, and the answers it was sending break off (`carried`).
@@ -37,11 +37,11 @@ impl Net {
     /// A network with no member on it.
     pub fn new() -> Arc<Net> { Arc::default() }
 
-    /// Member `name` is reached at its name from now on: by `router` while it holds one, its calls meeting `faults`.
-    pub fn join(&self, name: &str, router: Arc<Mutex<Option<axum::Router>>>, faults: Arc<Faults>) {
+    /// Member `name` is reached at its name from now on: by its router while `running` holds one, its calls meeting `faults`.
+    pub fn join(&self, name: &str, running: crate::node::kept::Slot, faults: Arc<Faults>) {
         let mut doors = lock(&self.doors);
         let peer = std::net::SocketAddr::from(([127, 0, 0, doors.len() as u8 + 2], 7000));
-        doors.insert(name.to_string(), Arc::new(Door { router, faults, answering: Default::default(), up: tokio::sync::watch::Sender::new(true), peer }));
+        doors.insert(name.to_string(), Arc::new(Door { running, faults, answering: Default::default(), up: tokio::sync::watch::Sender::new(true), peer }));
     }
 
     /// Member `name` is down: the calls it is answering end, unanswered, and nothing reaches it until it joins again.
@@ -103,7 +103,7 @@ impl Net {
         if door.faults.meet(Op::Call, &shown).await == Verdict::Fail {
             return Err(none("its answer failed"));
         }
-        let Some(router) = lock(&door.router).clone() else { return Err(none("it is starting, or stopped")) };
+        let Some(router) = lock(&door.running).clone().map(|r| r.router) else { return Err(none("it is starting, or stopped")) };
         let from = mine.map_or(std::net::SocketAddr::from(([127, 0, 0, 1], 7000)), |d| d.peer);
         let req = request(node, from, c.verb, &c.path, c.json, c.bearer, c.user, c.headers, c.body)?;
         let answered = crate::spawns::untracked(async move {

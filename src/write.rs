@@ -1392,7 +1392,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         None => Ok(rows),
     });
     // (files of up to 4M rows, as a merge writes them: `maintain` leaves them alone)
-    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], true, partition.as_deref()));
+    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], partition.as_deref()));
     Ok((columns, futures::future::try_join_all(writes).await?.concat()))
 }
 
@@ -1562,6 +1562,17 @@ where
         undo_made(run, name, job).await;
     }
     out
+}
+
+/// What a statement that isn't an INSERT asks of another engine's table (`table_formats::Ability`).
+fn asks(stmt: &Stmt) -> crate::table_formats::Ability {
+    use crate::table_formats::Ability;
+    match stmt {
+        Stmt::Update(..) => Ability::Update,
+        Stmt::Delete(..) => Ability::Delete,
+        Stmt::Merge(..) => Ability::Merge,
+        _ => Ability::Insert,
+    }
 }
 
 /// Drops the table a statement made under `name` after it failed or stopped: purged, as `made_drop` says (never another
@@ -1833,14 +1844,18 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let (names, query) = match &stmt {
             Stmt::Insert(_, query) => (None, query),
             Stmt::InsertInto(_, names, query) => (Some(names.clone()), query),
-            _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
+            _ => return Err(crate::table_formats::may(&stmt.table(), &crate::ext_names::spec(&target).map(|s| s.format).unwrap_or_default(), asks(&stmt)).err().unwrap_or_else(|| anyhow::anyhow!("{}: another engine's table", stmt.table()))),
         };
         return crate::write_outside::insert(lake, &target, &stmt.table(), names, query, &job, &by.scope).await;
     }
     // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
     // "no table" with a quoted path)
     if let Some(spec) = crate::ext_names::spec(&stmt.table()) {
-        bail!("{}: files or another engine's table; Pondra INSERTs into a Delta or Iceberg table (UPDATE, DELETE and MERGE: not yet)", spec.urls.join(", "));
+        let named = spec.urls.join(", ");
+        return Err(match crate::table_formats::named(&spec.format) {
+            Some(f) => crate::table_formats::refused(&named, f, asks(&stmt)),
+            None => anyhow::anyhow!("{named}: files; {} changes a table (another engine's, {}, as its format says), and files are written anew with COPY … TO", asks(&stmt).said(), crate::table_formats::names()),
+        });
     }
     // UPDATE and DELETE of an append table, and MERGE: the leader's (of the table's lake), from
     // one snapshot (`change.rs`). Another leader is sent what it can't read (ADR-028).

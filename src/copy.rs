@@ -73,7 +73,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         Some(f) => f.to_lowercase(),
         None => format_of(to.trim_end_matches('/')).map(|f| f.0).with_context(|| format!("COPY … TO {to}: which FORMAT? (parquet, csv, json, delta, iceberg)"))?,
     };
-    if format == "delta" || format == "iceberg" {
+    if crate::table_formats::is(&format) {
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
         let ctx = crate::query::session_for(lake, &query, "", None, scope).await?;
         let (append, overwrite) = (on("append"), on("overwrite"));
@@ -116,8 +116,10 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         } else {
             kept = there.into_iter().collect();
         }
-        // A folder from a big table, on remote storage: every node writes its own share's files.
-        if remote {
+        // A folder from a big table, on remote storage: every node writes its own share's files. Not for a scope with
+        // grants, which is planned here only (`App::here_only_for`): a node plans its share as the node's own work, which
+        // reads every row and column (step 6 piece 5: before role options let a user export).
+        if remote && scope.whole() {
             match crate::spmd::copy(lake, nodes, me, &query, &target, scope).await {
                 Ok(Some(rows)) => return Ok(serde_json::json!({"copied": rows, "to": to})),
                 Ok(None) => {}

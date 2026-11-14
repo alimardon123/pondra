@@ -279,8 +279,12 @@ async fn carry(lake: &Lake, table: &str, meta: &TableMeta, c: &FileCommit) -> Re
     use crate::lake_scan::deleted_rows;
     use crate::scan::Delete;
     let mut live = meta.files.clone();
-    for m in crate::manifest::list(lake, meta).await? {
-        live.extend(crate::manifest::files(lake, &m).await?.iter().cloned());
+    // Sealed files' records are read only when a file named is not one of the open ones: an INSERT,
+    // which names none, reads no manifest (with thousands of sealed files, that was most of its commit).
+    if c.removed.iter().chain(c.deleted.iter().map(|d| &d.0)).any(|p| !meta.files.iter().any(|f| &f.path == p)) {
+        for m in crate::manifest::list(lake, meta).await? {
+            live.extend(crate::manifest::files(lake, &m).await?.iter().cloned());
+        }
     }
     let here = |p: &str| live.iter().any(|f| f.path == p);
     let old = |p: &str| meta.replaced.iter().find(|f| f.path == p).cloned().with_context(|| format!("{}: {p} is no longer {table}'s (removed since the writer read it)", crate::iceberg::CONFLICT));
@@ -302,7 +306,7 @@ async fn carry(lake: &Lake, table: &str, meta: &TableMeta, c: &FileCommit) -> Re
     }
     ids.sort_unstable();
     ids.dedup();
-    let range = |f: &DataFile| f.stats.get(crate::text::ROW_ID).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
+    let range = |f: &DataFile| crate::bounds::Ranged::longs(f, crate::text::ROW_ID);
     let mut found = 0;
     for f in live.iter().filter(|f| range(f).is_none_or(|(lo, hi)| lo <= ids[ids.len() - 1] && ids[0] <= hi)) {
         let gone: std::collections::HashSet<u64> = deleted_rows(lake, f).await?.into_iter().collect();

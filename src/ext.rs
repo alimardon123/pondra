@@ -305,8 +305,8 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)], scope: &crate::r
         for u in m.ext.as_ref().map(|s| s.urls.clone()).unwrap_or_default() {
             OWNER.scope(true, register(lake, &u, scope)).await?;
         }
-        if let Some(s) = m.ext.as_ref().filter(|s| s.format == "iceberg" && s.options.contains_key("namespace")) {
-            OWNER.scope(true, crate::catalogs::prime(lake, s, m, scope)).await?;
+        if let Some((s, prime)) = m.ext.as_ref().and_then(|s| Some((s, crate::table_formats::named(&s.format)?.prime?))) {
+            OWNER.scope(true, prime(lake, s, m, scope)).await?;
         }
         keep(t, m);
     }
@@ -484,18 +484,17 @@ async fn resolve(lake: &Lake, spec: &Spec, scope: &crate::rights::Scope) -> Resu
     match spec.format.as_str() {
         "kafka" => return Ok({ let mut entry = crate::kafka_client::resolve(lake, &spec.urls[0], scope).await?; entry.ext = Some(spec.clone()); entry }),
         "share" => return Ok({ let mut entry = crate::sharing_client::read(lake, spec, scope).await?; entry.ext = Some(spec.clone()); entry }), // (its files' links are the provider's: ADR-046)
-        "delta" | "iceberg" => {
-            let (mut m, d) = match spec.format.as_str() {
-                "delta" => (table_meta(crate::read_delta::resolve(&crate::ext::Asking { lake, scope }, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?), None), // (a folder named relatively: from where the node runs)
-                _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options, scope).await?,
-            };
-            check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str()), scope).await?;
-            if let Some(d) = &d {
-                crate::catalogs::rehome(d, &mut m); // (its files are read through the table's own delegated store)
-            }
-            return Ok({ let mut entry = m; entry.ext = Some(spec.clone()); entry });
-        }
         _ => {}
+    }
+    if let Some(f) = crate::table_formats::named(&spec.format) {
+        let r = (f.resolve)(lake, spec, scope).await?; // (another engine's table: its format's entry)
+        check_files(lake, &r.meta, r.vouched.as_deref(), scope).await?;
+        let mut entry = r.meta;
+        if let Some(then) = r.then {
+            then(&mut entry);
+        }
+        entry.ext = Some(spec.clone());
+        return Ok(entry);
     }
     let ctx = lake.session();
     let state = ctx.state();
@@ -537,7 +536,7 @@ pub(crate) async fn objects(lake: &Lake, spec: &Spec, scope: &crate::rights::Sco
 /// columns (outside the lake, a file may change under the same name). Parquet and the other files
 /// are read by `ext_names::read`, the reader a page shares.
 pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>, scope: &crate::rights::Scope) -> Result<datafusion::prelude::DataFrame> {
-    if ["delta", "iceberg", "share"].contains(&spec.format.as_str()) {
+    if crate::table_formats::is(&spec.format) || spec.format == "share" {
         return crate::scan::read(ctx, files, schema, table).await; // (another engine's table, or a share: its partition values, its deletes)
     }
     if spec.format == "kafka" {

@@ -9,7 +9,7 @@ use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Statement;
-use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::ast;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -89,8 +89,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if let Some(q) = crate::friendly::summarize(host, sql).await? {
         return Ok(q);
     }
-    // (then the text's passes, in order: `spark_sql('…')` as Pondra's SQL; `pondra.diff('prod.t', 'dev.t')`, ADR-047;
-    // `t AT (VERSION => n)`, ADR-043; `PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON; FINAL and RUNNING before a
+    // (then the text's passes, in order: `spark_sql('…')` as Pondra's SQL; `t AT (VERSION => n)`, ADR-043; `PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON; FINAL and RUNNING before a
     // measure, a subquery before MATCH_RECOGNIZE: each as SQL that parses)
     let sql: &str = &passes.text(sql)?.into_owned();
     let Routines { own: all, lake } = host.routines().await?;
@@ -104,18 +103,9 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if !expands && !measured && !passes.wants(sql)? { // (a tree pass's look: friendly's forms, MATCH_RECOGNIZE, a type of one's own)
         return as_written();
     }
-    // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
-    static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
-    // (parsed once for the front's looks, `parsed.rs`; a text generic refuses read with the fallback dialect's hooks)
-    let parsed = crate::parsed::read(sql).or_else(|e| match LEADING_FROM.is_match(sql) {
-        true => {
-            let all = format!("SELECT * {sql}");
-            Parser::parse_sql(&GenericDialect {}, &all).or_else(|_| crate::dialect::parse(&all).0).map_err(|_| e)
-        }
-        false => Err(e),
-    });
-    let mut stmts = match parsed {
+    // (read as Pondra's SQL, the core's language, `parsed::pondra`: parsed once for the front's looks, a text generic refuses
+    // read with the fallback dialect's hooks, and DuckDB's `FROM t WHERE …` as `SELECT * FROM t WHERE …`)
+    let mut stmts = match crate::parsed::pondra(sql) {
         Ok(stmts) => stmts,
         // (the fallback read further than generic did: its error, which DataFusion's parse of the text never gives)
         Err(e) if crate::parsed::generic(sql).err().is_some_and(|g| g != e) => return Err(datafusion::error::DataFusionError::SQL(Box::new(e), None).into()),
@@ -123,8 +113,13 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     };
     // (a tree only the fallback dialect read, or the FROM-first reading: printed, as nothing after the front reads the text)
     let read_apart = crate::parsed::generic(sql).is_err();
+    // (`pondra.diff(a, b)`, ADR-047: each call as the query that answers it, whose views are expanded below as any other)
+    let expands = crate::diff::rewrite(host, &mut stmts).await? || expands;
     // (a view's `sum(x) AS MEASURE revenue`, which the fallback dialect reads as an alias, ADR-065 §3: `measures::passes`)
     let measured = measured || (read_apart && crate::measures::marked(&stmts));
+    // (Postgres's grouping where generic groups otherwise, `grouping.rs`: here, on the tree whichever dialect read, so a
+    // page, FROM first and every door group alike, 11-10 audit H3; a node's door grouped text generic reads already)
+    let grouped = crate::grouping::wanted(sql) && crate::grouping::regroup(&mut stmts);
     let name = host.name();
     let me = format!("{name}.");
     // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
@@ -144,7 +139,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let typed = crate::pg_casts::rewrite(host, &mut stmts).await?; // (JSON's set functions, uuid and json casts, pg_typeof, a lateral generate_series, array literals, an enum's casts as text)
     // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
     let friendly = crate::friendly::rewrite(host, &mut stmts).await?;
-    if !expands && !friendly && !typed && !patterned && !read_apart {
+    if !expands && !friendly && !typed && !patterned && !read_apart && !grouped {
         return as_written();
     }
     Ok(crate::text::text_kept(stmts)) // (kept as the printed text's parse: the engine plans from the tree, `parsed::keep`)

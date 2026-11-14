@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use crate::members::Members;
 
 #[cfg(feature = "doors")] mod run;
+#[cfg(feature = "doors")] pub(crate) mod kept;
 #[cfg(feature = "doors")] pub use run::{Node, Options};
+#[cfg(feature = "doors")] pub use kept::State;
 #[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
 pub use crate::lifecycle::{Guest, Restarting};
@@ -49,11 +51,11 @@ impl Default for Start {
 /// serve` then ends with status 1 (`cli.rs`). A node with no host in a library's process (a command's own) only says
 /// why: the process is the host program's. Elsewhere (a guest, a command of the command line's) the process ends here
 /// with status 1, as a supervisor expects of a stop and with no core: what it made goes first (an exit runs no destructor).
-fn stop(why: String, host: Option<&Host>, in_place: bool) {
+fn stop(why: String, host: Option<&Host>) {
     eprintln!("stopping: {why}");
     match host {
         Some(h) if !h.events.is_closed() => drop(h.events.send(Event::Failed(why))),
-        _ if hosted() || in_place => {}
+        _ if hosted() => {}
         _ => {
             crate::memory::leave();
             std::process::exit(1)
@@ -64,11 +66,16 @@ fn stop(why: String, host: Option<&Host>, in_place: bool) {
 /// A node's host: what it is told when the node's own work fails or must start again (`Event`), and where the node's
 /// lake moves go (`memory::set_location`). A library's supervisor and `pondra serve` each make one (`Host::new`) and give
 /// it to every node they start (`Options::host`): it outlives each node, as the host does. A node with none (a guest, a
-/// command's own, a test's) stops its process on a failure, and can't move its lake.
+/// command's own, a test's) stops its process on a failure, and can't move its lake. A folder of lakes' server keeps
+/// each of its databases' nodes in its own process (`Host::beside`).
 #[derive(Clone)]
 pub struct Host {
     events: mpsc::UnboundedSender<Event>,
     moves: mpsc::UnboundedSender<crate::lifecycle::Move>,
+    /// Does the host keep the node in its process beside others, and reach it there (each database of `pondra serve
+    /// <folder>`, `dbserver.rs`)? Then the node binds no port of its own (`Options::database`), a restart is in place, as a
+    /// library's is, and the process isn't the node's: the host and its other nodes go on.
+    beside: bool,
 }
 
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a library's and `pondra serve`'s, the doors half's)
@@ -84,8 +91,21 @@ impl Host {
     pub fn new() -> (Host, Told) {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (moves, moves_rx) = mpsc::unbounded_channel();
-        (Host { events, moves }, Told { events: events_rx, moves: moves_rx })
+        (Host { events, moves, beside: false }, Told { events: events_rx, moves: moves_rx })
     }
+
+    /// A host that keeps its node in its process beside others (`beside`), and its end of what the node tells it. Its
+    /// node's lake can't move: a database is its folder's (its end of the moves is let go of at once).
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a lakes server's: the doors half's)
+    pub(crate) fn beside() -> (Host, Told) {
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (moves, _) = mpsc::unbounded_channel();
+        let (_, moves_rx) = mpsc::unbounded_channel();
+        (Host { events, moves, beside: true }, Told { events: events_rx, moves: moves_rx })
+    }
+
+    /// Does it keep its node in its process beside others (`Host::beside`)?
+    pub(crate) fn keeps_beside(&self) -> bool { self.beside }
 
     /// Tells the host `e` (a library's close, which is the host's own).
     #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close sends it)
@@ -117,7 +137,6 @@ pub struct Native {
     settings: crate::settings::Values, // (the node's, which the processes it starts are handed: `lead_elsewhere`)
     host: Option<Host>, // (who is told of its failures and restarts, and takes its lake's moves: `Options::host`)
     claims: Arc<crate::node_state::Claims>, // (the node's: its restart says in them that it is coming back, `restart_with`)
-    in_place: bool, // (`Given::in_place`: hosted though the process isn't a library's)
 }
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
@@ -127,12 +146,12 @@ pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(gu
 /// `native`, the node starting with `settings` (`Options::settings`) under `host` (`Options::host`).
 pub(crate) fn native_with(guest: bool, settings: crate::settings::Values, host: Option<Host>, given: &crate::node_state::Given) -> Arc<crate::node_state::NodeState> {
     let claims = Arc::<crate::node_state::Claims>::default();
-    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone(), in_place: given.in_place }), settings, claims, given)
+    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone() }), settings, claims, given)
 }
 
 impl crate::lifecycle::Lifecycle for Native {
-    fn stop(&self, why: String) { stop(why, self.host.as_ref(), self.in_place) }
-    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, &self.claims, why, carried, self.host.as_ref(), self.in_place) }
+    fn stop(&self, why: String) { stop(why, self.host.as_ref()) }
+    fn restart(&self, why: &str, carried: &[(&str, String)]) -> ! { restart_with(self.guest, &self.claims, why, carried, self.host.as_ref()) }
     /// (a library's host and a `pondra sql` guest's shell show only trouble, so there it is not said)
     fn say(&self, line: &str) {
         if !hosted() && !self.guest {
@@ -140,7 +159,7 @@ impl crate::lifecycle::Lifecycle for Native {
         }
     }
     fn one_off(&self) -> bool { self.guest }
-    fn owns_process(&self) -> bool { !hosted() && !self.in_place }
+    fn owns_process(&self) -> bool { !hosted() && !self.host.as_ref().is_some_and(Host::keeps_beside) }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
     fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings, reaches)) }
     fn movable(&self) -> bool { self.host.as_ref().is_some_and(Host::movable) }
@@ -201,7 +220,7 @@ impl crate::lifecycle::Lifecycle for PageLife {
 /// task that asked unwinds, past the panic hook (a host's error reporting sees no panic for a takeover). In the
 /// program the same binary runs again (`run::exec_again`). On a page there is no program to run again, so a restart
 /// is a stop until the page decides otherwise (L2's answer in the design).
-fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carried: &[(&str, String)], host: Option<&Host>, in_place: bool) -> ! {
+fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carried: &[(&str, String)], host: Option<&Host>) -> ! {
     if guest && crate::write::tries() >= 5 {
         eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
         crate::memory::leave();
@@ -216,9 +235,9 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
             held.values().for_each(|(_, f)| crate::terms::say(f, &format!("restarting {}", crate::log::now_ms())));
         }
     }
-    if hosted() || in_place {
+    if hosted() || host.is_some_and(Host::keeps_beside) {
         if let Some(h) = host {
-            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
+            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process, a lakes server its other databases)
         }
         std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
     }
@@ -227,7 +246,7 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
     #[cfg(not(feature = "doors"))]
     {
         let _ = carried; // (a page carries nothing: nothing runs again)
-        stop(format!("{why}"), host, in_place); // (a page: a restart is a stop, until the page decides otherwise)
+        stop(format!("{why}"), host); // (a page: a restart is a stop, until the page decides otherwise)
         unreachable!("stop ends an unhosted process")
     }
 }
@@ -857,7 +876,7 @@ mod tests {
         use crate::lifecycle::{Lifecycle, Move, NO_MOVE};
         let to = |to: &str| Move { from: "memory://a".into(), to: to.into(), copied: Default::default() };
         let (host, mut told) = super::Host::new();
-        let node = super::Native { guest: false, settings: crate::settings::Values::now(), host: Some(host), claims: Default::default(), in_place: false };
+        let node = super::Native { guest: false, settings: crate::settings::Values::now(), host: Some(host), claims: Default::default() };
         assert!(node.movable());
         node.move_lake(to("/tmp/b")).unwrap();
         assert_eq!(told.moves.try_recv().map(|m| m.to).ok().as_deref(), Some("/tmp/b"));
@@ -866,7 +885,7 @@ mod tests {
         drop(told); // (the host is gone)
         assert!(!node.movable());
         assert_eq!(node.move_lake(to("/tmp/c")).unwrap_err().to_string(), NO_MOVE);
-        let alone = super::Native { guest: false, settings: crate::settings::Values::now(), host: None, claims: Default::default(), in_place: false };
+        let alone = super::Native { guest: false, settings: crate::settings::Values::now(), host: None, claims: Default::default() };
         assert!(!alone.movable());
         assert_eq!(alone.move_lake(to("/tmp/d")).unwrap_err().to_string(), NO_MOVE);
     }
@@ -982,6 +1001,64 @@ mod tests {
             assert_eq!(a.folder.as_deref(), Some("a__2"), "the renamed table keeps folder a: the new one takes the next");
             assert_eq!(free_folder(&lake, "a").await.unwrap().as_deref(), Some("a__3"), "a, kept for the dropped a2, and a__2 are used");
             assert_eq!(free_folder(&lake, "d").await.unwrap(), None);
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A keyed table's files keep their columns' ranges (step 5 piece 11a), and its reads skip a file they rule out,
+    /// unopened, for a filter on any column: each part of the merge on read is filtered alone (`query::upsert_view`). The
+    /// answers stay whole: an update's newest version, in a file a filter on another column skips, still shadows the old
+    /// one that filter finds. (Here, with the node: an UPDATE needs the leader's sequencer, and files its tiering.)
+    #[tokio::test]
+    async fn a_keyed_tables_reads_skip_the_files_their_ranges_rule_out() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            let run = |sql: String| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let stmt = crate::write::parse(&sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                }
+            };
+            run("CREATE TABLE k (id BIGINT, v BIGINT, PRIMARY KEY (id))".into()).await;
+            for (lo, hi) in [(1, 1000), (1001, 2000)] {
+                run(format!("INSERT INTO k SELECT value, value FROM range({lo}, {})", hi + 1)).await; // (v = id)
+                app.tier_all(0).await.unwrap();
+            }
+            run("UPDATE k SET v = -5 WHERE id = 5".into()).await;
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("k")).await.unwrap().unwrap();
+            assert_eq!(meta.files.len(), 3, "a file a round: {:?}", meta.files.iter().map(|f| (f.ord, &f.stats)).collect::<Vec<_>>());
+            let ranges = |f: &crate::store::DataFile| (f.stats.get("id").cloned(), f.stats.get("v").cloned());
+            let newest = meta.files.iter().max_by_key(|f| f.ord).unwrap();
+            assert_eq!(ranges(newest), (Some(("5".into(), "5".into())), Some(("-5".into(), "-5".into()))));
+            assert!(meta.files.iter().all(|f| f.sketch.is_empty()), "a keyed file's sketches would count a key's old versions");
+            let count = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let skipped = || app.lake.node.metrics.files_skipped.load(std::sync::atomic::Ordering::Relaxed);
+                    let before = skipped();
+                    let b = app.query(sql, Some("0"), &node.scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    (b[0].column(0).as_primitive::<Int64Type>().value(0), skipped() - before)
+                }
+            };
+            for (sql, rows, skips) in [
+                ("SELECT count(*) FROM k WHERE id = 1500", 1, true),     // (the two files of ids 1-1000 and of 5 unopened)
+                ("SELECT count(*) FROM k WHERE v = 5", 0, true),         // (id 5's old version, shadowed by a file it skips)
+                ("SELECT count(*) FROM k WHERE v = -5", 1, true),
+                ("SELECT count(*) FROM k WHERE v BETWEEN 1 AND 1000", 999, true),
+                ("SELECT count(*) FROM k", 2000, false),
+            ] {
+                let (n, skipped) = count(sql).await;
+                assert_eq!(n, rows, "{sql}");
+                assert_eq!(skipped > 0, skips, "{sql}: {skipped} files skipped");
+            }
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })

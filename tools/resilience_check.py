@@ -26,8 +26,8 @@ once the fault is gone (how long it took is in `info`).
 - **disk**: three nodes on a lake on local disk, and the disk full: reads go on, writes wait, and
   every one lands once when there is room.
 - **cache**: three nodes on a bucket (replicated acks), their cache disk full: nothing stops.
-- **server**: `pondra serve --lakes`, a database's node killed and the server killed under the
-  Python client and psycopg.
+- **server**: `pondra serve --lakes` killed twice under the Python client and psycopg (its databases'
+  nodes are in its process).
 - **cli**: `pondra sql` killed mid-INSERT, on local disk and a bucket, with a node and without.
 
   resilience_check.py [storage] [cutoff] [catalog] [restart] [clients] [doors] [flight] [disk] [cache] [server] [cli] [--secs 20]
@@ -1085,10 +1085,10 @@ def pids(*words):
 
 def server(a):
     """`pondra serve --lakes`: the Python client writing and reading a database through the
-    server, and psycopg through its Postgres port, while the database's node is killed twice (the
-    server starts it again on the next request) and then the server itself is killed (its nodes
-    stop with it) and started again: no Python call fails, psycopg reconnects, and everything
-    acknowledged is there once."""
+    server, and psycopg through its Postgres port, while the server is killed twice and started
+    again (its databases' nodes are in its own process, so they go with it: no child is left to
+    kill on its own): no Python call fails, psycopg reconnects, and everything acknowledged is
+    there once."""
     import psycopg
     sys.path.insert(0, os.path.join(os.path.dirname(HERE), "python"))
     import pondra
@@ -1109,8 +1109,10 @@ def server(a):
         call(port, "POST", "/databases", b'{"name": "shop"}', timeout=60)
         pondra.connect(url, echo=False).sql("CREATE TABLE events (producer VARCHAR, seq BIGINT, i BIGINT)")
         pondra.connect(url, echo=False).sql("CREATE TABLE pgt (seq BIGINT)")
-        node = lambda: pids("--advertise", f"127.0.0.1:{port}/db/shop")
-        check("a database's node, started by the server", until(node, 30))
+        node = lambda: pids("--advertise", f"127.0.0.1:{port}/db/shop")  # (a child serving it: there is none)
+        children = lambda: subprocess.run(["pgrep", "-P", str(srv.pid)], capture_output=True, text=True).stdout.split()
+        up = until(lambda: any(d.get("name") == "shop" and d.get("running") for d in call(port, "GET", "/databases", timeout=5) or []), 30)
+        check("a database's node, started by the server in its own process: no child", up and not children() and not node())
 
         def writer(name, insert):
             con, seq = pondra.connect(url, echo=False), 0
@@ -1161,15 +1163,11 @@ def server(a):
 
         for n in (1, 2):
             time.sleep(a.secs / 3)
-            [os.kill(pid, 9) for pid in node()]
-            going(f"the database's node killed ({n})")
-        time.sleep(a.secs / 3)
-        srv.kill()
-        srv.wait()
-        gone = until(lambda: not node(), 15)
-        check("the server killed: its database's node stops with it", gone, node())
-        srv = start()
-        going("the server started again")
+            srv.kill()
+            srv.wait()
+            check(f"the server killed ({n}): nothing of its database's is left running", not node())
+            srv = start()
+            going(f"the server started again ({n})")
         time.sleep(a.secs / 3)
         stop.set()
         [t.join(90) for t in threads]

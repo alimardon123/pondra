@@ -14,30 +14,20 @@
 //! `capi/`, for Python's `pondra.open`, and its Node-API module for JavaScript's: `designs/l2-step4-open.md`),
 //! answers that stream included. The loopback door the node opens is for what lives outside the host's
 //! process: the console in a browser, Python's workers calling back, other processes on the lake.
-use crate::node::{Event, Held, Node, Options, Restarting};
-use std::panic::AssertUnwindSafe;
+use crate::node::kept::{supervise, Slot};
+use crate::node::{Event, Options};
 use std::sync::{Arc, Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use futures::FutureExt;
 use tokio::sync::mpsc;
 
-/// What the node open in this process is doing now.
-#[derive(Clone, Debug, PartialEq)]
-pub enum State {
-    Starting,
-    Running,
-    /// Halted, about to start again: why.
-    Restarting(String),
-    /// Stopped, until opened again: why.
-    Failed(String),
-    Closed,
-}
+pub use crate::node::State;
 
 /// A node in this process, kept by its supervisor across restarts until it is closed.
 pub struct Opened {
     state: Arc<Mutex<State>>,
     /// The node's router while it runs (`Node::router`): what [`Opened::ask`] calls.
-    router: Arc<Mutex<Option<axum::Router>>>,
+    running: Slot,
     host: crate::node::Host, // (its node's host: a close is told to it, as the node's failures are)
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The key that makes a request the owner's (invariant 61), given by its host (`pondra.open` gives its
@@ -123,9 +113,6 @@ fn claim() -> anyhow::Result<()> {
 /// The library's node is closed, or its open failed: another may open.
 fn release() { OPEN.store(false, SeqCst) }
 
-/// Pauses between tries to start again; five restarts within a minute of each other is giving up.
-const PAUSES: [f64; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
-
 impl Opened {
     /// Opens a node in this process, once it serves (or has failed to, saying why). One at a time: a
     /// second open while one is open is refused by name.
@@ -136,10 +123,10 @@ impl Opened {
         let (host, told) = crate::node::Host::new();
         options.host = Some(host.clone()); // (every start of the node is under this supervisor: `Lifecycle::stop`, `restart`, `move_lake`)
         let state = Arc::new(Mutex::new(State::Starting));
-        let router = Arc::new(Mutex::new(None));
+        let running: Slot = Arc::new(Mutex::new(None));
         let (first, started) = std::sync::mpsc::channel();
-        let (st, ro) = (state.clone(), router.clone());
-        let thread = std::thread::Builder::new().name("pondra-supervisor".into()).stack_size(8 << 20).spawn(move || runtime().block_on(crate::auth::as_node(supervise(options, st, ro, told, first)))); // (the node's start: its own work, `auth::as_node`; a request is its caller's)
+        let (st, ro) = (state.clone(), running.clone());
+        let thread = std::thread::Builder::new().name("pondra-supervisor".into()).stack_size(8 << 20).spawn(move || runtime().block_on(supervise(options, st, ro, told, first))); // (the node's start: its own work, `kept::supervise`)
         let thread = match thread {
             Ok(t) => t,
             Err(e) => {
@@ -147,7 +134,7 @@ impl Opened {
                 return Err(e.into());
             }
         };
-        let opened = Opened { state, router, host, thread: Mutex::new(Some(thread)), owner: None, memory };
+        let opened = Opened { state, running, host, thread: Mutex::new(Some(thread)), owner: None, memory };
         match started.recv() {
             Ok(Ok(())) => Ok(opened),
             Ok(Err(why)) => Err(anyhow::anyhow!(why)), // (`opened` dropped: closed)
@@ -216,7 +203,7 @@ impl Opened {
     /// thread may have a small stack, invariant 195, and no runtime). While the node starts, restarts or has
     /// failed, the answer is 503 57P03 with the reason, which clients ask again on.
     pub fn ask(&self, method: &str, path: &str, headers: &[(String, String)], body: Vec<u8>) -> anyhow::Result<Asked> {
-        let router = self.router.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let router = self.running.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|r| r.router.clone());
         let Some(router) = router else {
             let why = match self.state() {
                 State::Closed => anyhow::bail!("this node is closed: open the lake again"),
@@ -291,150 +278,4 @@ async fn answer(router: axum::Router, req: http::Request<axum::body::Body>, mut 
 
 impl Drop for Opened {
     fn drop(&mut self) { self.close(); }
-}
-
-/// The node in place: what exec does to a process. Its tasks end, its state (its term's lock file,
-/// whose file says "restarting", its Python workers) is let go, and its lake with it; nothing waits
-/// on the bucket, and the term isn't given back: a fenced or cut-off node has nothing to make durable.
-fn halt(held: &Held, node: Option<Node>) {
-    held.abort_tasks();
-    drop(node);
-}
-
-pub(crate) async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, told: crate::node::Told, first: std::sync::mpsc::Sender<Result<(), String>>) {
-    let crate::node::Told { mut events, mut moves } = told; // (its nodes': their failures, restarts and the close; their lakes' moves)
-    // (the router is there exactly while the node runs: a request at any other time is told why)
-    let set = |s: State| {
-        let mut r = router.lock().unwrap_or_else(PoisonError::into_inner);
-        if s != State::Running {
-            r.take();
-        }
-        *state.lock().unwrap_or_else(PoisonError::into_inner) = s;
-    };
-    let mut first = Some(first);
-    let mut restarts: Vec<Instant> = vec![];
-    loop {
-        set(State::Starting);
-        // (a start can be told to restart by a task it started, or unwind with `Restarting` itself)
-        let held = Arc::new(Held::default()); // (this start's: a start dropped midway still ends what it started, `halt`)
-        let start = AssertUnwindSafe(Node::open_in(options.clone(), held.clone())).catch_unwind();
-        let why = tokio::select! {
-            started = start => match started {
-                Ok(Ok(node)) => {
-                    *router.lock().unwrap_or_else(PoisonError::into_inner) = Some(node.router());
-                    set(State::Running);
-                    if let Some(f) = first.take() {
-                        let _ = f.send(Ok(()));
-                    }
-                    let since = Instant::now();
-                    let next = tokio::select! {
-                        e = events.recv() => e,
-                        Some(m) = moves.recv() => {
-                            // The lake moves: its requests answered, the node stopped, its objects settled on the
-                            // target, and the node started there. A move is not a restart, so it is not counted.
-                            node.drain().await;
-                            set(State::Restarting(format!("moving the lake to {}", m.to)));
-                            node.stop().await;
-                            if let Err(e) = crate::memory::settle(&m).await {
-                                // (the lake stays in memory: the node starts again on it, and says why in `/stats`)
-                                options.move_failed = Some(crate::memory::move_failed(&m.to, &e));
-                                continue;
-                            }
-                            (options.dir, options.move_failed) = (m.to, None);
-                            continue;
-                        }
-                    };
-                    match next {
-                        Some(Event::Restart(why)) => {
-                            router.lock().unwrap_or_else(PoisonError::into_inner).take(); // (no request reaches a node being halted)
-                            halt(&held, Some(node));
-                            if since.elapsed() >= Duration::from_secs(60) {
-                                restarts.clear(); // (a node that served a minute starts the count again)
-                            }
-                            why
-                        }
-                        Some(Event::Failed(why)) => {
-                            set(State::Failed(why.clone())); // (said at once: the stop may wait on the bucket)
-                            if tokio::time::timeout(Duration::from_secs(30), node.stop()).await.is_err() {
-                                halt(&held, None);
-                            }
-                            return failed_until_closed(&set, why, &mut events, first.take()).await;
-                        }
-                        Some(Event::Close) | None => {
-                            let t0 = std::time::Instant::now();
-                            node.drain().await; // (its requests in flight answered: the router stays till then)
-                            if crate::env::is_set("PONDRA_TRACE_START") {
-                                eprintln!("stop: drained {:.2} s", t0.elapsed().as_secs_f64());
-                            }
-                            router.lock().unwrap_or_else(PoisonError::into_inner).take();
-                            node.stop().await;
-                            set(State::Closed);
-                            return;
-                        }
-                    }
-                }
-                Ok(Err(e)) if e.downcast_ref::<crate::format::Newer>().is_some() || crate::memory_lake::torn(&e) => {
-                    return failed_until_closed(&set, format!("{e:#}"), &mut events, first.take()).await; // (no try will open it: nor a place a move didn't finish)
-                }
-                Ok(Err(e)) => format!("{e:#}"), // (`Node::open` gave back what it took)
-                Err(p) => {
-                    halt(&held, None);
-                    match p.downcast::<Restarting>() {
-                        Ok(r) => r.0,
-                        Err(p) => return failed_until_closed(&set, crate::spawns::said(&*p), &mut events, first.take()).await,
-                    }
-                }
-            },
-            e = events.recv() => match e {
-                Some(Event::Restart(why)) => {
-                    halt(&held, None); // (the start's future is dropped: what it took goes with its statics)
-                    why
-                }
-                Some(Event::Failed(why)) => {
-                    halt(&held, None);
-                    return failed_until_closed(&set, why, &mut events, first.take()).await;
-                }
-                Some(Event::Close) | None => {
-                    halt(&held, None);
-                    set(State::Closed);
-                    return;
-                }
-            },
-        };
-        while let Ok(e) = events.try_recv() {
-            // (the same trouble said by several tasks at once: one restart; a close still closes)
-            if matches!(e, Event::Close) {
-                set(State::Closed);
-                return;
-            }
-        }
-        restarts.retain(|t| t.elapsed() < Duration::from_secs(60));
-        let Some(pause) = PAUSES.get(restarts.len()) else {
-            return failed_until_closed(&set, format!("restarted {} times within a minute; the last time: {why}", PAUSES.len()), &mut events, first.take()).await;
-        };
-        restarts.push(Instant::now());
-        eprintln!("restarting the node in place: {why}");
-        set(State::Restarting(why));
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs_f64(*pause)) => {}
-            e = events.recv() => if matches!(e, Some(Event::Close) | None) {
-                set(State::Closed);
-                return;
-            },
-        }
-    }
-}
-
-/// Failed: said to whoever opened it, then kept until it is closed.
-async fn failed_until_closed(set: &impl Fn(State), why: String, events: &mut mpsc::UnboundedReceiver<Event>, first: Option<std::sync::mpsc::Sender<Result<(), String>>>) {
-    set(State::Failed(why.clone()));
-    if let Some(f) = first {
-        let _ = f.send(Err(why));
-    }
-    while let Some(e) = events.recv().await {
-        if matches!(e, Event::Close) {
-            break;
-        }
-    }
-    set(State::Closed);
 }

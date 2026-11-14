@@ -72,7 +72,6 @@ PROCESS = {
     "console.rs:SERVER": "the server's page, built into the binary",
     "constraints.rs:TURN": LOCK,
     "defaults.rs:BASE": "the functions every session has, with no tables, for CHECK, DEFAULT and expectation expressions: nothing of a lake (what registers one gets a copy)",
-    "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
     "ledger.rs:ROOTS": "the process's memory, every node's budget held on it (redesign step 2, review change 4): one root for the sizes its machine and settings gave, so one in any process but a test's",
     "library.rs:OPEN": "whether a library's node is open in the process: one at a time, since the machine and network its first start installs are the process's",
     "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
@@ -125,7 +124,8 @@ PROCESS = {
     "casts.rs:WHOLE": "a function's definition (pondra_whole), the same for every lake",
     "avg.rs:AVG_OF": "a function's definition (pondra_avg_of), the same for every lake",
     "multiply.rs:MULTIPLY": "a function's definition (pondra_multiply), the same for every lake",
-    "divide.rs:DIVIDE": "a function's definitions (pondra_divide, Postgres's places and Spark's), the same for every lake",
+    "divide.rs:DIVIDE": "a function's definition (pondra_divide, Postgres's places), the same for every lake",
+    "divide.rs:SPARK_DIVIDE": "a function's definition (spark_divide, Spark SQL's `/`), the same for every lake",
     "runs.rs:WAKE": SIGNAL,
     "runs.rs:WRITTEN": SIGNAL,
     "app.rs:TURNS": SETTING + " (PONDRA_QUERIES, PONDRA_QUEUE_SECS; a stopped node's last queries give their turns back to it)",
@@ -162,7 +162,7 @@ PROCESS = {
     "functions.rs:FUNCTIONS": "Spark's functions, made against a session with nothing of a lake",
     "registry.rs:REGISTRY": "the build's extensions, registered once from `crate::built_in` and never changed after: the same for every node, and no section holds a node's state",
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",
-    "tls.rs:KEY": SETTING + " (PONDRA_CLIENT_KEY, which the lakes server gives each database's node)",
+    "tls.rs:LAKES_KEY": "the key of a folder of lakes' server for its headers (`tls::lakes_key`), one a process: its databases' nodes are in that process, and it never changes",
     "tls.rs:PROXIES": SETTING + " (PONDRA_TRUSTED_PROXIES)",
     "tls.rs:TLS": SETTING + " (PONDRA_TLS_*)",
     "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`Lifecycle::restart`)",
@@ -175,7 +175,8 @@ PLAIN = {"std", "sync", "collections", "time", "path", "num", "borrow", "regex",
          "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
          "i128", "isize", "f32", "f64", "Duration", "PathBuf", "Path", "Regex", "Value", "Bytes", "Cow",
          "NonZeroUsize", "static",
-         "crate", "registry", "BuiltIn"}  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "crate", "registry", "BuiltIn",  # (a built-in extension's `registry::BuiltIn`: its names and a function, nothing to change)
+         "languages", "Language"}  # (a language of the registry's, `languages::Language`: its names and a function too)
 # Where a `"PONDRA_…"` name isn't a setting anything reads, by file, with the reason.
 NOT_READ = {
     "ci.rs": "GitHub secrets' names, which `pondra ci init` sets for a repository's workflows",

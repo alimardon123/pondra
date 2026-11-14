@@ -54,7 +54,10 @@ pub enum Answer<O> {
 }
 
 /// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it.
-pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+pub async fn run<W: Wire>(app: &App, mut req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+    if let Some(sql) = in_language(crate::set::language(), &req.sql)? {
+        req.sql = sql; // (the session's language read once, as the request arrives: what follows reads Pondra's SQL)
+    }
     if let Some(seg) = how.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
@@ -85,6 +88,119 @@ pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire:
         Outcome::Rows(batches) => Answer::Rows(batches),
         Outcome::Done(v) => Answer::Done(v),
     })
+}
+
+/// A request's text in a language (`languages.rs`, the session's as it arrives: `set::language`) as Pondra's SQL: each
+/// statement read by the language's parse and printed (`text::text_kept`, so the front takes its tree and doesn't parse
+/// the print). A statement that sets the session's language (`set::language_change`) has the statements after it read
+/// in that one, as each would be sent on its own; one that lets the session's own go, in the node's (`set::node_language`).
+/// A text the language's grammar refuses is refused in its words (42601). Pondra's own statements are read as written in
+/// every language (`pondra_s_own`). None: Pondra's SQL throughout, or the cluster's own call (`auth::operator`), which is.
+/// Not a routine's or a task's body, kept as Pondra's SQL: those run as they are (`routines::one`).
+pub(crate) fn in_language(name: &str, sql: &str) -> Result<Option<String>> {
+    let languages = crate::languages::get();
+    let other = |name: &str| languages.named(name).filter(|l| !std::ptr::eq(*l, &crate::parsed::LANGUAGE));
+    let mut language = other(name);
+    if (language.is_none() && !sql.contains(';')) || crate::auth::operator() {
+        return Ok(None); // (one statement in Pondra's SQL: as written)
+    }
+    let mut read = false;
+    let mut out = vec![];
+    for one in routines::split(sql) {
+        let one = one.trim();
+        if pondra_s_own(one) {
+            if let Some(to) = crate::set::language_change(one) {
+                language = match to.as_deref() {
+                    Some(name) => other(name),
+                    None => other(crate::set::node_language()),
+                };
+            }
+            // (what it carries, in the session's language: DECLARE's query, PREPARE's statement, COPY's query, a
+            // variable's value, so a cursor's or a prepared query's answer is the one the query sent alone gives, 11-13 audit H1)
+            let carried = language.zip(carried(one)).map(|(l, (from, to, value))| read_carried(l, &one[from..to], value).map(|c| (from, to, c)));
+            match carried.transpose()? {
+                Some((from, to, c)) if c != one[from..to] => {
+                    read = true;
+                    out.push(format!("{}{c}{}", &one[..from], &one[to..]));
+                }
+                _ => out.push(one.to_string()),
+            }
+            continue;
+        }
+        let Some(l) = language else {
+            out.push(one.to_string());
+            continue;
+        };
+        read = true;
+        out.push(match (l.parse)(one) {
+            Ok(stmts) => crate::text::text_kept(stmts),
+            Err(e) if e.downcast_ref::<datafusion::sql::sqlparser::parser::ParserError>().is_some() => return Err(crate::codes::coded("42601", format!("{e:#}"))),
+            Err(e) => return Err(e),
+        });
+    }
+    Ok(read.then(|| out.join(";\n")))
+}
+
+/// Where the statement or value one of Pondra's own statements carries stands in it (`from..to`), and whether it is a
+/// value: `DECLARE c [options] CURSOR [WITH[OUT] HOLD] FOR query`, `PREPARE p [(types)] AS statement`, `COPY (query) TO …`,
+/// and a variable's value (`$v = …`, `SET [VARIABLE] $v = …`, `DECLARE $v [type] = …`).
+fn carried(one: &str) -> Option<(usize, usize, bool)> {
+    use std::sync::LazyLock;
+    static DECLARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^declare\s+(?:"[^"]+"|\w+)\s+(?:\w+\s+)*?cursor\s+(?:with(?:out)?\s+hold\s+)?for\s+"#).expect("a regex"));
+    static PREPARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^prepare\s+(?:"[^"]+"|\w+)\s*(?:\([^)]*\))?\s*as\s+"#).expect("a regex"));
+    static COPY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^copy\s*\(").expect("a regex"));
+    static VALUE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(?:\$|set\s+\$|set\s+variable\s+\$?|declare\s+(?:parameter\s+)?\$)[a-z_]\w*\b[^=;]*?(?::=|=|\bto\b|\bdefault\b)\s*").expect("a regex"));
+    let s = crate::text::first_word(one);
+    let lead = one.len() - s.len();
+    let end = one.trim_end().trim_end_matches(';').trim_end().len();
+    let after = |m: regex::Match| lead + m.end();
+    if let Some(m) = DECLARE.find(s).or_else(|| PREPARE.find(s)) {
+        return Some((after(m), end, false)).filter(|(from, to, _)| from < to);
+    }
+    if let Some(m) = COPY.find(s) {
+        let close = crate::text::closing(&s[m.end() - 1..])?;
+        return Some((after(m), lead + m.end() - 1 + close, false));
+    }
+    VALUE.find(s).map(|m| (after(m), end, true)).filter(|(from, to, _)| from < to)
+}
+
+/// What one of Pondra's own statements carries (`carried`), read with `l`'s parse and printed as Pondra's SQL: a
+/// statement as it is, a value as the one item of `SELECT value`.
+fn read_carried(l: &crate::languages::Language, text: &str, value: bool) -> Result<String> {
+    use datafusion::sql::sqlparser::ast::{SelectItem, SetExpr, Statement};
+    let refused = |e: anyhow::Error| match e.downcast_ref::<datafusion::sql::sqlparser::parser::ParserError>() {
+        Some(_) => crate::codes::coded("42601", format!("{e:#}")),
+        None => e,
+    };
+    if !value {
+        return (l.parse)(text).map(|stmts| stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n")).map_err(refused);
+    }
+    let stmts = (l.parse)(&format!("SELECT {text}")).map_err(refused)?;
+    let item = match &stmts[..] {
+        [Statement::Query(q)] => match q.body.as_ref() {
+            SetExpr::Select(s) if s.projection.len() == 1 => match &s.projection[0] {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e.to_string()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    Ok(item.unwrap_or_else(|| text.to_string()))
+}
+
+/// `sql` in the session's language (`set::language`) as Pondra's SQL (`in_language`): what `run` takes, and what a door's
+/// look before the run reads (Flight plans a query's schema from it).
+pub(crate) fn as_pondra(sql: &str) -> Result<Cow<'_, str>> {
+    Ok(in_language(crate::set::language(), sql)?.map_or(Cow::Borrowed(sql), Cow::Owned))
+}
+
+/// Pondra's own statements, read as written whatever language a session's SQL is in: a session's (SET, SHOW, RESET,
+/// PREPARE, DISCARD, USE, …, a `$variable`'s), a transaction's, a cursor's (DECLARE … CURSOR, FETCH, MOVE, CLOSE),
+/// CHECKPOINT, and the statements section's (`statements::claims`: COPY, ATTACH, CREATE SEQUENCE, …).
+pub(crate) fn pondra_s_own(one: &str) -> bool {
+    crate::set::is(one) || crate::text::head(one).eq_ignore_ascii_case("show") || crate::text::control(one).is_some() || crate::vars::change(one).is_some()
+        || crate::cursors::of(one).is_some() || crate::write::checkpoint(one) || crate::statements::claims(one)
 }
 
 /// The text as sent, when it is one statement that is no variable's change and no script: the first half of the test
@@ -364,4 +480,44 @@ fn answer(batches: &[RecordBatch], p: &SqlParams, lake: &crate::store::Lake) -> 
 fn big(batches: &[RecordBatch]) -> bool {
     let mut counted = datafusion::common::utils::memory::RecordBatchMemoryCounter::new(); // (as `query::collect` counts it)
     batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= crate::query::stream_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_language;
+
+    /// A Spark session's request is Pondra's SQL once read: each statement by Spark's grammar and turned, Pondra's own
+    /// as written, a text Spark's grammar refuses in its words (42601), and Pondra's SQL as it is.
+    #[test]
+    fn a_request_is_read_in_its_language() {
+        let read = |sql: &str| in_language("spark", sql).unwrap();
+        assert_eq!(read(r#"SELECT "x" AS s, 7 / 2 AS h FROM t"#).as_deref(), Some("SELECT 'x' AS s, spark_divide(7, 2) AS h FROM t"));
+        // (a statement that sets the language: the request's statements after it are read in the one it leaves)
+        assert_eq!(read(r#"SELECT "x"; SET language = 'pondra'; SELECT "x"; CHECKPOINT"#).as_deref(), Some("SELECT 'x' AS \"x\";\nSET language = 'pondra';\nSELECT \"x\";\nCHECKPOINT"));
+        assert_eq!(in_language("pondra", r#"SET language = 'spark'; SELECT "x""#).unwrap().as_deref(), Some("SET language = 'spark';\nSELECT 'x' AS \"x\""));
+        assert_eq!(in_language("pondra", r#"SET datafusion.sql_parser.dialect = 'databricks'; SELECT "x"; RESET ALL; SELECT "x""#).unwrap().as_deref(), Some("SET datafusion.sql_parser.dialect = 'databricks';\nSELECT 'x' AS \"x\";\nRESET ALL;\nSELECT \"x\""));
+        assert_eq!(read(r#"SET datafusion.sql_parser.dialect = 'mysql'; SELECT "x""#), None, "a dialect that names no language: the node's, Pondra's SQL");
+        assert_eq!(read(r#"DISCARD ALL; SELECT "x""#), None);
+        assert_eq!(in_language("pondra", r#"SET search_path = s; SELECT "x""#).unwrap(), None, "another setting: as written");
+        for own in ["SHOW language", "RESET language", "BEGIN", "COMMIT", "CHECKPOINT", "$n = 1", "CREATE SEQUENCE s", "COPY t TO 'x.csv'", "DISCARD ALL", "DECLARE c CURSOR WITH HOLD FOR SELECT x FROM t", "FETCH 1 FROM c", "CLOSE ALL"] {
+            assert_eq!(read(own), None, "{own}: Pondra's own, as written");
+        }
+        // (what one carries is read in the language, so it answers as the same query sent alone: 11-13 audit H1)
+        for (own, want) in [
+            (r#"DECLARE c CURSOR WITH HOLD FOR SELECT "x", 7 / 2 AS h"#, r#"DECLARE c CURSOR WITH HOLD FOR SELECT 'x' AS "x", spark_divide(7, 2) AS h"#),
+            (r#"/* psycopg */ declare "c 1" binary no scroll cursor without hold for select 7/2 AS h"#, r#"/* psycopg */ declare "c 1" binary no scroll cursor without hold for SELECT spark_divide(7, 2) AS h"#),
+            (r#"PREPARE p (INT) AS SELECT "x" WHERE $1 > 0"#, r#"PREPARE p (INT) AS SELECT 'x' AS "x" WHERE $1 > 0"#),
+            (r#"COPY (SELECT 7 / 2 AS h, ')' AS p) TO 'h.csv' (FORMAT csv)"#, r#"COPY (SELECT spark_divide(7, 2) AS h, ')' AS p) TO 'h.csv' (FORMAT csv)"#),
+            (r#"$h = 7 / 2"#, r#"$h = spark_divide(7, 2)"#),
+            (r#"SET VARIABLE h = "x""#, r#"SET VARIABLE h = 'x'"#),
+        ] {
+            assert_eq!(read(own).as_deref(), Some(want), "{own}");
+        }
+        assert_eq!(crate::codes::of(&in_language("spark", "PREPARE p AS FROM t SELECT a").unwrap_err()), "42601", "refused in Spark's words");
+        assert_eq!(in_language("pondra", r#"SELECT "x" FROM t"#).unwrap(), None);
+        assert_eq!(in_language(" Databricks ", "SELECT 1 / 2").unwrap().as_deref(), Some(r#"SELECT spark_divide(1, 2) AS "1 / 2""#)); // (its column named as Pondra's SQL names it)
+        let refused = in_language("spark", "FROM t SELECT a").unwrap_err();
+        assert_eq!(crate::codes::of(&refused), "42601", "{refused:#}");
+        assert!(format!("{refused:#}").starts_with("Spark SQL: "), "{refused:#}");
+    }
 }

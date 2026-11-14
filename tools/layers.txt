@@ -24,6 +24,7 @@ buckets base
 memo base
 metrics base
 parsed base
+languages base
 lake_state base
 passes base
 lists base
@@ -51,6 +52,7 @@ store_wire platform
 tls platform
 
 # catalog: objects, commits, the log, files and their formats, the lake format
+bounds catalog
 cache catalog
 data_file catalog
 format catalog
@@ -84,6 +86,7 @@ asof engine
 audit engine
 auth engine
 rights engine
+row_filter engine
 authored engine
 avg engine
 branch engine
@@ -98,6 +101,8 @@ defaults engine
 dialect_fns engine
 dialect_stmts engine
 diff engine
+redirect engine
+diff_steps engine
 divide engine
 eager engine
 engine engine
@@ -105,6 +110,7 @@ expander engine
 explain engine
 ext engine
 ext_names engine
+table_formats engine
 facts engine
 find engine
 finish engine
@@ -134,6 +140,7 @@ lifted engine
 literals engine
 locks engine
 median engine
+morsels engine
 multiply engine
 once engine
 one_row engine

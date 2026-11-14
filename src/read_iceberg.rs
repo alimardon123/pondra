@@ -39,6 +39,24 @@ impl crate::ledger::Charged for Manifests {
 /// The table at `url` (a table's folder or a metadata file), at its current snapshot or the one
 /// asked for: `version` (of its metadata), `snapshot_from_id`, `snapshot_from_timestamp`.
 /// The credentials are the table's catalog's, when it vouches for them (`catalogs::Delegated`).
+/// Iceberg's table format (`table_formats`): a table of a catalog attached `(TYPE iceberg)`, or `iceberg_scan('…')`.
+pub const FORMAT: crate::table_formats::TableFormat = crate::table_formats::TableFormat {
+    name: "iceberg",
+    abilities: &[crate::table_formats::Ability::Read, crate::table_formats::Ability::AsOf, crate::table_formats::Ability::Insert, crate::table_formats::Ability::CopyTo],
+    options: &["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
+    resolve: |lake, spec, scope| {
+        Box::pin(async move {
+            let (meta, d) = resolve(lake, &spec.urls[0], &spec.options, scope).await?;
+            Ok(crate::table_formats::Resolved {
+                vouched: d.as_ref().map(|d| d.prefix.clone()),
+                then: d.map(|d| Box::new(move |m: &mut TableMeta| crate::catalogs::rehome(&d, m)) as Box<dyn FnOnce(&mut TableMeta) + Send>), // (its files read through the table's own delegated store)
+                meta,
+            })
+        })
+    },
+    prime: Some(|lake, spec, meta, scope| Box::pin(async move { if spec.options.contains_key("namespace") { crate::catalogs::prime(lake, spec, meta, scope).await } else { Ok(()) } })),
+};
+
 pub async fn resolve(lake: &Lake, url: &str, options: &BTreeMap<String, String>, scope: &crate::rights::Scope) -> Result<(TableMeta, Option<crate::catalogs::Delegated>)> {
     let url = url.trim_end_matches('/');
     if options.contains_key("namespace") {
@@ -365,24 +383,8 @@ fn by_count(v: &Value) -> HashMap<i64, i64> {
 /// A bound in Iceberg's single-value form as a file's range bound (text), or None where it can't
 /// bound: floats (NaN), and types not ordered here.
 fn bound(b: &[u8], t: &DataType) -> Option<String> {
-    let le8 = || Some(i64::from_le_bytes(b.get(..8)?.try_into().ok()?));
-    let le4 = || Some(i32::from_le_bytes(b.get(..4)?.try_into().ok()?));
-    let v = match t {
-        DataType::Boolean => ScalarValue::Boolean(Some(*b.first()? != 0)),
-        DataType::Int32 => ScalarValue::Int32(Some(le4()?)),
-        DataType::Int64 => ScalarValue::Int64(Some(le8()?)),
-        DataType::Date32 => ScalarValue::Date32(Some(le4()?)),
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => ScalarValue::TimestampMicrosecond(Some(le8()?), tz.clone()),
-        DataType::Timestamp(TimeUnit::Nanosecond, tz) => ScalarValue::TimestampNanosecond(Some(le8()?), tz.clone()),
-        DataType::Utf8 => ScalarValue::Utf8(Some(String::from_utf8(b.to_vec()).ok()?)),
-        DataType::Decimal128(p, s) => {
-            let mut full = [if b.first()? & 0x80 != 0 { 0xff } else { 0 }; 16];
-            full[16 - b.len().min(16)..].copy_from_slice(&b[b.len().saturating_sub(16)..]);
-            ScalarValue::Decimal128(Some(i128::from_be_bytes(full)), *p, *s)
-        }
-        _ => return None,
-    };
-    crate::manifest::text(&v)
+    // (not a float's: Iceberg's bounds leave NaN out, and a NaN row must not be pruned away)
+    crate::manifest::text(&crate::bounds::decode(b, t).filter(|_| !t.is_floating())?)
 }
 
 /// Might a position-delete file hold rows of `path`? (Its bounds on `file_path`, if it has them.)

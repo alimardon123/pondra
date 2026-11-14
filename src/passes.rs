@@ -120,6 +120,11 @@ impl Passes {
         self.all.sort_by_key(|p| (p.phase(), p.order));
     }
 
+    /// Has a text pass this word alone as a mark (a language's table function, `languages.rs`)?
+    pub fn marked(&self, word: &str) -> bool {
+        self.all.iter().any(|p| matches!(p.run, Run::Text(_)) && p.marks.iter().any(|m| *m == [word]))
+    }
+
     /// The passes, in the order the front runs them.
     #[cfg(test)]
     pub fn all(&self) -> &[Pass] {
@@ -517,16 +522,17 @@ pub(crate) mod tests {
                 (Phase::Refuse, "kept.refused"),
                 (Phase::Refuse, "dialect_stmts.refused"),
                 (Phase::Refuse, "pattern.refused"),
-                (Phase::Text, "sparksql.inline"),
-                (Phase::Text, "diff.diffs"),
+                (Phase::Text, "sparksql.inline"), // (a tree pass at PR 9: it parses the statement to walk it already)
                 (Phase::Text, "past_names.syntax"),
                 (Phase::Text, "friendly.text"),
                 (Phase::Text, "pattern.text"),
                 (Phase::Wants, "friendly.forms"),
                 (Phase::Wants, "friendly.marked"),
                 (Phase::Wants, "friendly.aliases"),
+                (Phase::Wants, "diff.diffs"), // (a tree pass since Trellis T1a: the parse reads a side that is a query)
                 (Phase::Wants, "pattern.wanted"),
                 (Phase::Wants, "text.names_a_type"),
+                (Phase::Wants, "grouping.regroups"),
                 (Phase::Parse, "friendly.comprehension"),
                 (Phase::Parse, "friendly.lambda"),
                 (Phase::Parse, "friendly.pivot"),

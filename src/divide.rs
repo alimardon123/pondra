@@ -9,18 +9,19 @@
 //! quotient is typed from its own type. Its places (`quotient_type`): Postgres's `select_div_scale` picks enough for 16
 //! significant digits from the values' sizes, and a column's type is fixed before them, so here they are the 16 Postgres
 //! gives a quotient from 1 to 9,999, or either side's places where that is more. Within 38 digits they give way to the
-//! whole digits a quotient can have (p1 - s1 + s2), but never below the s1 + 4 Arrow gave. In Spark's dialect a quotient
-//! has Spark's type: max(6, s1 + p2 + 1) places, giving way down to 6. Either way the last place is rounded half away
-//! from zero, as Postgres's and Spark's are.
+//! whole digits a quotient can have (p1 - s1 + s2), but never below the s1 + 4 Arrow gave. Spark SQL's `/` is
+//! `spark_divide` (`sparksql.rs` turns each into a call of it): two DECIMALs have Spark's type, max(6, s1 + p2 + 1) places,
+//! giving way down to 6, and anything else is divided as DOUBLEs, as Spark's `/` always is fractional (`7 / 2` is 3.5).
+//! Either way the last place is rounded half away from zero, as Postgres's and Spark's are.
 //!
 //! Each row is worked out in i64s or i128s, and in i256s where the scaled dividend doesn't fit, so every quotient is the
 //! exact one rounded: one past its precision is refused as a cast past it is (22003), a zero divisor as `/` refuses it
 //! (22012). `SAFE_DIVIDE` of two DECIMALs answers with the same type and digits, NULL for those two (`dialect_fns`).
-use datafusion::arrow::array::{new_null_array, ArrowNativeTypeOp, AsArray, PrimitiveArray};
+use datafusion::arrow::array::{new_null_array, ArrowNativeTypeOp, AsArray, Float64Array, PrimitiveArray};
 use datafusion::arrow::compute::{try_binary, try_unary};
-use datafusion::arrow::datatypes::{i256, DataType, Decimal128Type, DecimalType, Field, FieldRef};
+use datafusion::arrow::datatypes::{i256, DataType, Decimal128Type, DecimalType, Field, FieldRef, Float64Type};
 use datafusion::arrow::error::ArrowError;
-use datafusion::common::config::{ConfigOptions, Dialect};
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{exec_err, plan_err, DFSchema, Result, ScalarValue};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
@@ -147,11 +148,10 @@ pub(crate) fn divided(a: &ColumnarValue, b: &ColumnarValue, rows: usize, to: &Da
     Ok(ColumnarValue::Array(Arc::new(q.with_precision_and_scale(*p, *s)?)))
 }
 
-/// `a / b` of two DECIMALs: Postgres's places, or Spark's (`spark`).
+/// `a / b` of two DECIMALs, with Postgres's places.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Divide {
     signature: Signature,
-    spark: bool,
 }
 
 impl ScalarUDFImpl for Divide {
@@ -173,7 +173,7 @@ impl ScalarUDFImpl for Divide {
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
         match args {
-            [a, b] => match quotient_type(a, b, self.spark) {
+            [a, b] => match quotient_type(a, b, false) {
                 Some(t) => Ok(t),
                 None => plan_err!("{NAME} divides two DECIMALs, not {a} / {b}"),
             },
@@ -194,13 +194,81 @@ impl ScalarUDFImpl for Divide {
     }
 }
 
-/// The quotient's function by Postgres's places and by Spark's, one definition each for every lake. Not registered in any
-/// session: no SQL names it, and a name would be a function users could call. `Quotients` puts it in the plans that need it.
-static DIVIDE: LazyLock<[Arc<ScalarUDF>; 2]> = LazyLock::new(|| [false, true].map(|spark| Arc::new(ScalarUDF::new_from_impl(Divide { signature: Signature::any(2, Volatility::Immutable), spark }))));
+/// The quotient's function, one definition for every lake. Not registered in any session: no SQL names it, and a name
+/// would be a function users could call. `Quotients` puts it in the plans that need it.
+static DIVIDE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(Divide { signature: Signature::any(2, Volatility::Immutable) })));
+
+/// Spark SQL's `/`, the name it is called by (the spark extension registers it in every session: a Spark statement
+/// arrives as Pondra's SQL that names it).
+pub(crate) const SPARK_NAME: &str = "spark_divide";
+
+/// Spark SQL's `/` (above): two DECIMALs with Spark's places, as `pondra_divide` divides them; anything else as DOUBLEs. A
+/// zero divisor is refused (22012), as Spark's ANSI `/` refuses it, a DOUBLE's too.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SparkDivide {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SparkDivide {
+    fn name(&self) -> &str {
+        SPARK_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn coerce_types(&self, args: &[DataType]) -> Result<Vec<DataType>> {
+        let [a, b] = args else { return plan_err!("{SPARK_NAME} takes two values") };
+        Ok(match BinaryTypeCoercer::new(a, &Operator::Divide, b).get_input_types() {
+            Ok((l, r)) if quotient_type(&l, &r, true).is_some() => vec![l, r],
+            _ => vec![DataType::Float64, DataType::Float64],
+        })
+    }
+
+    // (named as the `/` it stands for, as `pondra_divide`'s column is)
+    fn schema_name(&self, args: &[Expr]) -> Result<String> {
+        match args {
+            [a, b] => Ok(format!("{} / {}", a.schema_name(), b.schema_name())),
+            _ => plan_err!("{SPARK_NAME} takes two values"),
+        }
+    }
+
+    fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        match args {
+            [a, b] => Ok(quotient_type(a, b, true).unwrap_or(DataType::Float64)),
+            _ => plan_err!("{SPARK_NAME} takes two values"),
+        }
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let types: Vec<DataType> = args.arg_fields.iter().map(|f| f.data_type().clone()).collect();
+        let nullable = args.arg_fields.iter().any(|f| f.is_nullable());
+        Ok(Arc::new(Field::new(SPARK_NAME, self.return_type(&types)?, nullable)))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [a, b] = &args.args[..] else { return exec_err!("{SPARK_NAME} takes two values") };
+        if let DataType::Decimal128(..) = args.return_field.data_type() {
+            return divided(a, b, args.number_rows, args.return_field.data_type(), false);
+        }
+        let double = |v: &ColumnarValue| -> Result<datafusion::arrow::array::ArrayRef> { Ok(datafusion::arrow::compute::cast(&v.to_array(args.number_rows)?, &DataType::Float64)?) };
+        let (a, b) = (double(a)?, double(b)?);
+        let q: Float64Array = try_binary(a.as_primitive::<Float64Type>(), b.as_primitive::<Float64Type>(), |x, y| if y == 0.0 { Err(ArrowError::DivideByZero) } else { Ok(x / y) })?;
+        Ok(ColumnarValue::Array(Arc::new(q)))
+    }
+}
+
+static SPARK_DIVIDE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(SparkDivide { signature: Signature::user_defined(Volatility::Immutable) })));
+
+/// Spark SQL's `/`, for the spark extension to register.
+pub(crate) fn spark() -> Arc<ScalarUDF> {
+    SPARK_DIVIDE.clone()
+}
 
 /// `e` as `pondra_divide(a, b)` where it is an `a / b` that DataFusion divides as two DECIMAL128s, its operands cast to the
 /// types they would be divided as. Anything else, and a side whose type isn't known yet (a parameter's), stays as it is.
-fn quotient(e: Expr, schema: &DFSchema, spark: bool) -> Result<Transformed<Expr>> {
+fn quotient(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let Expr::BinaryExpr(b) = &e else { return Ok(Transformed::no(e)) };
     if b.op != Operator::Divide {
         return Ok(Transformed::no(e));
@@ -210,26 +278,55 @@ fn quotient(e: Expr, schema: &DFSchema, spark: bool) -> Result<Transformed<Expr>
         return Ok(Transformed::no(e)); // (a NULL, or a parameter not typed yet: no decimal to divide)
     }
     let Ok((lt, rt)) = BinaryTypeCoercer::new(&l, &Operator::Divide, &r).get_input_types() else { return Ok(Transformed::no(e)) };
-    if quotient_type(&lt, &rt, spark).is_none() {
+    if quotient_type(&lt, &rt, false).is_none() {
         return Ok(Transformed::no(e));
     }
     let Expr::BinaryExpr(b) = e else { unreachable!("matched above") };
     let (left, right) = ((*b.left).cast_to(&lt, schema)?, (*b.right).cast_to(&rt, schema)?);
-    Ok(Transformed::yes(DIVIDE[usize::from(spark)].call(vec![left, right])))
+    Ok(Transformed::yes(DIVIDE.call(vec![left, right])))
 }
 
-/// `quotient` for every division of an expression planned with no analyzer of its own (a table's CHECK), before its types
+/// In Spark SQL's `/` (`spark_divide`), a whole-number literal beside a DECIMAL is a DECIMAL of its own digits, as Spark
+/// types a literal (its `DecimalPrecision`): a DECIMAL(10, 2)'s `x / 100` is a DECIMAL(14, 6), not the (31, 23) that a
+/// BIGINT's DECIMAL(20, 0) gives. A column's whole number is its type's DECIMAL, as in Spark.
+fn spark_literals(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    let Expr::ScalarFunction(f) = &e else { return Ok(Transformed::no(e)) };
+    let [a, b] = &f.args[..] else { return Ok(Transformed::no(e)) };
+    if f.func.name() != SPARK_NAME {
+        return Ok(Transformed::no(e));
+    }
+    let decimal = |x: &Expr| matches!(x.get_type(schema), Ok(DataType::Decimal128(..)));
+    let whole = |x: &Expr| match x {
+        Expr::Literal(ScalarValue::Int8(Some(n)), _) => Some(i128::from(*n)),
+        Expr::Literal(ScalarValue::Int16(Some(n)), _) => Some(i128::from(*n)),
+        Expr::Literal(ScalarValue::Int32(Some(n)), _) => Some(i128::from(*n)),
+        Expr::Literal(ScalarValue::Int64(Some(n)), _) => Some(i128::from(*n)),
+        _ => None,
+    };
+    let digits = |n: i128| Expr::Literal(ScalarValue::Decimal128(Some(n), n.unsigned_abs().to_string().len() as u8, 0), None);
+    let args = match (whole(a), whole(b)) {
+        (Some(n), None) if decimal(b) => vec![digits(n), b.clone()],
+        (None, Some(n)) if decimal(a) => vec![a.clone(), digits(n)],
+        _ => return Ok(Transformed::no(e)),
+    };
+    Ok(Transformed::yes(f.func.call(args)))
+}
+
+/// A division as it is planned: Postgres's places for a DECIMAL `/` (`quotient`), Spark's literals in `spark_divide`.
+fn division(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    match quotient(e, schema)? {
+        t if t.transformed => Ok(t),
+        t => spark_literals(t.data, schema),
+    }
+}
+
+/// `division` for every division of an expression planned with no analyzer of its own (a table's CHECK), before its types
 /// are coerced, so it divides as a query's does.
-pub(crate) fn alone(e: Expr, schema: &DFSchema, options: &ConfigOptions) -> Result<Expr> {
-    let spark = spark(options);
-    e.transform_up(|e| quotient(e, schema, spark)).data()
+pub(crate) fn alone(e: Expr, schema: &DFSchema) -> Result<Expr> {
+    e.transform_up(|e| division(e, schema)).data()
 }
 
-fn spark(options: &ConfigOptions) -> bool {
-    matches!(options.sql_parser.dialect, Dialect::Spark | Dialect::Databricks)
-}
-
-/// Every DECIMAL division of a plan as `pondra_divide` (above). Before type coercion, which then types what reads each
+/// Every DECIMAL division of a plan as `pondra_divide`, and Spark's literals in `spark_divide` (above). Before type coercion, which then types what reads each
 /// quotient from the quotient's own type.
 #[derive(Debug)]
 pub struct Quotients;
@@ -239,12 +336,11 @@ impl AnalyzerRule for Quotients {
         "pondra_decimal_quotients"
     }
 
-    fn analyze(&self, plan: LogicalPlan, options: &ConfigOptions) -> Result<LogicalPlan> {
-        let spark = spark(options);
+    fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up_with_subqueries(|plan| {
             let mut has = false;
             plan.apply_expressions(|e| {
-                has = e.exists(|e| Ok(matches!(e, Expr::BinaryExpr(b) if b.op == Operator::Divide)))?;
+                has = e.exists(|e| Ok(matches!(e, Expr::BinaryExpr(b) if b.op == Operator::Divide) || matches!(e, Expr::ScalarFunction(f) if f.func.name() == SPARK_NAME)))?;
                 Ok(if has { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
             })?;
             if !has {
@@ -257,7 +353,7 @@ impl AnalyzerRule for Quotients {
             let names = NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
             let t = plan.map_expressions(|e| {
                 let name = names.save(&e);
-                Ok(e.transform_up(|e| quotient(e, &schema, spark))?.update_data(|e| name.restore(e)))
+                Ok(e.transform_up(|e| division(e, &schema))?.update_data(|e| name.restore(e)))
             })?;
             if t.transformed { t.map_data(crate::optimize::settled) } else { Ok(t) } // (a node above reads the types its columns have now)
         })
@@ -289,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn in_sparks_dialect_a_quotient_has_sparks_type() {
+    fn in_spark_sql_a_quotient_has_sparks_type() {
         let spark = |l: DataType, r: DataType| quotient_type(&l, &r, true);
         assert_eq!(spark(decimal(20, 0), decimal(2, 1)), Some(decimal(27, 6)), "max(6, s1 + p2 + 1) places");
         assert_eq!(spark(decimal(10, 2), decimal(10, 2)), Some(decimal(23, 13)));

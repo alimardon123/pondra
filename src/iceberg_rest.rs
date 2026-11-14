@@ -166,7 +166,10 @@ async fn as_job(app: &crate::app::App, who: &crate::auth::Principal, sql: &str, 
 }
 
 /// An error as the Iceberg REST catalog answers it: its exception by the error's SQLSTATE (`codes::kind`), the message as
-/// said. Something still depending on it is a namespace that isn't empty when the namespace is what's dropped.
+/// said. Something still depending on it is a namespace that isn't empty when the namespace is what's dropped. A
+/// statement to try again (a serialization failure) is a 409, which an engine retries; one whose outcome isn't known (an
+/// internal error, the leader cut off or silent, a timeout) a 500, CommitStateUnknownException: an engine deletes the
+/// files it wrote on any other error, and a commit that was taken with its answer lost would name deleted files.
 fn exception(code: &str, words: String, drops_namespace: bool) -> Refusal {
     use crate::codes::Kind;
     match (crate::codes::kind(code), code) {
@@ -175,6 +178,8 @@ fn exception(code: &str, words: String, drops_namespace: bool) -> Refusal {
         (_, "2BP01") if drops_namespace => refused(409, "NamespaceNotEmptyException", words),
         (_, "3F000") => refused(404, "NoSuchNamespaceException", words),
         (_, "42P01") => refused(404, "NoSuchTableException", words),
+        (Kind::Retry, _) => refused(409, "CommitFailedException", words),
+        (Kind::Internal | Kind::Unavailable | Kind::Timeout, _) => refused(500, "CommitStateUnknownException", words),
         _ => bad(words),
     }
 }
@@ -266,10 +271,11 @@ fn assigned(asked: &Value) -> Option<&str> { asked["updates"].as_array()?.iter()
 /// were written, when they fit the table: no copy). If they can't be, the table is dropped again, so the statement
 /// leaves nothing.
 async fn made(app: &crate::app::App, who: &crate::auth::Principal, target: &str, lake: &std::sync::Arc<Lake>, name: &str, table: &str, asked: &Value, retried: bool) -> Reply {
+    // (made as the job its uuid names, so the table keeps the uuid the engine was given, or a new one: `iceberg::publish`)
+    let job = format!("{}{}", crate::iceberg::MADE, assigned(asked).map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string));
     if !retried {
-        // (made as the job its uuid names, so the table keeps the uuid the engine was given: `iceberg::publish`)
         let sql = create_sql(target, &staged_request(table, asked)).map_err(|e| bad(crate::ext::said(&e)))?;
-        as_job(app, who, &sql, false, assigned(asked).map(|u| format!("{}{u}", crate::iceberg::MADE))).await?;
+        as_job(app, who, &sql, false, Some(job.clone())).await?;
     }
     let mut current = None;
     for _ in 0..600 {
@@ -290,7 +296,16 @@ async fn made(app: &crate::app::App, who: &crate::auth::Principal, target: &str,
         Err(e) => Err(e),
     };
     if taken.is_err() && !retried {
-        let _ = as_caller(app, who, &format!("DROP TABLE {target}"), false).await; // (all or nothing, as a CREATE TABLE … AS SELECT)
+        // (all or nothing, as a CREATE TABLE … AS SELECT: dropped as a statement drops the table it made, `write::made_drop`:
+        // purged, and only while it is the one this job made. Named as the SQL names it, so a table of an attached lake too)
+        if let Some(crate::write::Stmt::Ddl(mut ddl)) = crate::write::parse(&format!("DROP TABLE IF EXISTS {target}")) {
+            if let [crate::ddl::Ddl::DropTable { purge, made_by, .. }] = ddl.as_mut_slice() {
+                (*purge, *made_by) = (true, Some(job.clone()));
+                if let Err(e) = crate::write::on_node_as(app, crate::write::Stmt::Ddl(ddl), None, false, who).await {
+                    eprintln!("left {name} as it is: the drop after its staged create's commit was refused didn't answer: {e:#}");
+                }
+            }
+        }
     }
     taken.map(axum::Json)
 }
@@ -363,7 +378,8 @@ async fn replaced(app: &crate::app::App, who: &crate::auth::Principal, target: &
         let (app, who, job) = (app_.clone(), who_.clone(), job_.clone());
         Box::pin(async move { crate::write::on_node_as(&app, stmt, Some(job), false, &who).await })
     };
-    let (app_, lake_) = (app.clone(), lake.clone());
+    let said = std::sync::Arc::new(std::sync::Mutex::new(None::<Refusal>)); // (the fill's commit's refusal, if it was refused)
+    let (app_, lake_, said_) = (app.clone(), lake.clone(), said.clone());
     let fill = move |staged: String| -> futures::future::BoxFuture<'static, Option<anyhow::Result<Value>>> {
         Box::pin(async move {
             if data.is_empty() {
@@ -375,10 +391,15 @@ async fn replaced(app: &crate::app::App, who: &crate::auth::Principal, target: &
                 Ok(None) => Ok(Value::Null),
                 Err(e) => Err(e),
             };
-            Some(taken.map_err(|(_, body)| anyhow::anyhow!("{}", body.0["error"]["message"].as_str().unwrap_or("the engine's files"))))
+            Some(taken.map_err(|r| {
+                let words = r.1 .0["error"]["message"].as_str().unwrap_or("the engine's files").to_string();
+                *said_.lock().unwrap() = Some(r); // (answered as the commit refused it: its status, not the replace's)
+                anyhow::anyhow!("{words}")
+            }))
         })
     };
-    crate::replace::replacing_with(&run, lake, &c, name, &job, false, &mut |_: &str| {}, &who.scope, fill).await.map_err(|e| exception(crate::codes::of(&e), crate::ext::said(&e), false))?;
+    let replaced = crate::replace::replacing_with(&run, lake, &c, name, &job, false, &mut |_: &str| {}, &who.scope, fill).await;
+    replaced.map_err(|e| said.lock().unwrap().take().unwrap_or_else(|| exception(crate::codes::of(&e), crate::ext::said(&e), false)))?;
     published(lake, name, current, true).await
 }
 
@@ -691,4 +712,22 @@ async fn commit(app: &crate::app::App, lake: &std::sync::Arc<Lake>, commits: Vec
             _ => refused(500, "CommitStateUnknownException", e),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// A statement to try again is Iceberg's 409, which an engine retries; one whose outcome isn't known its 500,
+    /// CommitStateUnknownException, on which an engine keeps the files it wrote. Never a 400, on which it deletes them.
+    #[test]
+    fn a_retry_is_a_409_and_an_unknown_outcome_a_500() {
+        let said = |code: &str| {
+            let (status, body) = super::exception(code, "w".into(), false);
+            (status.as_u16(), body.0["error"]["type"].as_str().unwrap_or_default().to_string())
+        };
+        assert_eq!(said("40001"), (409, "CommitFailedException".into()));
+        for code in ["XX000", "57P03", "08006", "57014"] {
+            assert_eq!(said(code), (500, "CommitStateUnknownException".into()), "{code}");
+        }
+        assert_eq!(said("42601").0, 400);
+    }
 }

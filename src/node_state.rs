@@ -14,17 +14,13 @@ pub type Stops = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What a host gives the node it starts beside what its process has: none for a native host (`Given::default()`), and for
 /// the sim's member (`sim::Cluster`) how it reaches the others, where it stops on purpose, whom to tell each start's state
-/// to, and that it listens on no port (the sim's network reaches its router).
+/// to (its host keeps it beside the others, `Host::beside`, and the sim's network reaches its router).
 #[derive(Clone, Default)]
 pub struct Given {
     #[cfg(feature = "lake")]
     pub dial: Option<Arc<dyn crate::calls::Dial>>,
     pub stops: Option<Stops>,
     pub started: Option<Arc<dyn Fn(&Arc<NodeState>) + Send + Sync>>,
-    pub no_port: bool,
-    /// Its restarts and failures are its host's alone, in this process, as a library's node's are (`node::hosted`), though
-    /// the process isn't a library's: the sim's members, whose process is the test's.
-    pub in_place: bool,
 }
 
 impl NodeState {

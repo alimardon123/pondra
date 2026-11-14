@@ -90,6 +90,10 @@ pub struct Grant {
     pub on: On,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>, // (SELECT on these only)
+    /// Its rows only: those where this condition holds (SQL over the table's columns, `row_filter::check`ed when it is set).
+    /// None, every row. Step 6 piece 5: only tests set one until its syntax comes, so every grant stored reads as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<String>,
 }
 
 impl Grant {
@@ -446,7 +450,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             for n in &to {
                 let mut u = grantee(lake, n).await?;
                 for p in &privileges {
-                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if p == "select" { columns.clone() } else { vec![] } };
+                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if p == "select" { columns.clone() } else { vec![] }, rows: None };
                     u.grants.retain(|x| !(x.privilege == g.privilege && x.on == g.on)); // (the newest grant of it stands: columns replaced)
                     u.grants.push(g);
                 }
@@ -1152,6 +1156,35 @@ impl Access {
         some.map(Some)
     }
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    /// The filters on the rows of `table` it may use for `privilege` (`Grant.rows`), its grants' that give it: None, every
+    /// row (one of them has none, or no grant gives it, which `columns` refuses); Some(these), the rows where any holds, as
+    /// Postgres's permissive policies join. `named`: a table of another lake attached here, which only grants naming it
+    /// give (`named`). Rows and columns join apart, as Postgres's column grants and policies do: the columns one grant
+    /// gives are read in the rows any gives.
+    pub fn rows(&self, privilege: &str, table: &str, named: bool) -> Option<Vec<&str>> {
+        let schema = crate::text::split(table).0;
+        let gives = |g: &Grant| match &g.on {
+            On::Table(t) => t == table,
+            On::Schema(s) => !named && s == schema,
+            On::Lake => !named,
+            _ => false,
+        };
+        let mut some: Option<Vec<&str>> = None;
+        for g in self.grants.iter().filter(|g| g.privilege == privilege && gives(g)) {
+            match &g.rows {
+                None => return None,
+                Some(r) => some.get_or_insert_with(Vec::new).push(r.as_str()),
+            }
+        }
+        some.map(|mut these| {
+            these.sort_unstable();
+            these.dedup();
+            these
+        })
+    }
+    /// Every filter on rows its grants hold, any privilege's, any table's (`rights::Scope::key`: what is filled in for its
+    /// reader is in the key).
+    pub(crate) fn filters(&self) -> impl Iterator<Item = &str> { self.grants.iter().filter_map(|g| g.rows.as_deref()) }
     /// Whether it holds any privilege on `table`: SELECT, INSERT, UPDATE or DELETE, on it, its schema or the lake.
     pub fn knows(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.columns(p, table).is_some()) }
     /// The same, for a table of another lake attached here (`named`).
@@ -1548,6 +1581,25 @@ mod tests {
     }
 
     use super::*;
+
+    /// 11-10 audit H1: the node's own work (a task's tick, a view's refresh) is no one's who runs the nodes, so another
+    /// database that signs in on its own opens nothing to it; a token of the nodes' it opens, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_nodes_own_work_opens_no_database_that_signs_in_on_its_own() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-across-{}", uuid::Uuid::new_v4()));
+        let other = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let node = crate::auth::Principal::node().scope;
+        let token = crate::auth::Principal::token(Role::Admin).scope;
+        assert!(across(&other, "b", &node).await.is_ok(), "a database nothing locks opens to the node's own work");
+        let verifier = Some(Verifier::with("ann-password-1", b"0123456789abcdef", 4096)); // (a user who signs in: `any`)
+        apply(&other, Change::Create { name: "ann".into(), login: true, if_not_exists: false, verifier, superuser: false, limits: Limits::default() }).await?;
+        let e = across(&other, "b", &node).await.expect_err("b has a user: the node's own work is nobody there");
+        assert!(e.to_string().contains("b signs in on its own"), "{e}");
+        assert!(across(&other, "b", &token).await.is_ok(), "a token of the nodes' opens it");
+        assert!(!node.operator() && node.whole() && node.superuser(), "whole and an admin's, but not the operator's");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_lakes_keep_their_users_access_apart() -> Result<()> {

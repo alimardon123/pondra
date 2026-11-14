@@ -60,12 +60,14 @@ pub mod memo;
 // The one walk of the SQL tree (every module's walks go through it: `walk.rs`).
 mod walk;
 // Postgres's grouping where the generic dialect groups otherwise: JSON operators, IS DISTINCT FROM's right side.
-#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its readers are the lake's doors)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its text's readers are the lake's doors; the front's regroup is every form's)
 mod grouping;
 // The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
 mod kept;
 pub mod extension;
 pub mod ext_names;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its entries are the lake's extensions')
+mod table_formats;
 pub mod lake_files;
 pub mod sketch;
 mod asof;
@@ -74,10 +76,13 @@ mod multiply;
 mod divide;
 mod sparksql;
 mod parsed;
+mod languages;
 mod dialect;
 mod passes;
 mod past_names;
 mod diff;
+mod redirect;
+mod diff_steps;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod expander;
 mod front;
@@ -122,8 +127,11 @@ mod held;
 mod keys_below;
 mod late_rows;
 mod eager;
+mod morsels;
 mod median;
 mod reuse;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a file's ranges, typed: a page reads files too)
+mod bounds;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
@@ -155,6 +163,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod records; // (the catalog's record scheme: every prefix, and whose it is)
 #[cfg(feature = "lake")] mod auth;
 #[cfg(feature = "lake")] mod rights; // (what a principal may do, decided in one place: step 6)
+#[cfg(feature = "lake")] mod row_filter; // (a grant's filter on its rows: checked when set, filled in for its reader)
 #[cfg(feature = "lake")] mod budget;
 #[cfg(feature = "lake")] mod buckets; // (what opens a lake's bucket: the hosts fill it, `hosted`)
 #[cfg(feature = "lake")] mod hosted;

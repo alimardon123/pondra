@@ -819,9 +819,11 @@ pub(crate) async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Va
 pub(crate) async fn prepare_as(lake: &Lake, name: &str, current: &Value, asked: &Value, as_written: bool) -> Result<Option<Commit>, Refusal> {
     let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(name)).await.ok().flatten().ok_or_else(|| bad(format!("no table {name}")))?;
     let mut c = parse(lake, name, &current["metadata"], asked).await?;
-    // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11)
+    // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11. A replace's
+    // staged table, which no user may write, is asked as the table it replaces: `iceberg_rest::replaced`)
     let (replaces, deletes) = (!meta.key.is_empty() && !c.incoming.is_empty(), !c.removed.is_empty() || !c.deletes.is_empty() || !c.equality.is_empty());
-    crate::rights::changing(replaces, deletes).try_for_each(|action| crate::rights::may_here(action, crate::rights::Object::Table(name))).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
+    let asked_of = crate::sys::staged_for(name).unwrap_or(name);
+    crate::rights::changing(replaces, deletes).try_for_each(|action| crate::rights::may_here(action, crate::rights::Object::Table(asked_of))).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
     if done(lake, &c.job()).await.map_err(|e| bad(crate::ext::said(&e)))? {
         return Ok(None);
     }
