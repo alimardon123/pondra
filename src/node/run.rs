@@ -71,7 +71,7 @@ impl Options {
     pub(crate) fn database(dir: &str, advertise: String, folder: &str, start: Start, server: &str, host: crate::node::Host) -> Options {
         let settings = crate::settings::Values::now().with("PONDRA_SERVER_URL", format!("http://{server}")).without("PONDRA_IDLE_EXIT_SECS");
         Options { dir: dir.into(), listen: String::new(), advertise: Some(advertise), start, pg: None, kafka: None, kafka_advertise: None, flight: None,
-                  attach: vec![], attach_found: Some(folder.into()), guest: None, settings, move_failed: None, host: Some(host) }
+                  attach: vec![], attach_found: Some(folder.into()), guest: None, settings, move_failed: None, host: Some(host), given: Default::default() }
     }
 }
 
