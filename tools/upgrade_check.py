@@ -631,13 +631,14 @@ def until(what, secs, step=0.5):
 
 # ---------------------------------------------------------------- the lake's format
 
-LISTS = 6  # every table's columns kept as one list (`format::LISTS`): a new lake starts there, an older one moves there by itself
-FORMAT = 7  # this build's format (`format::FORMAT`): a view of averages keeps its query's own state (`fvar::PARTS_FORMAT`)
+LISTS = 6  # every table's columns kept as one list (`format::LISTS`): an older lake moves there by itself
+BOUNDS = 8  # files' ranges kept typed (`format::BOUNDS`): a new lake starts there, an older one moves there by itself
+FORMAT = 8  # this build's format (`format::FORMAT`; 7: a view of averages keeps its query's own state, `fvar::PARTS_FORMAT`)
 
 
 def format_check(new_bin, work, port, old=None):
-    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=8:
-    this build's format, 7, plus one); and the writes that need formats 2 to 5 (ADR-055, ADR-058, ADR-074)
+    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=9:
+    this build's format, 8, plus one); and the writes that need formats 2 to 5 (ADR-055, ADR-058, ADR-074)
     against `old`, the release before (version, binary), this build posing as one that knows only format 5
     (so the lake doesn't move on to its column lists by itself)."""
     checks, info = {}, {}
@@ -645,17 +646,17 @@ def format_check(new_bin, work, port, old=None):
     lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": str(FORMAT + 1), **unsealed}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
     first = Node(new_bin, lake, port, work, env=unsealed, token=False).start()  # makes the lake
-    checks["a lake this build makes starts at its tables' column lists (format 6)"] = until(lambda: fmt(first) == LISTS, 3, step=0.1)
+    checks["a lake this build makes starts at its files' typed ranges (format 8, with its tables' column lists)"] = until(lambda: fmt(first) == BOUNDS, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
     first.q("CREATE TABLE s (k VARCHAR, x INT)")
     first.q("INSERT INTO s VALUES ('a', 1), ('a', 2)")
     first.q("CREATE MATERIALIZED VIEW means AS SELECT k, avg(x) AS m FROM s GROUP BY k")  # (grouped: a view of one row keeps its query otherwise)
-    checks["…and a view of averages moves it to format 7, keeping its query's own state"] = \
+    checks["…and a view of averages keeps its query's own state there (format 7's)"] = \
         until(lambda: fmt(first) == FORMAT, 3, step=0.1) and until(lambda: first.q("SELECT m FROM means") == [{"m": 1.5}], 10)
     first.stop()
-    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 8
-    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 7
+    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 9
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 8
     time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
     checks["a lake moves on only to the newest format every node knows"] = fmt(a) == FORMAT and fmt(b) == FORMAT
@@ -669,7 +670,7 @@ def format_check(new_bin, work, port, old=None):
         b.p.wait(20)
     except (Failed, subprocess.TimeoutExpired):
         pass
-    info["a follower that knows format 7 said"] = b.said()[-300:]
+    info[f"a follower that knows format {FORMAT} said"] = b.said()[-300:]
     checks["a node that doesn't know the lake's format refuses it, saying which release it needs"] = refused(b)
     b.stop("kill")
     code, said = cli(new_bin, lake, "SELECT count(*) AS n FROM t", ok=False)
@@ -684,7 +685,7 @@ def format_check(new_bin, work, port, old=None):
     b.stop("kill")
     t1 = time.time()
     a = Node(new_bin, lake, port, work, env=later, token=False).start()
-    info["seconds"] = {"a node of format 7 refused to lead it": round(t1 - t0, 1), "then one of format 8 led it": round(time.time() - t1, 1)}
+    info["seconds"] = {f"a node of format {FORMAT} refused to lead it": round(t1 - t0, 1), f"then one of format {FORMAT + 1} led it": round(time.time() - t1, 1)}
     checks["…without holding on to the leader's term: the next node leads at once"] = refused(b) and time.time() - t1 < 10
     checks["the lake reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     a.stop()
@@ -732,7 +733,7 @@ def guests_check(new_bin, work, port):
     build's column lists (format 6) by it, in a local folder or in a bucket (with --s3), since a node of the release before
     may serve it again (11-07 audit L2: one `pondra sql` raised a folder for good, and a 0.80 server was refused it). Such a
     lake moves on only by its server's leader. Each lake is made at format 5 (a build posing as one before the column
-    lists); a node of format 5 then serves it again. A folder lake `pondra sql` makes starts at format 6, as a node's does,
+    lists); a node of format 5 then serves it again. A folder lake `pondra sql` makes starts at format 8, as a node's does,
     and a node of format 5 is refused it by name."""
     checks, info = {}, {}
     five = {"PONDRA_TEST_FORMAT": "5", "PONDRA_SECRET_KEY": ""}
@@ -773,8 +774,8 @@ def guests_check(new_bin, work, port):
         got = {"refused": o.said()[-300:]}
     o.stop("kill")
     info["made by pondra sql"] = {"exit": made_fresh.returncode, **got}
-    checks["…and a folder lake pondra sql makes starts at format 6: a node of format 5 is refused it by name"] = \
-        made_fresh.returncode == 0 and "format 6" in got.get("refused", "") and "run Pondra" in got.get("refused", "")
+    checks[f"…and a folder lake pondra sql makes starts at format {BOUNDS}: a node of format 5 is refused it by name"] = \
+        made_fresh.returncode == 0 and f"format {BOUNDS}" in got.get("refused", "") and "run Pondra" in got.get("refused", "")
     # A RESTORE by this build into a new folder, of a backup a node of format 5 took: the new place is led for the moment by
     # `pondra lead`, which doesn't raise it, so its entries are written in format 5's shape under the backup's own mark (below
     # 6), and a node of format 5 serves it with the same rows (going back to 0.80 after a restore by main).
@@ -1341,7 +1342,7 @@ def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
         steps[f"{was} {x.port} on the new binary"] = {"longest wait for an ack, s": load.longest(t0 - 0.5), "seconds": round(time.time() - t0, 1)}
     info["tier rounds with nodes of both releases"] = rounds
     checks[f"a tier round with nodes of both releases: every job done, Pondra {old_v}'s and this build's entries each read by the other"] = bool(rounds) and all(r["every job done"] for r in rounds)
-    raised = until(lambda: all(y.get("/stats", timeout=5)["format"] == LISTS for y in live), 60)
+    raised = until(lambda: all(y.get("/stats", timeout=5)["format"] == BOUNDS for y in live), 60)
     # The next upgrade, from this build: each node drained and its leader stepping down.
     restarting = time.time()
     for x in sorted(list(live), key=lambda x: role(x) == "leader"):
@@ -1363,7 +1364,7 @@ def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
     checks["every acknowledged batch once, no torn read, through every step"] = not result["lost or twice"] and not result["torn reads"]
     checks["every node answers the same: rows, a keyed table, a view"] = same("SELECT count(*) AS n FROM ev2") and same("SELECT * FROM kv2 ORDER BY k") and same("SELECT * FROM per_producer ORDER BY producer")
     checks["the view equals its rows"] = live[0].q("SELECT * FROM per_producer ORDER BY producer") == live[0].q("SELECT producer, count(*) AS n, max(seq) AS mx FROM ev2 GROUP BY producer ORDER BY producer")
-    checks["the lake moves to this build's format (6: its tables' column lists) once every node runs it, under load"] = bool(raised)
+    checks["the lake moves to this build's format (8: its tables' column lists, its files' typed ranges) once every node runs it, under load"] = bool(raised)
     checks["…and the table made before it answers as it did"] = same("SELECT * FROM mid") and live[0].q("SELECT a, c FROM mid") == [{"a": 1, "c": "x"}]
     checks["the leader hears every node say its release (none from before formats)"] = len(info["releases"]) == 3 and "older" not in info["releases"].values()
     checks["restarted a node at a time from this build, no batch waits more than 2 s (drained, the leader stepping down)"] = restarted < 2

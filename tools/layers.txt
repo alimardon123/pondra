@@ -72,6 +72,7 @@ replica catalog
 scan catalog
 sketch catalog
 store catalog
+column_types catalog
 frozen catalog
 naming catalog
 pins catalog
@@ -232,6 +233,7 @@ pg_catalog extensions:postgres
 pg_copy extensions:postgres
 pg_formats extensions:postgres
 pg_functions extensions:postgres
+pg_column_types extensions:postgres
 pg_json extensions:postgres
 pg_json_edit extensions:postgres
 pg_json_make extensions:postgres

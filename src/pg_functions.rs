@@ -21,7 +21,9 @@ use std::sync::Arc;
 // ---------------------------------------------------------------- the builder
 // (how a function meets DataFusion: every Postgres function the core registers is made with these)
 
-pub use crate::store::MARK;
+/// The field metadata that marks an answer's column with its Postgres type (`uuid`, `json`, `jsonb`): the port reads it, other
+/// doors pass it by. The column types section's (`column_types::MARK`).
+pub use crate::column_types::MARK;
 
 type Body = dyn Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync;
 
@@ -59,8 +61,8 @@ impl ScalarUDFImpl for PgFn {
             None if self.follows => first_json_mark(args.arg_fields),
             None => None,
         };
-        Ok(Arc::new(match mark {
-            Some(mark) => field.with_metadata([(MARK.to_string(), mark)].into()),
+        Ok(Arc::new(match mark.as_deref().and_then(crate::column_types::named) {
+            Some(t) => crate::column_types::mark(field, t),
             None => field,
         }))
     }
@@ -113,6 +115,7 @@ pub static POSTGRES: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "postgres",
     requires: &["engine"],
     register: |r| {
+        [&crate::pg_column_types::UUID, &crate::pg_column_types::JSON, &crate::pg_column_types::JSONB].into_iter().for_each(|t| r.section_mut::<crate::column_types::ColumnTypes>().add(t));
         r.section_mut::<crate::engine::Functions>().add("postgres", |ctx| {
             let ctx = crate::pg_json::planned(ctx);
             register(&ctx);

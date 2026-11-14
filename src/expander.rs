@@ -947,6 +947,9 @@ impl VisitorMut for Expander<'_> {
                 Ok(q) => q,
                 Err(e) => return ControlFlow::Break(e.context(format!("{name}"))),
             };
+            if crate::grouping::wanted(sql) {
+                crate::grouping::regroup(&mut q); // (a frame groups as the same query sent alone: `front::expand`)
+            }
             crate::walk::visit_mut(&mut q, &mut Expander { views: &NONE, depth: self.depth + 1, scopes: vec![], ..*self })?; // (its functions; its names are the lake's)
             let shown = name.0.last().and_then(|part| part.as_ident()).map_or_else(|| object(name), crate::text::ident); // (`FROM page.public.v` reads as v, as in Postgres)
             let alias = alias.clone().or_else(|| Some(ast::TableAlias { explicit: true, name: ast::Ident::new(shown), columns: vec![], at: None }));

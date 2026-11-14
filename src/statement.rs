@@ -55,9 +55,7 @@ pub enum Answer<O> {
 
 /// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it.
 pub async fn run<W: Wire>(app: &App, mut req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
-    if let Some(sql) = in_language(crate::set::language(), &req.sql)? {
-        req.sql = sql; // (the session's language read once, as the request arrives: what follows reads Pondra's SQL)
-    }
+    in_its_language(crate::set::language(), &mut req)?; // (the session's language read once, as the request arrives: what follows reads Pondra's SQL)
     if let Some(seg) = how.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
@@ -88,6 +86,20 @@ pub async fn run<W: Wire>(app: &App, mut req: Request, how: How<'_>, who: Who, w
         Outcome::Rows(batches) => Answer::Rows(batches),
         Outcome::Done(v) => Answer::Done(v),
     })
+}
+
+/// A request as Pondra's SQL: its text and each of its frames read in `language` (the session's as it arrives:
+/// `set::language`), so a frame answers as the same query sent alone does. Each door that runs a request reads it here.
+pub(crate) fn in_its_language(language: &str, req: &mut crate::routines::Request) -> Result<()> {
+    if let Some(sql) = in_language(language, &req.sql)? {
+        req.sql = sql;
+    }
+    for frame in req.views.values_mut() {
+        if let Some(sql) = in_language(language, frame)? {
+            *frame = sql;
+        }
+    }
+    Ok(())
 }
 
 /// A request's text in a language (`languages.rs`, the session's as it arrives: `set::language`) as Pondra's SQL: each
@@ -484,7 +496,7 @@ fn big(batches: &[RecordBatch]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::in_language;
+    use super::{in_its_language, in_language};
 
     /// A Spark session's request is Pondra's SQL once read: each statement by Spark's grammar and turned, Pondra's own
     /// as written, a text Spark's grammar refuses in its words (42601), and Pondra's SQL as it is.
@@ -499,6 +511,10 @@ mod tests {
         assert_eq!(read(r#"SET datafusion.sql_parser.dialect = 'mysql'; SELECT "x""#), None, "a dialect that names no language: the node's, Pondra's SQL");
         assert_eq!(read(r#"DISCARD ALL; SELECT "x""#), None);
         assert_eq!(in_language("pondra", r#"SET search_path = s; SELECT "x""#).unwrap(), None, "another setting: as written");
+        // (a client's frames too: a frame answers as the same query sent alone, 11-14 audit H1)
+        let mut req = crate::routines::Request { sql: "SELECT h FROM f".into(), views: [("f".to_string(), r#"SELECT 7 / 2 AS h, "x" AS s"#.to_string())].into(), ..Default::default() };
+        in_its_language("spark", &mut req).unwrap();
+        assert_eq!((req.sql.as_str(), req.views["f"].as_str()), ("SELECT h FROM f", "SELECT spark_divide(7, 2) AS h, 'x' AS s"));
         for own in ["SHOW language", "RESET language", "BEGIN", "COMMIT", "CHECKPOINT", "$n = 1", "CREATE SEQUENCE s", "COPY t TO 'x.csv'", "DISCARD ALL", "DECLARE c CURSOR WITH HOLD FOR SELECT x FROM t", "FETCH 1 FROM c", "CLOSE ALL"] {
             assert_eq!(read(own), None, "{own}: Pondra's own, as written");
         }
