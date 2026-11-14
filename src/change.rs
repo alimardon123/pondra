@@ -547,7 +547,9 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
     let _gate = crate::locks::close(lake, std::slice::from_ref(&table)).await?;
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
     let point = match &stmt {
-        crate::write::Stmt::Update(_, set, Some(cond)) if !append => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?, // (one key: no planning, ADR-036 §6)
+        // (one key: no planning, ADR-036 §6. Not for a writer a filter on the table's rows holds: planned, so the filter
+        // reads the key's row, as every other row it changes)
+        crate::write::Stmt::Update(_, set, Some(cond)) if !append && scope.rows("select", &table).is_none() => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?,
         _ => None,
     };
     let insert = matches!(stmt, crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..));
@@ -580,11 +582,14 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
     // A plain INSERT's keys must be new (23505: `constraints.rs`), and so must the keys a MERGE inserts. One that matches on
     // the key alone, comparing it in the key's own type, inserts only rows whose key no row holds, so nothing is looked up;
     // a MERGE's must still differ from each other (an upsert's keep their own rule: `Upsert::merge` keeps a key's first row, or refuses 21000).
+    // A writer a filter on the table's rows holds matched only the rows it reads: its new keys are looked up in every row, so a
+    // key a row it doesn't read holds is refused (23505), as a plain INSERT's is, and that row isn't replaced.
+    let read_whole = scope.rows("select", &table).is_none();
     let plain = match &stmt {
         crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..) => true,
-        crate::write::Stmt::Merge(m) if m.upsert.is_some() => !m.on_key(&meta),
+        crate::write::Stmt::Merge(m) if m.upsert.is_some() => !(read_whole && m.on_key(&meta)),
         crate::write::Stmt::Merge(m) => match m.key_sources(&meta) {
-            Some(sources) => !(m.on_key(&meta) && compared_as_keys(lake, &meta, &sources, m, upto, scope).await?),
+            Some(sources) => !(read_whole && m.on_key(&meta) && compared_as_keys(lake, &meta, &sources, m, upto, scope).await?),
             None => true,
         },
         _ => false,

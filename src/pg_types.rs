@@ -14,7 +14,6 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::sqlparser::ast::{self, Expr, Statement};
 
-use crate::pg_functions::MARK;
 use crate::pg_names;
 use crate::pg_trace::{first_arg, known, param, Known, Trace};
 pub(crate) use crate::pg_trace::{one, Ty};
@@ -23,7 +22,7 @@ use crate::text::object;
 
 /// The type an answer's column is marked with: `typed` marked it, or a catalog function that answers
 /// json did (`pg_catalog.rs`).
-pub fn marked_type(f: &Field) -> Option<Ty> { f.metadata().get(MARK).and_then(|t| Ty::of(t)) }
+pub fn marked_type(f: &Field) -> Option<Ty> { crate::column_types::of(f).and_then(|t| Ty::of(t.name)) }
 
 /// What an answer's columns are, from its statement as written: which types they are (`columns`), and the
 /// names Postgres gives them (`pg_names::of`; None when they can't be read the same way as the columns).
@@ -61,11 +60,10 @@ fn marked(schema: &SchemaRef, marks: &[Option<Ty>]) -> SchemaRef {
         return schema.clone();
     }
     let fields: Vec<Arc<Field>> = fields.iter().zip(marks).map(|(f, m)| match m {
-        Some(t) => {
-            let mut meta = f.metadata().clone();
-            meta.insert(MARK.into(), t.name().into());
-            Arc::new(f.as_ref().clone().with_metadata(meta))
-        }
+        Some(t) => match crate::column_types::named(t.name()) {
+            Some(entry) => Arc::new(crate::column_types::mark(f.as_ref().clone(), entry)),
+            None => f.clone(),
+        },
         None => f.clone(),
     }).collect();
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))

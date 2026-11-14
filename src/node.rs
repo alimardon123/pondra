@@ -1053,6 +1053,9 @@ mod tests {
             assert_eq!(first("SELECT doc FROM j ORDER BY id").await, (vec![s(r#"{"a": 3}"#)], 2));
             assert_eq!(first("SELECT count(*) FROM c").await.0, vec![s("2")]);
             assert_eq!(first("SELECT arrow_metadata(doc, 'pg_type') FROM v").await, (vec![s("jsonb")], 2), "through a view");
+            run("CREATE TABLE k (u UUID)").await;
+            run("INSERT INTO k VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')").await;
+            assert_eq!(first("SELECT arrow_metadata(u, 'pg_type') FROM k").await, (vec![s("uuid")], 1), "a uuid column, marked by its entry too");
             assert_eq!(first("SELECT doc FROM j UNION ALL SELECT t FROM j").await.1, 4);
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
@@ -1063,7 +1066,9 @@ mod tests {
     /// A keyed table's files keep their columns' ranges (step 5 piece 11a), and its reads skip a file they rule out,
     /// unopened, for a filter on any column: each part of the merge on read is filtered alone (`query::upsert_view`). The
     /// answers stay whole: an update's newest version, in a file a filter on another column skips, still shadows the old
-    /// one that filter finds. (Here, with the node: an UPDATE needs the leader's sequencer, and files its tiering.)
+    /// one that filter finds. The lake moves to format 8 before the last round, so its files keep their ranges in both forms,
+    /// text and typed (`bounds::Ranged`), as a lake upgraded keeps them until its files are rewritten. (Here, with the node:
+    /// an UPDATE needs the leader's sequencer, and files its tiering.)
     #[tokio::test]
     async fn a_keyed_tables_reads_skip_the_files_their_ranges_rule_out() {
         use datafusion::arrow::array::AsArray;
@@ -1084,13 +1089,16 @@ mod tests {
                 run(format!("INSERT INTO k SELECT value, value FROM range({lo}, {})", hi + 1)).await; // (v = id)
                 app.tier_all(0).await.unwrap();
             }
+            crate::format::alone(&lake).await.unwrap(); // (format 8 from here: the update's file keeps its ranges typed)
             run("UPDATE k SET v = -5 WHERE id = 5".into()).await;
             app.tier_all(0).await.unwrap();
             let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("k")).await.unwrap().unwrap();
-            assert_eq!(meta.files.len(), 3, "a file a round: {:?}", meta.files.iter().map(|f| (f.ord, &f.stats)).collect::<Vec<_>>());
-            let ranges = |f: &crate::store::DataFile| (f.stats.get("id").cloned(), f.stats.get("v").cloned());
+            assert_eq!(meta.files.len(), 3, "a file a round: {:?}", meta.files.iter().map(|f| (f.ord, &f.stats, &f.bounds)).collect::<Vec<_>>());
+            let ranges = |f: &crate::store::DataFile| (crate::bounds::Ranged::longs(f, "id"), crate::bounds::Ranged::longs(f, "v"));
             let newest = meta.files.iter().max_by_key(|f| f.ord).unwrap();
-            assert_eq!(ranges(newest), (Some(("5".into(), "5".into())), Some(("-5".into(), "-5".into()))));
+            assert_eq!(ranges(newest), (Some((5, 5)), Some((-5, -5))));
+            assert!(newest.stats.is_empty() && !newest.bounds.is_empty(), "written at format 8: its ranges typed");
+            assert!(meta.files.iter().filter(|f| f.ord != newest.ord).all(|f| f.bounds.is_empty() && !f.stats.is_empty()), "written before: as text");
             assert!(meta.files.iter().all(|f| f.sketch.is_empty()), "a keyed file's sketches would count a key's old versions");
             let count = |sql: &'static str| {
                 let (app, node) = (app.clone(), node.clone());

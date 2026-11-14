@@ -33,10 +33,8 @@ pub const SEAL: usize = 64; // …then all but the newest this many are sealed
 const BIG: u64 = 4096; // files per manifest at most; smaller manifests are merged, 16 at a time
 
 pub use crate::data_file::{text, Stats};
+pub use crate::bounds::Values;
 use crate::bounds::Ranged;
-
-/// Column -> its (min, max), typed: what a query's planning knows of a table's values (`ranges`).
-pub type Values = BTreeMap<String, (ScalarValue, ScalarValue)>;
 
 /// A manifest's entry in the table's list: where it is, what it holds, its columns' ranges.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -99,17 +97,17 @@ impl Seen {
     /// table's entries stay small; strings only up to 64 characters, where a cut-off value would no
     /// longer bound them), and of the system columns (`sys.rs`: a purge finds changed rows by them).
     /// Floats' come from their rows (Parquet leaves NaN out of its own, and a NaN must not be pruned
-    /// away), the rest from the footer, when exact: Parquet cuts a value at 64 bytes, which `text`
-    /// would leave out anyway.
-    pub fn stats(&mut self, written: &ParquetMetaData) -> Stats {
-        let mut out = Stats::new();
+    /// away), the rest from the footer, when exact: Parquet cuts a value at 64 bytes, which a file
+    /// keeps no range of anyway (`bounds::kept`).
+    pub fn ranges(&mut self, written: &ParquetMetaData) -> Values {
+        let mut out = Values::new();
         let floats: BTreeMap<usize, (ScalarValue, ScalarValue)> = self.floats.iter_mut().filter_map(|(i, lo, hi)| Some((*i, (lo.evaluate().ok()?, hi.evaluate().ok()?)))).collect();
         for (i, f) in self.schema.fields().iter().enumerate().filter(|(i, f)| ranged(*i, f)) {
             let range = match f.data_type().is_floating() {
                 true => floats.get(&i).cloned(),
                 false => from_footer(written, &self.schema, f.name()),
             };
-            if let Some((Some(lo), Some(hi))) = range.map(|(lo, hi)| (text(&lo), text(&hi))) {
+            if let Some((lo, hi)) = range.filter(|(lo, hi)| !lo.is_null() && !hi.is_null()) {
                 out.insert(f.name().clone(), (lo, hi));
             }
         }
@@ -274,10 +272,11 @@ async fn write(lake: &Lake, dir: &str, files: &[DataFile], schema: &SchemaRef) -
 }
 
 fn summary(path: String, files: &[DataFile], schema: &SchemaRef) -> Manifest {
-    let typed = union(&files.iter().map(|f| f as &dyn Ranged).collect::<Vec<_>>(), schema);
-    let stats = typed.iter().filter_map(|(c, (lo, hi))| Some((c.clone(), (text(lo)?, text(hi)?)))).collect();
+    let values = union(&files.iter().map(|f| f as &dyn Ranged).collect::<Vec<_>>(), schema);
+    // (typed when its files are: only a lake at format 8 has any)
+    let (stats, bounds) = crate::bounds::kept(&values, files.iter().any(|f| !f.bounds.is_empty()));
     let nulls = files.iter().map(|f| f.nulls.clone()).collect::<Option<Vec<_>>>().map(|n| n.concat().into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect());
-    Manifest { path, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), bytes: files.iter().map(|f| f.bytes).sum(), stats, nulls, ..Default::default() }
+    Manifest { path, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), bytes: files.iter().map(|f| f.bytes).sum(), stats, bounds, nulls }
 }
 
 /// Leader, in `tier::maintain`: seal the oldest inline files once there are too many, and merge

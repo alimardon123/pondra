@@ -1378,7 +1378,8 @@
    "privilege Utf8",
    "on_kind Utf8",
    "on_name Utf8",
-   "columns Utf8"
+   "columns Utf8",
+   "rows Utf8"
   ],
   "pondra.history": [
    "at Timestamp(\u00b5s, \"UTC\")",

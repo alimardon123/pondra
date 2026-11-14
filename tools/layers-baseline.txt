@@ -189,7 +189,7 @@ routines -> workspace  6
 rules -> pg_bytea  1
 rules -> pg_casts  1
 rules -> pg_json  1
-rules -> pg_json_make  6
+rules -> pg_json_make  4
 runs -> apply  1
 runs -> crypto  2
 scan -> wasm32  2
