@@ -496,7 +496,7 @@ fn big(batches: &[RecordBatch]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::in_language;
+    use super::{in_its_language, in_language};
 
     /// A Spark session's request is Pondra's SQL once read: each statement by Spark's grammar and turned, Pondra's own
     /// as written, a text Spark's grammar refuses in its words (42601), and Pondra's SQL as it is.
