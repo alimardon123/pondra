@@ -44,6 +44,7 @@ pub const FORMAT: crate::table_formats::TableFormat = crate::table_formats::Tabl
     name: "iceberg",
     abilities: &[crate::table_formats::Ability::Read, crate::table_formats::Ability::AsOf, crate::table_formats::Ability::Insert, crate::table_formats::Ability::CopyTo],
     options: &["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
+    past: &["version", "snapshot_from_id", "snapshot_from_timestamp"],
     resolve: |lake, spec, scope| {
         Box::pin(async move {
             let (meta, d) = resolve(lake, &spec.urls[0], &spec.options, scope).await?;
