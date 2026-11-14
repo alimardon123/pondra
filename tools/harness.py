@@ -16415,6 +16415,7 @@ def waits():
 
     # READ ONLY, per transaction and by default.
     c5 = pg()
+    c5.execute("CREATE SEQUENCE ro_seq")
     c5.execute("BEGIN READ ONLY")
     ro = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
     ro_next = code(c5, "SELECT 1")  # (Postgres aborts the transaction too)
@@ -16432,6 +16433,15 @@ def waits():
     via_set = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
     checks["READ ONLY: a write refused (25006) and ends the transaction (25P02 after); default_transaction_read_only refuses writes outside one; SHOW says so"] = \
         ro == "25006" and ro_next == "25P02" and ro_read == 1000 and shown_ro == "on" and default_ro == "on" and outside == "25006" and wrote == "ok" and via_set == "25006"
+    # (11-10 audit M3: a sequence's move is a write, though a SELECT says it: refused 25006 by default and in READ ONLY)
+    seq_default = code(c5, "SELECT nextval('ro_seq')")
+    c5.execute("SET default_transaction_read_only = off")
+    c5.execute("BEGIN READ ONLY")
+    seq_in = code(c5, "SELECT setval('ro_seq', 100)")
+    c5.execute("ROLLBACK")
+    seq_after = c5.execute("SELECT nextval('ro_seq')").fetchone()[0]
+    checks["READ ONLY moves no sequence: nextval under default_transaction_read_only and setval in BEGIN READ ONLY are refused 25006, and the next nextval is the first (11-10 audit M3)"] = \
+        seq_default == "25006" and seq_in == "25006" and seq_after == 1
 
     # Eight clients on both nodes, READ COMMITTED: transfers wait for each other's rows (and deadlocks
     # are refused, and retried); none is refused with 40001, and the total is kept.
