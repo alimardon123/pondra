@@ -996,7 +996,7 @@ async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u
     let rules = stored.rules()?;
     // (one key's read without planning: not for a writer a filter on the table's rows holds, whose rows are planned so the
     // filter reads them)
-    let whole = scope.rows("select", l.name).is_none();
+    let whole = !scope.filtered(l.name);
     if let (Stmt::Merge(m), true) = (stmt, whole) {
         if let Some(p) = m.point_upsert(l.name, stored, scope) {
             if let Some(c) = upsert_point(l, stored, &rules, m, &p, snapshot).await? {
