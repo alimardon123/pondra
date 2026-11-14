@@ -16,8 +16,9 @@ pub fn length(t: &str) -> Option<usize> {
     t.strip_prefix("varchar(")?.strip_suffix(')')?.parse().ok()
 }
 
-/// A type a column keeps as text and checks (`Column::held`): `uuid`, `json`, `jsonb` or `varchar(n)`.
-pub fn held(t: &str) -> bool { matches!(t, "uuid" | "json" | "jsonb") || length(t).is_some() }
+/// A type a column keeps as text and checks (`Column::held`): a column type's (`column_types`: `uuid`, `json`, `jsonb`)
+/// or `varchar(n)`.
+pub fn held(t: &str) -> bool { crate::column_types::named(t).is_some() || length(t).is_some() }
 
 /// `v` is longer than `n` characters, but for trailing spaces (Postgres takes those, and cuts them).
 fn too_long(v: &str, n: usize) -> bool {
@@ -102,25 +103,12 @@ fn jsonb_refused(column: &str, v: &str, e: datafusion::error::DataFusionError) -
     anyhow::Error::new(crate::codes::Violation(message, code))
 }
 
-/// Why a uuid column refuses a value: not a uuid, or one written another way than the column holds.
-fn refused_uuid(column: &str, s: &str) -> String {
-    match uuid_of(s) {
-        Ok(u) => format!("invalid input syntax for type uuid: \"{s}\" (column {column} holds a uuid one way, lower case with hyphens: write '{u}', or cast it, '{s}'::uuid)"),
-        Err(_) => format!("invalid input syntax for type uuid: \"{s}\" (column {column} holds uuids)"),
-    }
-}
-
-/// Why a value of a column held as `t` is refused, with its message and SQLSTATE; None when it is taken.
-/// The column's name is the one the message gives.
+/// Why a value of a column held as `t` is refused, with its message and SQLSTATE; None when it is taken: its column type's
+/// refusal (`column_types`), or a `varchar(n)`'s. The column's name is the one the message gives.
 fn refusal(t: &str, column: &str, v: &str) -> Option<(String, &'static str)> {
-    match t {
-        "uuid" if !is_uuid(v) => Some((refused_uuid(column, v), "22P02")),
-        // (the reader the functions use decides: 22P02 for text that isn't JSON, 54001 past its levels)
-        "json" | "jsonb" => crate::pg_json_make::refused(v).map(|code| match code {
-            "54001" => (format!("stack depth limit exceeded (column {column} holds {t}: a document nested past {} levels)", crate::pg_json_make::MAX_DEPTH), code),
-            _ => (format!("{} (column {column} holds {t})", json_refusal(v)), code),
-        }),
-        _ => match length(t) {
+    match crate::column_types::named(t).and_then(|ty| ty.refusal) {
+        Some(refused) => refused(column, v),
+        None => match length(t) {
             Some(n) if too_long(v, n) => Some((format!("value too long for type character varying({n}) (column {column}: a value of {} characters)", v.chars().count()), "22001")),
             _ => None,
         },

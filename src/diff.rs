@@ -263,7 +263,7 @@ async fn answer_of<H: Host>(host: &H, call: &Call) -> Result<String> {
     let (named_a, named_b) = (&call.a, &call.b);
     let (ran_a, ran_b) = match &call.data {
         Some(db) => sides_over(host, named_a, named_b, db).await?,
-        None => (own(host, named_a).await?, own(host, named_b).await?),
+        None => (named_a.clone(), named_b.clone()),
     };
     let (a, b) = (&ran_a, &ran_b);
     let ((of_a, rows_a), (of_b, rows_b)) = (columns_of(host, a).await?, columns_of(host, b).await?);
@@ -308,15 +308,6 @@ async fn sides_over<H: Host>(host: &H, a: &Side, b: &Side, db: &str) -> Result<(
         return Err(crate::codes::coded("0A000", format!("pondra.diff's data => runs two sides' definitions over {db}'s tables, and {} and {} are tables, which have none: name a view or a query, or leave data => out", a.shown(), b.shown())));
     }
     Ok((over(host, a, ra, db).await?, over(host, b, rb, db).await?))
-}
-
-/// A side as it reads with no `data =>`: another database's view as its query, its names read in that database (the
-/// front expands this database's views alone); anything else as named.
-async fn own<H: Host>(host: &H, side: &Side) -> Result<Side> {
-    Ok(match (side, relation_of(host, side).await) {
-        (Side::Name(n), Some(Relation::View { sql, lake: Some(other) })) => Side::Query(redirect(&*other, sql, database_of(n), 0).await?),
-        _ => side.clone(),
-    })
 }
 
 /// The database another database's object is named in here: its name's first part (`dev` of `dev.sales.v` and of

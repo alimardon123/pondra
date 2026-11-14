@@ -1423,8 +1423,9 @@ impl Segment {
 
 /// The field metadata that marks a column with its SQL type where its Arrow type doesn't say it (`json`, `jsonb`, `uuid`):
 /// a table's JSON column (`TableMeta::read_schema`), and an answer's (`pg_functions`). The Postgres port types its
-/// answer's columns by it; other doors pass it by.
-pub const MARK: &str = "pg_type";
+/// answer's columns by it; other doors pass it by. The column types section's (`column_types::MARK`), whose `mark` writes it
+/// here too once the column record keeps the full type (5-TY-b).
+pub use crate::column_types::MARK;
 
 pub fn table_key(t: &str) -> String { format!("t/{t}") }
 
