@@ -64,6 +64,8 @@ mod grouping;
 mod kept;
 pub mod extension;
 pub mod ext_names;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (its entries are the lake's extensions')
+mod table_formats;
 pub mod lake_files;
 pub mod sketch;
 mod asof;
