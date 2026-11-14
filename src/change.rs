@@ -549,7 +549,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str, scope: &cra
     let point = match &stmt {
         // (one key: no planning, ADR-036 §6. Not for a writer a filter on the table's rows holds: planned, so the filter
         // reads the key's row, as every other row it changes)
-        crate::write::Stmt::Update(_, set, Some(cond)) if !append && scope.rows("select", &table).is_none() => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?,
+        crate::write::Stmt::Update(_, set, Some(cond)) if !append && !scope.filtered(&table) => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?,
         _ => None,
     };
     let insert = matches!(stmt, crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..));
@@ -613,16 +613,28 @@ async fn inserted(lake: &Lake, table: &str, stored: &std::sync::Arc<TableMeta>, 
 /// the rows it replaces (with their `_row_id`, `_created_at` and `_version`), and the new versions
 /// (keeping their `_row_id` and `_created_at`) and new rows. A temporary table's too (`temp.rs`). `rules` are the table's,
 /// as its entry gives them (`TableMeta::rules`): a MERGE's proposed rows are shaped for them.
+///
+/// A writer a grant's filter on the table's rows holds changes only rows it holds (step 6 piece 5c): UPDATE's (or DELETE's)
+/// rows are read with SELECT's filter and that privilege's together (`Scope::writing`), a MERGE's clause's with its action's,
+/// so a row the filter doesn't hold is left as it is; and each new version must meet UPDATE's filter, and each row a MERGE
+/// inserts INSERT's, or the change is refused (`row_filter::holds`: Postgres's WITH CHECK, its policy's USING when it has none).
 pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, stmt: &crate::write::Stmt, upto: u64, scope: &crate::rights::Scope) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
-    Ok(match stmt {
+    let (old, new) = match stmt {
         crate::write::Stmt::Update(_, set, cond) => {
             crate::txn::refuse_change(lake, table, meta, stmt).await?;
-            update(lake, table, meta, set, cond, upto, scope).await?
+            update(lake, table, meta, set, cond, upto, &scope.writing("update", table)).await?
         }
-        crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto, scope).await?.0, vec![]),
+        crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto, &scope.writing("delete", table)).await?.0, vec![]),
         crate::write::Stmt::Merge(m) => merge(lake, table, meta, rules, m, upto, scope).await?,
         _ => bail!("not an UPDATE, DELETE or MERGE"),
-    })
+    };
+    // (its new versions: UPDATE's; the rows a MERGE inserts, which carry no id: INSERT's)
+    for privilege in ["update", "insert"] {
+        if let Some(f) = scope.rows(privilege, table) {
+            crate::row_filter::holds(&lake.session_with(1), table, &new, &f, &privilege.to_uppercase()).await?;
+        }
+    }
+    Ok((old, new))
 }
 
 fn from(table: &str) -> String { format!("{} AS {}", crate::write::sql_name(table), q(table.rsplit('.').next().unwrap_or(table))) }
@@ -752,9 +764,9 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                         return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
                     }
                     ensure!(set.iter().all(|(c, _)| meta.columns().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
-                    select_as(lake, meta, Some(set), None, &rest, upto, &a, scope).await?
+                    select_as(lake, meta, Some(set), None, &rest, upto, &a, &scope.writing("update", table)).await?
                 }
-                (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a, scope).await?,
+                (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a, &scope.writing("delete", table)).await?,
                 (Action::Insert(columns, values), _) => {
                     // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
                     let given = if columns.is_empty() { crate::write::implicit(&meta.sql_names(), Some(values.len())).to_vec() } else { columns.clone() }; // (SQL's order)

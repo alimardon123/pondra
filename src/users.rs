@@ -386,9 +386,10 @@ fn grant(w: &mut Words, grant: bool, rows: Option<&str>) -> Result<Change> {
         if database.is_some() || !matches!(on, On::Table(_)) {
             return Err(a_tables());
         }
-        // (an INSERT's, an UPDATE's and a DELETE's filter is kept by their writes, which piece 5c makes)
-        if privileges.iter().any(|p| p != "select") {
-            return Err(crate::codes::coded("0A000", "a filter on rows is SELECT's: GRANT SELECT ON t TO r WHERE …"));
+        // (SELECT's reads, UPDATE's and DELETE's writes read through theirs, and INSERT's rows are checked by it: `change::rows_of`,
+        // `write::rows_of`. ALL is the four)
+        if privileges.iter().any(|p| !TABLE_PRIVILEGES.contains(&p.as_str())) {
+            return Err(crate::codes::coded("0A000", "a filter on rows is a table's privileges', SELECT, INSERT, UPDATE and DELETE: GRANT INSERT ON t TO r WHERE …"));
         }
     }
     Ok(if grant { Change::Grant { privileges, on, columns, to: who, database, rows } } else { Change::Revoke { privileges, on, columns, from: who, database, rows } })
@@ -1781,8 +1782,10 @@ mod tests {
         }
         assert_eq!(p("GRANT USAGE ON SECRET s TO ann WHERE a = 1")["code"], "0A000");
         assert_eq!(p("GRANT analyst TO ann WHERE a = 1")["code"], "0A000");
-        assert_eq!(p("GRANT INSERT ON t TO ann WHERE a = 1")["error"], "a filter on rows is SELECT's: GRANT SELECT ON t TO r WHERE …");
-        assert_eq!(p("GRANT ALL ON t TO ann WHERE a = 1")["code"], "0A000");
+        assert_eq!(p("GRANT INSERT ON t TO ann WHERE a = 1")["rows"], "a = 1");
+        assert_eq!(p("GRANT ALL ON t TO ann WHERE a = 1")["privileges"], j!(["select", "insert", "update", "delete"]), "the four, each with it");
+        assert_eq!(p("GRANT UPDATE, DELETE ON t TO ann WHERE Dept = 'eng'")["rows"], "dept = 'eng'", "UPDATE's and DELETE's: their writes read through it");
+        assert_eq!(p("REVOKE DELETE ON t FROM ann WHERE dept = 'eng'")["rows"], "dept = 'eng'");
         assert_eq!(p("GRANT SELECT ON t TO ann WHERE")["code"], "42601");
         assert_eq!(p("GRANT SELECT ON t TO ann WHERE a = 1; DROP TABLE t")["code"], "42601", "one condition, and nothing after it");
         // (Postgres's own filters on rows: refused, naming ours)
