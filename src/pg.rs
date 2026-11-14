@@ -67,20 +67,26 @@ impl Door {
 
     /// A new connection's handlers, and its session: a connection is a session, whose temporary tables end with it
     /// (`temp.rs`). None while the node drains: a new connection goes to another node (`drain.rs`).
-    fn handlers(&self) -> Option<(Arc<Pg>, String)> {
+    fn handlers(&self, peer: Option<Peer>) -> Option<(Arc<Pg>, String)> {
         if self.app.lake.node.drain.draining() {
             return None;
         }
         let (app, session) = (&self.app, format!("pg-{}", uuid::Uuid::new_v4().simple()));
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: self.parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone(), parsed: Default::default(), forget: Default::default() });
-        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: self.cancels.clone() };
+        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: self.cancels.clone(), peer };
         Some((Arc::new(Pg(backend, Arc::new(startup), self.cancel.clone())), session))
     }
 
     /// A connection to the node's own port, served on a task of the node's.
-    pub fn take(&self, socket: tokio::net::TcpStream) {
-        let Some((pg, session)) = self.handlers() else { return };
-        let tls = self.tls.clone();
+    pub fn take(&self, socket: tokio::net::TcpStream) { self.take_from(socket, None) }
+
+    /// A connection its host passed on over this machine's loopback (Windows has no pair of sockets), `peer` its client's.
+    #[cfg(not(unix))]
+    pub fn take_handed(&self, socket: tokio::net::TcpStream, peer: Peer) { self.take_from(socket, Some(peer)) }
+
+    fn take_from(&self, socket: tokio::net::TcpStream, peer: Option<Peer>) {
+        let Some((pg, session)) = self.handlers(peer) else { return };
+        let tls = if peer.is_some() { None } else { self.tls.clone() }; // (a passed one's TLS ended at its host)
         self.serve_one(session, async move {
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
@@ -88,10 +94,11 @@ impl Door {
     }
 
     /// A connection its host passed on in this process, its startup message not read yet: the host ended the client's TLS
-    /// and checked it was allowed, as it does a connection to the node's own port (`dbserver.rs`).
+    /// and checked it was allowed, as it does a connection to the node's own port (`dbserver.rs`). `peer`: its client's
+    /// address and TLS, which this end of the pair doesn't show.
     #[cfg(unix)]
-    pub fn take_passed(&self, socket: tokio::net::UnixStream) {
-        let Some((pg, session)) = self.handlers() else { return };
+    pub fn take_passed(&self, socket: tokio::net::UnixStream, peer: Peer) {
+        let Some((pg, session)) = self.handlers(Some(peer)) else { return };
         self.serve_one(session, async move {
             let _ = pgwire::tokio::process_socket_unix(socket, pg).await;
         });
@@ -185,7 +192,11 @@ struct Startup {
     plain: tokio::sync::Mutex<bool>, // (a token asked for as a plain password)
     oauth: tokio::sync::Mutex<Option<Bearer>>, // (a token asked for by OAUTHBEARER, psql 18's)
     cancels: Arc<ConnectionManager>, // (the server's connections, by the key a cancel request names)
+    peer: Option<Peer>, // (a client its host passed on: `peer`)
 }
+
+/// A client's address, and whether it came over TLS.
+pub type Peer = (std::net::SocketAddr, bool);
 
 /// OAUTHBEARER's exchange (RFC 7628, as psql 18 speaks it; ADR-074): a client with no token yet, or a
 /// token refused, is told where the provider is, answers `\x01`, and is refused; psql then gets a token
@@ -260,6 +271,11 @@ async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAd
 }
 
 impl Startup {
+    /// The client's address and whether it came over TLS: its connection's, or what its host said of a client it passed on
+    /// (`Door::take_passed`), since this end shows neither (pgwire names a pair of sockets 127.0.0.1, not secure): a
+    /// password's rule, a refused sign-in's count and the audit go by the client (11-14 audit L1).
+    fn peer(&self, client: &impl ClientInfo) -> Peer { self.peer.unwrap_or((client.socket_addr(), client.is_secure())) }
+
     /// Signed in: in the database the client named at startup (`dbname`), then ready for queries. A name that is a
     /// database here (`ddl::database`: an attached lake, a clone among them) starts the session in it, as `USE DATABASE`
     /// does, with the signed-in user's rights: `psql -d br` reads and writes `br`, never the lake it was cloned from.
@@ -318,7 +334,7 @@ impl Startup {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let app = &self.backend.app;
-        let from = Some(client.socket_addr());
+        let from = Some(self.peer(client).0);
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let mut oauth = self.oauth.lock().await;
         let Some(bearer) = oauth.as_mut() else { return Ok(()) };
@@ -367,7 +383,8 @@ impl StartupHandler for Startup {
     {
         use pgwire::messages::startup::Authentication;
         let app = &self.backend.app;
-        let from = Some(client.socket_addr());
+        let (at, secure) = self.peer(client); // (the client's: `peer`)
+        let from = Some(at);
         let ip = from.map(|a| a.ip()); // (failed sign-ins are counted per address and user name: `auth::guessing`)
         let wrong = async |user: &str| {
             crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password").await;
@@ -375,7 +392,7 @@ impl StartupHandler for Startup {
         };
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
-                if !crate::tls::pg_allowed(client.is_secure(), client.socket_addr()) {
+                if !crate::tls::pg_allowed(secure, at) {
                     return Err(fatal(crate::tls::PLAIN.into()));
                 }
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
@@ -383,7 +400,7 @@ impl StartupHandler for Startup {
                 let epoch = app.lake.cat.rights_version(); // (before it is asked: a user made after it moves the version past it)
                 if app.open().await {
                     let who = crate::auth::Principal { epoch, ..crate::auth::Principal::of(crate::auth::Role::Admin) };
-                    self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(Again::Open));
+                    self.backend.signed_in(who.at("postgres", from), Some(Again::Open));
                     return self.ready(client).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -400,7 +417,7 @@ impl StartupHandler for Startup {
                 if no_password && !tokens && self.ask_oauth(client, listed).await? {
                     return Ok(());
                 }
-                let tokens_only = listed || (no_password && crate::tls::may_send_password(client.is_secure(), client.socket_addr()) && crate::sso::anyone(&app.lake).await);
+                let tokens_only = listed || (no_password && crate::tls::may_send_password(secure, at) && crate::sso::anyone(&app.lake).await);
                 *self.plain.lock().await = tokens_only;
                 client.send(PgWireBackendMessage::Authentication(if tokens_only { Authentication::CleartextPassword } else { Authentication::SASL(vec!["SCRAM-SHA-256".into()]) })).await?;
             }
@@ -410,7 +427,7 @@ impl StartupHandler for Startup {
                 let password = m.into_password()?.password;
                 let token = crate::users::is_token(&user, &password);
                 // (a user's password crosses only TLS from another machine; a token may, as `tls.rs` says)
-                if !token && !crate::tls::may_send_password(client.is_secure(), client.socket_addr()) {
+                if !token && !crate::tls::may_send_password(secure, at) {
                     return Err(fatal(crate::tls::PASSWORD_PLAIN.into()));
                 }
                 if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
@@ -432,7 +449,7 @@ impl StartupHandler for Startup {
                     true => Again::Token { user: user.clone(), token: password.clone() },
                     false => Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() },
                 };
-                self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
+                self.backend.signed_in(who.at("postgres", from), Some(again));
                 return self.ready(client).await;
             }
             PgWireFrontendMessage::PasswordMessageFamily(m) => {
@@ -474,7 +491,7 @@ impl StartupHandler for Startup {
                         };
                         let Some(who) = who else { return Err(wrong(&user).await) };
                         let again = Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() };
-                        self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
+                        self.backend.signed_in(who.at("postgres", from), Some(again));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
                         return self.ready(client).await;
                     }
