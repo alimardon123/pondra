@@ -106,10 +106,11 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, who: Option<a
 async fn watch(app: &App, who: &crate::auth::Principal, headers: &axum::http::HeaderMap, sql: Option<&str>, kind: &str, body: &[u8], every: Duration, tag: String) -> anyhow::Result<Watch> {
     let session = crate::temp::of(&app.lake, headers, &who.name)?;
     crate::temp::SESSION.scope(crate::temp::named(&app.lake, session.clone()), async {
-        let req = match sql {
+        let mut req = match sql {
             Some(sql) => crate::routines::Request::read("", sql.as_bytes())?,
             None => crate::routines::Request::read(kind, body)?,
         };
+        crate::statement::in_its_language(crate::set::language(), &mut req)?; // (the session's, as `statement::run`)
         anyhow::ensure!(req.tables.is_empty(), "a live query reads the lake: rows sent with it would never change");
         let who = who.clone();
         let sql = crate::routines::prepare(&app.lake, &req.sql, &req.params, &req.views, &who.scope).await?;
