@@ -33,13 +33,23 @@ use std::time::Duration;
 /// piece 6b), which a node from before can't read (`LISTS`).
 /// 7: a materialized view that keeps an average or a variance as its query's own state (`fvar::MEAN_PARTS`, 11-09 audit
 /// M11), which a node from before has no function to merge.
-pub const FORMAT: u32 = 7;
+/// 8: a file's ranges kept typed (`DataFile::bounds`, redesign step 5, piece 14a), which a node from before drops when it
+/// writes the entry again, leaving the file with no ranges (`BOUNDS`).
+pub const FORMAT: u32 = 8;
 
 /// The format whose tables keep their columns as one list (`store::Stored`). A lake moves to it by itself: its leader raises
 /// it once every node knows it (`raise`), and a form that leads a lake in memory or a folder alone as it opens (`alone`). The commit sets the
 /// format alone: each table's entry becomes its list at its next write (`Catalog::write`), and an entry still in format
 /// 5's shape reads as it always did, as every format-5 lake's do.
 pub const LISTS: u32 = 6;
+
+/// The format whose files keep their ranges typed (`bounds.rs`). A lake moves to it by itself, as to `LISTS`: once every
+/// node knows it, or as a form alone opens a lake no release before has read. Below it a file keeps them as text (`stats`),
+/// and a file written before keeps them so until it is rewritten: every reader reads both (`bounds::Ranged`).
+pub const BOUNDS: u32 = 8;
+
+/// Does a file written in this lake now keep its ranges typed (`BOUNDS`)?
+pub async fn typed(lake: &Lake) -> Result<bool> { Ok(of(&lake.cat).await?.format >= BOUNDS) }
 
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
@@ -221,8 +231,9 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
                 marked = done.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
             }
             if ready >= LISTS {
-                if let Err(e) = set(&lake, LISTS).await {
-                    eprintln!("the tables' column lists (format {LISTS}): {e:#}");
+                let to = ready.min(BOUNDS); // (each format up to it: what every node knows)
+                if let Err(e) = set(&lake, to).await {
+                    eprintln!("the lake's format {to}: {e:#}");
                 }
             }
             if known() > FORMAT {
@@ -234,12 +245,13 @@ pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
     });
 }
 
-/// The format a lake this build makes starts at: its tables' column lists (`LISTS`) at once, since no release older than
-/// this build has read it (the mark alone, `BASE`, for a test posing as a build from before them).
-fn first() -> u32 { if known() >= LISTS { LISTS } else { BASE } }
+/// The format a lake this build makes starts at: its files' typed ranges (`BOUNDS`, and with them its tables' column lists)
+/// at once, since no release older than this build has read it (the mark alone, `BASE`, for a test posing as a build from
+/// before the lists).
+fn first() -> u32 { if known() >= LISTS { known().min(BOUNDS) } else { BASE } }
 
 /// A form that leads its lake alone, with no leader's loop (`pondra sql`, a program's node): a lake in memory, or one this
-/// process made in a local folder, moves to this build's tables' column lists (`LISTS`) as it opens, in one small commit.
+/// process made in a local folder, moves to where a lake this build makes starts (`first`) as it opens, in one small commit.
 /// No release before this build has read either. A folder's lake made before doesn't, nor a bucket's: a node of a release
 /// before may serve it again (a folder's after a restart, a bucket's cluster at once: its followers, which this form can't
 /// hear in a leader gap), and it would stop (11-07 audit L2: one `pondra sql` raised a folder for good, so a 0.80 server
@@ -247,7 +259,7 @@ fn first() -> u32 { if known() >= LISTS { LISTS } else { BASE } }
 /// `require`, for what needs the lists; until then its entries keep format 5's shape, which every reader reads.
 pub async fn alone(lake: &Lake) -> Result<()> {
     if known() >= LISTS && moves_alone(&lake.url, lake.format.made) {
-        set(lake, LISTS).await?;
+        set(lake, first()).await?;
     }
     Ok(())
 }
@@ -312,7 +324,7 @@ mod tests {
         assert!(made(&new) && !made(&old));
         alone(&new).await?;
         alone(&old).await?;
-        assert_eq!((of(&new.cat).await?.format, of(&old.cat).await?.format), (LISTS, 5), "the lake made here moves on, the other stays");
+        assert_eq!((of(&new.cat).await?.format, of(&old.cat).await?.format), (BOUNDS, 5), "the lake made here moves on, the other stays");
         for (lake, d) in [(new, here), (old, before)] {
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(d);
