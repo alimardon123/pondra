@@ -1085,10 +1085,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 136. **`DO` is an admin's, and its errors count lines from the code's first** (`routines::do_of`
    drops the newline after `$$`; a DO block's errors carry no routine name). `harness.py
    procedures`.
-137. **A folder of lakes' server holds no lake.** Each database is a `pondra serve` child
-   (`--advertise host:port/db/name`, `--attach-found <folder>`, `--stop-with-stdin`,
-   `PONDRA_SERVER_URL`); the server routes Postgres by the startup message and HTTP by
-   `/db/{name}`. `harness.py server` (local, `--s3`).
+137. **A folder of lakes' server holds no lake.** Each database is a node in the server's own process
+   (`node::Options::database`: advertised at `host:port/db/name`, attached to the folder's lakes, its
+   settings with `PONDRA_SERVER_URL`), kept by a supervisor of its own (`node::kept`), so its failure or
+   restart is its own and the other databases go on. It binds no port: the server routes Postgres by the
+   startup message, handing the connection to its door (`pg::Door`), and HTTP by `/db/{name}`, calling its
+   router. `harness.py server` (local, `--s3`).
 138. **The console asks only the node that served it** (no CDN or other hosts; its page, modules
    and style sheet are `include_str!`ed and its fonts `include_bytes!`ed from `brand/fonts/`;
    extensions are the node's own files). `console_check.py`: "every request went to the node", in
@@ -2646,8 +2648,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `Retry-After` at HTTP), the right password too, until its minute has fewer. Each refusal
    costs its 400 ms, as a wrong guess does. At most 10,000 pairs are held. Bearer tokens aren't
    counted. The Postgres, Flight and Kafka doors take the same two hooks. Behind `pondra serve --lakes` the address is the client's, which the server names in
-   `x-pondra-client` with a key it gives its databases' nodes (`PONDRA_CLIENT_KEY`). A node takes that
-   header only from this machine and with that key, so no other process here can name an address, and
+   `x-pondra-client` with its key (`tls::lakes_key`, which only its process holds: its databases' nodes are in it). A
+   node takes that header only from this machine and with that key, so no other process here can name an address, and
    the server replaces what a client sent. Without it, ten wrong passwords from anyone locked the user out for everyone. The same
    address decides what a page on this machine is (`Peer::from_here`: saving the console's settings, choosing a node's
    Python), so behind the server a page from another machine can't do either (S28). From an address of
