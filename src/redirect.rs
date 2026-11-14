@@ -1,6 +1,7 @@
-//! A definition read in another database (`pondra.diff`'s `data => 'db'`, Trellis T1c): a view's stored query, or a
-//! query, with the tables of its own database named in `db`, and the views of its own database it reads inlined, each
-//! read the same way. Another database's names, a CTE's, a table function's, a session's temporary table and a name the
+//! A definition read in another database: a view's stored query, or a query, with the tables of its own database named
+//! in `db`, and the views of its own database it reads inlined, each read the same way. `pondra.diff`'s `data => 'db'`
+//! reads both sides so (Trellis T1c), and a session reads another database's view so by its name there
+//! (`query::their_views`). Another database's names, a CTE's, a table function's, a session's temporary table and a name the
 //! database doesn't know are as written. The names are looked up first (the host is asked, `redirect`), then the query
 //! is rewritten by a pure function (`redirected`).
 use crate::front::{Host, Relation};
