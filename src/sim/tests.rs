@@ -330,3 +330,63 @@ async fn keyed_writes_from_three_members_never_double_a_key() {
         println!("seed {seed}: {} keys from three members, each once, the leader killed once", keys.len());
     }
 }
+
+/// The harness's `sequences`, its cluster part: `nextval` from nine clients on three members at once (a follower's go to
+/// the leader), while the leader is killed once: every value handed out is handed out once (a value a kill cut off
+/// before its answer is skipped, never given again).
+#[tokio::test(start_paused = true)]
+async fn nextval_on_three_members_hands_out_each_value_once_through_a_leader_kill() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        for m in 0..3 {
+            c.start(m).await.unwrap();
+        }
+        c.sql(1, "CREATE SEQUENCE s").await.unwrap();
+        let (cluster, taken) = (&c, AtomicUsize::new(0));
+        let taken = &taken;
+        let client = |k: usize| async move {
+            let (m, mut got) = (k % 3, vec![]);
+            for _ in 0..40 {
+                let mut tries = 0;
+                let values = loop {
+                    if cluster.up(m) {
+                        match cluster.sql(m, "SELECT nextval('s') AS v FROM range(25)").await {
+                            Ok(a) => break rows(&a).iter().map(|r| r["v"].as_i64().unwrap_or(-1)).collect::<Vec<_>>(),
+                            Err(e) => {
+                                tries += 1;
+                                assert!(tries < 100, "seed {seed}: client {k}'s nextval never answered: {e}\n{}", cluster.met());
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                got.extend(values);
+                taken.fetch_add(1, Relaxed);
+            }
+            got
+        };
+        let chaos = async {
+            while taken.load(Relaxed) < 120 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let mut lead = None;
+            for m in 0..3 {
+                if c.role(m).await.as_deref() == Some("leader") {
+                    lead = Some(m);
+                }
+            }
+            let lead = lead.unwrap_or_else(|| panic!("seed {seed}: no member leads\n{}", c.met()));
+            c.kill(lead);
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            c.start(lead).await.unwrap();
+        };
+        let (got, ()) = futures::join!(futures::future::join_all((0..9).map(client)), chaos);
+        let all: Vec<i64> = got.into_iter().flatten().collect();
+        let distinct: std::collections::BTreeSet<i64> = all.iter().copied().collect();
+        assert_eq!(all.len(), 9000, "seed {seed}: values answered");
+        assert_eq!(distinct.len(), all.len(), "seed {seed}: a value handed out twice\n{}", c.met());
+        assert!(distinct.first().is_some_and(|v| *v >= 1), "seed {seed}: the least value {:?}", distinct.first());
+        println!("seed {seed}: 9,000 values from nine clients on three members, each once (up to {}), the leader killed once", distinct.last().unwrap());
+    }
+}
