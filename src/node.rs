@@ -1034,6 +1034,11 @@ mod tests {
             let b = q("SELECT min(id), max(id) FROM f").await.expect("answered from the entries' exact ranges");
             assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (1, 1000));
             assert!(q("SELECT max(v) FROM f").await.is_err(), "a float's range leaves NaN out: its files are read");
+            // (and as a read with the memory columns off, or maintenance's, takes them: `query::files_once`)
+            let files: Vec<&crate::store::DataFile> = meta.files.iter().collect();
+            let read = crate::query::files_once(&lake, &lake.session(), &files, &meta, &meta.read_schema().unwrap()).await.expect("a read of the files");
+            read.create_physical_plan().await.expect("planned from the entries, no footer read");
+            assert_eq!(lake.node.metrics.footers_planned.load(std::sync::atomic::Ordering::Relaxed), 0, "no footer read to plan");
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })

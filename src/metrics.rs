@@ -21,6 +21,7 @@ pub struct Metrics {
     pub files_scanned: AtomicU64, // append-table files queries opened…
     pub files_skipped: AtomicU64, // …and skipped by their min/max
     pub hot_skipped: AtomicU64,   // batches of hot columns scans skipped by their ranges (`hot::Skip`)
+    pub footers_planned: AtomicU64, // table files planned from their footers: ones written before their entries kept their columns' sizes
     pub object_writes: AtomicU64,  // object-store requests its lakes made (`store::Counted`, on each lake's open): writes…
     pub object_lists: AtomicU64,   // …lists…
     pub object_deletes: AtomicU64, // …deletes…
@@ -150,6 +151,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("hot_limit_bytes", "gauge", "the most the hot columns may hold (PONDRA_HOT_GB)", &one(hot_max as f64));
     metric("hot_loading_files", "gauge", "files whose columns are being decoded into memory, or wait to be", &one(loading as f64));
     metric("hot_batches_skipped_total", "counter", "batches of hot columns scans skipped by their ranges", &one(get(&m.hot_skipped)));
+    metric("files_planned_from_footers_total", "counter", "table files a plan read the footer of: ones written before their catalog entries kept their columns' sizes (others are planned from their entries)", &one(get(&m.footers_planned)));
     // (one line a cache the node's line counts, by its name: `Ledger::charge`)
     let caches: Vec<(String, f64)> = app.lake.cached_bytes().iter().map(|(c, b)| (format!("{{cache=\"{c}\"}}"), *b as f64)).collect();
     metric("cache_bytes", "gauge", "what each bounded cache holds now: objects' byte ranges, decoded log rows, tables' tails, row groups for lookups, the catalog's blocks, Parquet footers, files' statistics, remembered answers, planning facts' manifest lists, tables' manifests, Delta logs and Iceberg manifests read, answers kept for their pages, statements worked out as point queries, the log tails' keys lookups index", &caches);

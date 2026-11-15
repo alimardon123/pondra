@@ -388,8 +388,14 @@ pub async fn files_once(lake: &Lake, ctx: &SessionContext, files: &[&DataFile], 
     // (a keyed table's positions are the older versions its newer files hold: what others read; its own reads take the newest anyway)
     let (deleted, own): (Vec<&DataFile>, Vec<&DataFile>) = own.into_iter().partition(|f| !f.deletes.is_empty() && meta.key.is_empty());
     let mut parts = vec![];
-    if !own.is_empty() {
-        parts.push(ctx.read_parquet(own.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?);
+    // (planned from their entries, as `hot::HotFiles` plans them: no footer read to plan)
+    let (planned, footed): (Vec<&DataFile>, Vec<&DataFile>) = own.into_iter().partition(|f| crate::scan::sized(f, schema));
+    if !planned.is_empty() {
+        parts.push(ctx.read_table(Arc::new(crate::scan::own(|p| lake.full(p), &planned, schema)?))?);
+    }
+    if !footed.is_empty() {
+        crate::metrics::add(&lake.node.metrics.footers_planned, footed.len() as u64);
+        parts.push(ctx.read_parquet(footed.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?);
     }
     if !deleted.is_empty() {
         parts.push(crate::lake_scan::with_deletes(lake, ctx, &deleted, schema).await?);

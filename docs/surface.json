@@ -401,6 +401,7 @@
   "pondra_catalog_records_total",
   "pondra_catalog_unflushed_seconds",
   "pondra_commit_ms",
+  "pondra_files_planned_from_footers_total",
   "pondra_files_scanned_total",
   "pondra_files_skipped_total",
   "pondra_hot_batches_skipped_total",
