@@ -67,7 +67,7 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
     if let Some(spec) = &meta.partition {
         f.part = partition(&md, &schema, meta, spec, &f.path, rows).await?;
     }
-    ((f.stats, f.bounds), f.nulls) = (crate::bounds::kept(&ranges, crate::format::typed(lake).await?), Some(nulls));
+    ((f.stats, f.bounds), f.nulls, f.sizes) = (crate::bounds::kept(&ranges, crate::format::typed(lake).await?), Some(nulls), crate::manifest::sizes(&md));
     Ok(f)
 }
 

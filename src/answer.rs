@@ -392,6 +392,65 @@ fn parquet(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     Ok(w.into_inner()?)
 }
 
+// ---------------------------------------------------------------- a cut answer
+//
+// A principal with `MAX_ROWS n` (step 6 piece 6b) is sent at most n rows of an answer: its plan is given a LIMIT of n + 1
+// (`App::run_query`), so the engine stops early, and the one more row says the answer was cut. Each door says so in its
+// own way: Arrow's and Flight's streams in their schema's metadata (`CUT`), the console's typed answer in a field, and
+// every door's notices (`cut_said`): HTTP's `x-pondra-notices` and `x-pondra-cut` headers, a WARNING on Postgres, MCP's
+// note.
+
+/// The schema metadata key of a cut answer: the rows it was cut at.
+pub const CUT: &str = "pondra.cut";
+
+/// `batches` with at most `n` rows: when they have more, their first n, each batch's schema saying it was cut (`CUT`), and
+/// true.
+pub fn cut(batches: Vec<RecordBatch>, n: u64) -> Result<(Vec<RecordBatch>, bool)> {
+    if batches.iter().map(|b| b.num_rows() as u64).sum::<u64>() <= n {
+        return Ok((batches, false));
+    }
+    let (mut left, mut out) = (n as usize, vec![]);
+    for b in batches {
+        if left == 0 {
+            break;
+        }
+        let b = b.slice(0, left.min(b.num_rows()));
+        left -= b.num_rows();
+        let mut said = b.schema().metadata().clone();
+        said.insert(CUT.to_string(), n.to_string());
+        let schema = Arc::new(Schema::new_with_metadata(b.schema().fields().clone(), said));
+        out.push(b.with_schema(schema)?);
+    }
+    Ok((out, true))
+}
+
+/// `schema` (a door's, announced before the rows), saying where the answer was cut when its batches say so (`CUT`).
+pub fn with_cut(schema: SchemaRef, batches: &[RecordBatch]) -> SchemaRef {
+    match batches.first().and_then(|b| b.schema_ref().metadata().get(CUT).cloned()) {
+        Some(n) => {
+            let mut said = schema.metadata().clone();
+            said.insert(CUT.to_string(), n);
+            Arc::new(Schema::new_with_metadata(schema.fields().clone(), said))
+        }
+        None => schema,
+    }
+}
+
+/// The rows an answer was cut at, from its schema (`CUT`).
+pub fn cut_at(schema: &Schema) -> Option<u64> { schema.metadata().get(CUT).and_then(|n| n.parse().ok()) }
+
+const CUT_WORDS: &str = "WARNING: the answer is cut at ";
+
+/// What a cut answer's notice says (`routines::heard`): a WARNING, which Postgres's door sends as one.
+pub fn cut_said(n: u64) -> String {
+    format!("{CUT_WORDS}{n} rows: MAX_ROWS {n} holds this user (an option of its own or of a role it holds). Ask for fewer rows: a filter, or a LIMIT")
+}
+
+/// The rows an answer was cut at, from the notices its statement said (`cut_said`).
+pub fn cut_heard(heard: &[String]) -> Option<u64> {
+    heard.iter().find_map(|n| n.strip_prefix(CUT_WORDS)?.split(' ').next()?.parse().ok())
+}
+
 /// The rows of an answer the console is sent at once, a page, unless it asks for another number
 /// (`?rows=`, its rows a page), at most `MOST`.
 pub const SHOWN: usize = 10_000;
@@ -419,7 +478,11 @@ pub fn typed(batches: &[RecordBatch], shown: usize, keep: Keep<'_>) -> anyhow::R
     let rows: Vec<Value> = objects.into_iter().map(|mut o| Value::Array((0..columns.len()).map(|i| o.remove(&i.to_string()).unwrap_or(Value::Null)).collect())).collect();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     let pages = keep(batches);
-    Ok(serde_json::to_vec(&j!({"columns": columns, "rows": rows, "total": total, "pages": pages}))?)
+    let mut answer = j!({"columns": columns, "rows": rows, "total": total, "pages": pages});
+    if let Some(n) = batches.first().and_then(|b| cut_at(b.schema_ref())) {
+        answer["cut"] = j!(n); // (`MAX_ROWS`: `cut`)
+    }
+    Ok(serde_json::to_vec(&answer)?)
 }
 
 /// A column as JavaScript can hold it exactly: decimals as their digits (`1.50`), and 64-bit
@@ -739,6 +802,25 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Fields};
     use datafusion::arrow::ipc::reader::StreamReader;
     use std::io::Cursor;
+
+    /// An answer cut at n rows (`MAX_ROWS`) keeps its first n, across batches, and its schema says where it was cut, as its
+    /// Arrow stream and its typed form do; one of n rows or fewer is as it was.
+    #[test]
+    fn a_cut_answer_keeps_its_first_rows_and_says_where() -> Result<()> {
+        let (whole, cut_off) = cut(vec![sample(2), sample(3)], 5)?;
+        assert!(!cut_off && whole.iter().all(|b| cut_at(b.schema_ref()).is_none()), "5 rows of 5: whole");
+        let (some, cut_off) = cut(vec![sample(2), sample(3)], 4)?;
+        assert!(cut_off);
+        assert_eq!(some.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), vec![2, 2]);
+        assert!(some.iter().all(|b| cut_at(b.schema_ref()) == Some(4)));
+        let read = StreamReader::try_new(Cursor::new(ipc(&some)?), None)?;
+        assert_eq!(read.schema().metadata().get(CUT).map(String::as_str), Some("4"), "an Arrow stream says it");
+        let typed: Value = serde_json::from_slice(&typed(&some, SHOWN, &|_| None)?)?;
+        assert_eq!((typed["cut"].as_u64(), typed["total"].as_u64()), (Some(4), Some(4)));
+        assert_eq!(cut_heard(&["a procedure's line".into(), cut_said(4)]), Some(4));
+        assert!(cut_said(4).starts_with("WARNING: "), "Postgres's door sends it as a WARNING");
+        Ok(())
+    }
 
     /// `rows` rows: an integer, a text (one value with a comma and a quote in it), a float with a null.
     fn sample(rows: usize) -> RecordBatch {

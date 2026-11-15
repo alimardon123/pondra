@@ -240,6 +240,11 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
 /// them (`change.rs`). Every other door's UPDATE or DELETE replaces or deletes rows by their key, unread (`writer::may`).
 fn may_in(who: &Principal, action: Action, object: Object, sql: bool) -> Result<(), Refusal> {
     let superuser = who.superuser();
+    // (READ ONLY, its own option or a role's: it reads, whatever it is granted. The session's temporary tables and its
+    // `$variables` write nothing to the lake and never ask (`may_run`); a CALL asks nothing itself, and its statements ask)
+    if who.scope.access.as_ref().is_some_and(|a| a.limits.read_only()) && !matches!(action, Action::Select | Action::SelectAll) {
+        return Err(Refusal::new(format!("permission denied: {} is READ ONLY (an option of its own or of a role it holds), so it may not {}", who.name, action.words())));
+    }
     // (a role first: a token's, a user's for what no grant names, and whoever isn't signed in, which sees nothing)
     let need = action.role();
     let token = who.scope.whole() || who.role == Role::None;
@@ -407,6 +412,10 @@ impl Scope {
 
     /// A user's own quota (`users::quota`); None: whole, which has none.
     pub fn limits(&self) -> Option<crate::users::Limits> { self.access.as_ref().map(|a| a.limits) }
+
+    /// The rows an answer sent to it may have (`MAX_ROWS`, the tightest of its own and its roles': step 6 piece 6b). None:
+    /// no limit, as for a superuser and the node.
+    pub fn max_rows(&self) -> Option<u64> { self.limits().and_then(|l| l.max_rows).filter(|n| *n > 0) }
 
     /// Everything: no grants narrow it.
     pub fn whole(&self) -> bool { self.access.is_none() }

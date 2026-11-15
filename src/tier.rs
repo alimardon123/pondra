@@ -1330,7 +1330,8 @@ impl Encoding {
         let buf = std::mem::take(w.inner_mut());
         let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(&footer), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
         let bytes = buf.len() as u64;
-        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, nulls, sketch, sys, ..Default::default() }))
+        let sizes = crate::manifest::sizes(&footer);
+        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, sizes, nulls, sketch, sys, ..Default::default() }))
     }
 
     /// The file finished and put in the table's folder, and its hot columns held there (a table whose
@@ -1356,6 +1357,7 @@ impl Encoding {
 /// among the stored ones (a renamed column keeps it), the rows' system columns 1,000,001 on.
 /// Readers that match a file's columns to the table's by id (Polars' `scan_iceberg`) need them.
 fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::SchemaRef) -> datafusion::arrow::datatypes::SchemaRef {
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY as ID;
     // (a table's: its column list's ids; a table an INSERT makes: its columns will be these, in this order)
     let list = meta.map(|m| m.column_list());
@@ -1367,11 +1369,24 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
         };
         own.or_else(|| crate::text::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i))
     };
+    // A list's elements have an id too, after every column's (`iceberg.rs`: `element-id`): a reader that matches a
+    // file's fields by id alone (DuckDB's `iceberg_scan`) reads a list whose elements have none as NULLs.
+    let columns = list.as_ref().map_or(made.len(), |l| l.all().len());
+    let element = |t: &DataType, id: usize| {
+        let with = |f: &FieldRef| std::sync::Arc::new(f.as_ref().clone().with_metadata([(ID.to_string(), id.to_string())].into()));
+        match t {
+            DataType::List(f) => DataType::List(with(f)),
+            DataType::LargeList(f) => DataType::LargeList(with(f)),
+            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(with(f), *n),
+            t => t.clone(),
+        }
+    };
     let fields: Vec<_> = schema.fields().iter().map(|f| match id(f.name()) {
         Some(i) => {
             let mut m = f.metadata().clone();
             m.insert(ID.to_string(), i.to_string());
-            std::sync::Arc::new(f.as_ref().clone().with_metadata(m))
+            let t = if i <= columns { element(f.data_type(), columns + i) } else { f.data_type().clone() };
+            std::sync::Arc::new(f.as_ref().clone().with_metadata(m).with_data_type(t))
         }
         None => f.clone(),
     }).collect();

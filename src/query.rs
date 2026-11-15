@@ -1147,6 +1147,18 @@ pub async fn when_handed() {
     }
 }
 
+/// `plan` with a LIMIT of `cap` + 1 above it (`MAX_ROWS`: `App::run_query`), so the engine stops at the row that says the
+/// answer is cut. A plan that isn't a query's (a statement's, a write's) is as it is.
+pub fn capped(plan: datafusion::logical_expr::LogicalPlan, cap: Option<u64>) -> Result<datafusion::logical_expr::LogicalPlan> {
+    use datafusion::logical_expr::LogicalPlan as P;
+    match cap {
+        Some(n) if !matches!(plan, P::Dml(_) | P::Ddl(_) | P::Statement(_) | P::Copy(_) | P::Explain(_) | P::Analyze(_) | P::DescribeTable(_)) => {
+            Ok(datafusion::logical_expr::LogicalPlanBuilder::from(plan).limit(0, Some(usize::try_from(n).unwrap_or(usize::MAX - 1) + 1))?.build()?)
+        }
+        _ => Ok(plan),
+    }
+}
+
 /// The size from which a query's answer goes to its door in pieces (`PONDRA_STREAM_MB`, 8 MB of Arrow), read
 /// once. 0 sends every answer in pieces (the tests compare the two ways).
 pub fn stream_bytes() -> usize {
@@ -2071,6 +2083,29 @@ impl Lake {
 
 #[cfg(test)]
 mod tests {
+
+    /// A capped plan (`MAX_ROWS`) gives one row more than its cap, so its answer is known to be cut; a cap past its rows
+    /// gives them all, and a statement's plan takes none.
+    #[tokio::test]
+    async fn a_capped_plan_stops_one_row_past_its_cap() -> anyhow::Result<()> {
+        use super::*;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let rows = |cap: Option<u64>, sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let state = ctx.state();
+                let plan = capped(state.create_logical_plan(sql).await?, cap)?;
+                let batches = datafusion::prelude::DataFrame::new(state, plan).collect().await?;
+                anyhow::Ok(batches.iter().map(|b| b.num_rows()).sum::<usize>())
+            }
+        };
+        assert_eq!(rows(Some(3), "SELECT v FROM generate_series(1, 100) AS g(v) ORDER BY v DESC").await?, 4);
+        assert_eq!(rows(Some(500), "SELECT v FROM generate_series(1, 100) AS g(v)").await?, 100);
+        assert_eq!(rows(None, "SELECT v FROM generate_series(1, 100) AS g(v)").await?, 100);
+        let set = ctx.state().create_logical_plan("SET datafusion.execution.batch_size = 100").await?;
+        assert!(matches!(capped(set, Some(3))?, datafusion::logical_expr::LogicalPlan::Statement(_)), "a statement's plan as it is");
+        Ok(())
+    }
 
     /// A view's partial DECIMAL sums add up in the type its table keeps, however many files and log rows it has: its sum
     /// keeps that type, and its average (`pondra_avg_of`) the query's places (11-08 audit M2; the train's `sums` found a
