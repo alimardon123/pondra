@@ -162,7 +162,7 @@ impl Layout {
     }
 
     /// A file's partition record, Avro-encoded, from its partition value (`DataFile::part`: the
-    /// text `tier::split` gives it).
+    /// text `partition::split` gives it).
     fn record(&self, part: &str) -> Result<Vec<u8>> {
         use datafusion::arrow::array::{AsArray, StringArray};
         use datafusion::arrow::datatypes::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType};
