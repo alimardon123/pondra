@@ -367,83 +367,9 @@ fn clock(us: u64) -> String {
     format!("{:02}:{:02}:{:02}{fraction}", us / 3_600_000_000, us / 60_000_000 % 60, us / 1_000_000 % 60)
 }
 
-/// Postgres's text array literal (`{a,"b,c",NULL}`): a bare NULL is a NULL element, a quoted one is text, a bare
-/// element is trimmed of its spaces, and `{}` has no elements. Nested braces are refused by name (0A000) for now.
-pub(crate) fn array_literal(s: &str) -> anyhow::Result<Vec<Option<String>>> {
-    let malformed = || crate::codes::coded("22P02", format!("malformed array literal: \"{s}\""));
-    let body = s.trim().strip_prefix('{').and_then(|b| b.strip_suffix('}')).ok_or_else(malformed)?;
-    let mut rest = body.trim_start();
-    let mut items = Vec::new();
-    if rest.is_empty() {
-        return Ok(items);
-    }
-    loop {
-        if rest.starts_with('{') {
-            return Err(crate::codes::coded("0A000", format!("nested array literals are not supported yet: \"{s}\"")));
-        }
-        let (item, after) = if rest.starts_with('"') { quoted_item(rest) } else { bare_item(rest) }.ok_or_else(malformed)?;
-        items.push(item);
-        let after = after.trim_start();
-        if after.is_empty() {
-            return Ok(items);
-        }
-        rest = after.strip_prefix(',').ok_or_else(malformed)?.trim_start();
-    }
-}
-
-/// A quoted element at the start of `s`, its escapes undone, and the text after its closing quote.
-fn quoted_item(s: &str) -> Option<(Option<String>, &str)> {
-    let mut out = String::new();
-    let mut chars = s[1..].char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => return Some((Some(out), &s[2 + i..])),
-            '\\' => out.push(chars.next()?.1),
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-/// A bare element at the start of `s`: up to the next comma, trimmed, with `\x` read as `x`. A bare NULL is NULL,
-/// and an empty element (`{a,,b}`) is malformed.
-fn bare_item(s: &str) -> Option<(Option<String>, &str)> {
-    let mut end = s.len();
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            ',' => {
-                end = i;
-                break;
-            }
-            _ => {}
-        }
-    }
-    let raw = s[..end].trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let item = if raw.eq_ignore_ascii_case("NULL") { None } else { Some(unescaped(raw)) };
-    Some((item, &s[end..]))
-}
-
-/// `s` with each `\x` read as `x`.
-fn unescaped(s: &str) -> String {
-    let mut out = String::new();
-    let mut escaped = false;
-    for c in s.chars() {
-        if c == '\\' && !escaped {
-            escaped = true;
-        } else {
-            out.push(c);
-            escaped = false;
-        }
-    }
-    out
-}
+/// Postgres's text array literal (`{a,"b,c",NULL}`), or pgvector's and DuckDB's list in brackets (`[1,2,3]`): every door's
+/// text of a list, so it is the engine's (`casts::list_literal`).
+pub(crate) use crate::casts::list_literal as array_literal;
 
 // ---- Array literals: a string cast to an array type is read as Postgres reads it (`'{a,b}'::text[]`) ----
 
@@ -489,7 +415,14 @@ fn array_text(e: &ast::Expr) -> Option<(String, ast::DataType)> {
     }
 }
 
-fn is_array(t: &ast::DataType) -> bool { matches!(t, ast::DataType::Array(_)) }
+/// An array type, or `VECTOR(n)` (spelled `REAL[n]` after this pass, by `friendly::vector`).
+fn is_array(t: &ast::DataType) -> bool {
+    match t {
+        ast::DataType::Array(_) => true,
+        ast::DataType::Custom(name, _) => name.to_string().eq_ignore_ascii_case("vector"),
+        _ => false,
+    }
+}
 
 fn string_of(e: &ast::Expr) -> Option<String> {
     match e {
@@ -552,6 +485,8 @@ mod tests {
         assert_eq!(rewritten(r#"SELECT TEXT[] '{a,"b,c",NULL}'"#), Ok((true, "SELECT CAST(make_array('a', 'b,c', NULL) AS TEXT[])".to_string())));
         assert_eq!(rewritten("SELECT '{}'::text[]"), Ok((true, "SELECT CAST(make_array() AS TEXT[])".to_string())), "an empty one");
         assert_eq!(rewritten("SELECT '{NULL}'::text[]"), Ok((true, "SELECT CAST(make_array(NULL) AS TEXT[])".to_string())));
+        assert_eq!(rewritten("SELECT '[1, 2,3]'::real[3]"), Ok((true, "SELECT CAST(make_array('1', '2', '3') AS REAL[3])".to_string())), "pgvector's and DuckDB's form");
+        assert_eq!(rewritten("SELECT '[1,2,3]'::vector(3)"), Ok((true, "SELECT CAST(make_array('1', '2', '3') AS vector(3))".to_string())), "a VECTOR's");
         assert_eq!(rewritten("SELECT '{it''s,\"x\\\"y\"}'::text[]"), Ok((true, "SELECT CAST(make_array('it''s', 'x\"y') AS TEXT[])".to_string())), "quotes and escapes");
     }
 
