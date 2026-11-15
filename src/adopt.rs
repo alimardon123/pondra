@@ -67,30 +67,36 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
     if let Some(spec) = &meta.partition {
         f.part = partition(&md, &schema, meta, spec, &f.path, rows).await?;
     }
-    ((f.stats, f.bounds), f.nulls) = (crate::bounds::kept(&ranges, crate::format::typed(lake).await?), Some(nulls));
+    ((f.stats, f.bounds), f.nulls, f.sizes) = (crate::bounds::kept(&ranges, crate::format::typed(lake).await?), Some(nulls), crate::manifest::sizes(&md));
     Ok(f)
 }
 
-/// The one partition value a file's rows hold (as `tier::split` names it), by its footer's range
-/// of the partition's column; a file holding more than one is refused by name.
+/// The one part a file's rows hold (as `partition::split` names it), by its footer's ranges of the partition's
+/// columns; a file holding more than one is refused by name, and so is any file of a table bucketed by a column: a
+/// bucket isn't in order with its column, so no range says which one the rows are in.
 async fn partition(md: &datafusion::parquet::file::metadata::ParquetMetaData, schema: &Schema, meta: &TableMeta, spec: &str, path: &str, rows: u64) -> Result<String> {
     use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
-    let col = spec.split_once('(').map_or(spec, |(_, c)| c.trim_end_matches(')')).trim();
+    let parsed = crate::partition::Spec::parse(spec)?;
+    ensure!(!parsed.fields.iter().any(|f| matches!(f.transform, crate::partition::Transform::Bucket(_))), "{path}: its footer can't say which bucket ({spec}) its rows are in; a bucketed table takes its rows with INSERT … SELECT");
     let list = meta.column_list();
-    let column = list.of_stored(col).context("the partition's column")?;
-    let (name, t) = (column.name.as_str(), crate::answer::dtype(&column.dtype)?);
-    let field = in_file(schema, column.id as i64, name).with_context(|| format!("{path}: it has no column {name}, which {spec} partitions by"))?;
-    let c = StatisticsConverter::try_new(field.name(), schema, md.file_metadata().schema_descr())?;
-    let nulls: u64 = c.row_group_null_counts(md.row_groups().iter())?.iter().flatten().sum();
-    if nulls == rows {
-        return Ok("null".into());
+    let (mut fields, mut values) = (vec![], vec![]);
+    for col in parsed.columns() {
+        let column = list.of_stored(col).context("the partition's column")?;
+        let (name, t) = (column.name.as_str(), crate::answer::dtype(&column.dtype)?);
+        let field = in_file(schema, column.id as i64, name).with_context(|| format!("{path}: it has no column {name}, which {spec} partitions by"))?;
+        let c = StatisticsConverter::try_new(field.name(), schema, md.file_metadata().schema_descr())?;
+        let nulls: u64 = c.row_group_null_counts(md.row_groups().iter())?.iter().flatten().sum();
+        let (lo, hi) = match nulls {
+            n if n == rows => (ScalarValue::try_from(&t)?, ScalarValue::try_from(&t)?),
+            0 => crate::manifest::from_footer(md, schema, field.name()).with_context(|| format!("{path}: its footer doesn't say which partition ({spec}) it holds"))?,
+            _ => anyhow::bail!("{path}: it holds rows of more than one partition ({spec}: {name} null and not); the table's partition spec, as it publishes it, puts each in a file of its own"),
+        };
+        values.push(datafusion::arrow::compute::cast(&ScalarValue::iter_to_array([lo, hi])?, &t)?);
+        fields.push(Field::new(col, t, true));
     }
-    let (lo, hi) = crate::manifest::from_footer(md, schema, field.name()).with_context(|| format!("{path}: its footer doesn't say which partition ({spec}) it holds"))?;
-    let values = ScalarValue::iter_to_array([lo, hi])?;
-    let values = datafusion::arrow::compute::cast(&values, &t)?;
-    let batch = datafusion::arrow::array::RecordBatch::try_new(std::sync::Arc::new(Schema::new(vec![Field::new(col, t, true)])), vec![values])?;
-    let parts: Vec<String> = crate::tier::split(spec, vec![batch]).await?.into_iter().map(|(p, _)| p).collect();
-    ensure!(parts.len() == 1 && nulls == 0, "{path}: it holds rows of more than one partition ({spec}: {}{}); the table's partition spec, as it publishes it, puts each in a file of its own", parts.join(", "), if nulls > 0 { ", null" } else { "" });
+    let batch = datafusion::arrow::array::RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), values)?;
+    let parts: Vec<String> = crate::partition::split(spec, vec![batch]).await?.into_iter().map(|(p, _)| p).collect();
+    ensure!(parts.len() == 1, "{path}: it holds rows of more than one partition ({spec}: {}); the table's partition spec, as it publishes it, puts each in a file of its own", parts.join(", "));
     Ok(parts.into_iter().next().expect("one"))
 }
 

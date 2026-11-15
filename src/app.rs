@@ -229,6 +229,9 @@ impl App {
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
         let explained = crate::explain::asked(query);
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
+        // (`MAX_ROWS`: the door's answer, at most this many rows, collected whole so its door can say it was cut before its
+        // first byte. Not a query inside another one, nor an INSERT's or a refresh's: those don't come here)
+        let cap = scope.max_rows().filter(|_| top);
         let run = async {
             let nodes = if spread == Some("0") || self.here_only_for(query, scope).await { vec![] } else { self.members.nodes() };
             // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
@@ -256,11 +259,12 @@ impl App {
                 crate::query::mark("parsed to logical plan");
                 let (state, logical) = df.into_parts();
                 let task = crate::query::task_with_peak(&state, peak)?;
+                let logical = crate::query::capped(logical, cap)?; // (one row more than it may have: it was cut, `answer::cut`)
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 crate::query::mark("optimized plan");
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
                 crate::query::mark("physical plan");
-                let out = if top { crate::query::collect_or_send(plan.clone(), task).await? } else { crate::query::collect(plan.clone(), task).await? };
+                let out = if top && cap.is_none() { crate::query::collect_or_send(plan.clone(), task).await? } else { crate::query::collect(plan.clone(), task).await? };
                 crate::query::mark("run to the end");
                 crate::history::planned(&logical, &plan, peak.peak_reserved()); // (its shape; a slow statement's plan, with what each operator did; what it learned; its cost)
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
@@ -291,6 +295,16 @@ impl App {
                 add(&m.spread, spread as u64);
                 crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
                 let batches = if explained { crate::explain::answered(batches)? } else { batches }; // (files as SQL named them: a node's EXPLAIN and a page's alike)
+                let batches = match cap {
+                    Some(n) => match crate::answer::cut(batches, n)? {
+                        (batches, true) => {
+                            crate::routines::heard(&crate::answer::cut_said(n)); // (said at every door: `answer::cut`)
+                            batches
+                        }
+                        (batches, false) => batches,
+                    },
+                    None => batches,
+                };
                 Ok(batches.into_iter().map(crate::answer::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {

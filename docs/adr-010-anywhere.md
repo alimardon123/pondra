@@ -153,7 +153,8 @@ Connect Claude Code with:
 
 ### 8. Vector search in SQL
 
-An embedding is a `FLOAT[]` (or `DOUBLE[]`) column. DataFusion's `cosine_distance`,
+An embedding is a `FLOAT[]` (or `DOUBLE[]`) column, or `VECTOR(n)` (pgvector's name for `FLOAT[n]`: every row's
+list has n numbers, and a list of another length is refused). DataFusion's `cosine_distance`,
 `inner_product` and `array_distance` give an exact nearest-neighbour search:
 
 ```sql

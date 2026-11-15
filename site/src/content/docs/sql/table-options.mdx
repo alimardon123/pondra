@@ -20,7 +20,7 @@ you get depends on the key:
 | Clause | For | Meaning |
 |---|---|---|
 | `PRIMARY KEY (a, b)` | keyed, merge | the key, as a column or table constraint |
-| `PARTITION BY col`, `PARTITION BY day(col)` | all | keep one partition per file. The units are `year`, `month`, `day` and `hour`, and need a timestamp or date column |
+| `PARTITION BY col`, `PARTITION BY (day(ts), bucket(16, id))` | all | keep one partition per file: one value of each field. A field is a column, the `year`, `month`, `day` or `hour` of a timestamp or date, `bucket(n, col)` (Iceberg's hash of the value, from 0 to n - 1) or `truncate(w, col)` (a number rounded down to a multiple of w, or text's first w characters) |
 | `CLUSTER BY (col1, col2)` | all | sort every file by these columns, so a filter on them skips most of a file; two or more follow a Hilbert curve |
 | `SEQUENCE BY col` | keyed | the row with the greatest value of this column wins, not the last to arrive |
 | `TTL col + INTERVAL '1 hour'` | keyed | a row whose timestamp or date column is older than that is gone |
@@ -37,7 +37,7 @@ it. In `CREATE TABLE t … AS SELECT …`, the clauses and `WITH` come before `A
 Each clause is also an option, for tools that write options: `partition_by = 'day(ts)'`,
 `cluster_by = 'a, b'`, `order_by = 'seen'`, `ttl = 'seen:3600'` (seconds) and
 `merge = 'amount:sum, n:count'`. Giving a clause and its option both is refused. Spark's
-`PARTITIONED BY (col)` is `PARTITION BY col`.
+`PARTITIONED BY (…)` is `PARTITION BY (…)`, and its `days(ts)` is `day(ts)`.
 
 Change a table's layout later with `ALTER TABLE t CLUSTER BY (a, b)`, `ALTER TABLE t TTL seen +
 INTERVAL '2 hours'` and `ALTER TABLE t SEQUENCE BY seen`, and its options with `ALTER TABLE t SET

@@ -1007,6 +1007,75 @@ mod tests {
         .await
     }
 
+    /// A table's files are planned from their catalog entries (step 5 piece 14b): no footer is read to plan a query over
+    /// them, and an aggregate their exact ranges answer reads no file at all. Here the files are gone from the store
+    /// after tiering: a plan of a filter still comes, and `min` and `max` of an integer column still answer. (A file
+    /// written before its entry kept its text columns' sizes is planned from its footer, as before.)
+    #[tokio::test]
+    async fn a_tables_files_are_planned_without_reading_a_footer() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            for sql in ["CREATE TABLE f (id BIGINT, v DOUBLE, s TEXT)", "INSERT INTO f SELECT value, value * 0.5, 's' || value FROM range(1, 1001)"] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            }
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("f")).await.unwrap().unwrap();
+            assert!(!meta.files.is_empty() && meta.files.iter().all(|f| f.sizes.get("s").is_some_and(|b| *b > 0)), "each file keeps its text's size");
+            for f in &meta.files {
+                lake.delete(&f.path).await;
+            }
+            let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
+            q("EXPLAIN SELECT id FROM f WHERE id > 500").await.expect("planned from the entries, no footer read");
+            let b = q("SELECT min(id), max(id) FROM f").await.expect("answered from the entries' exact ranges");
+            assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (1, 1000));
+            assert!(q("SELECT max(v) FROM f").await.is_err(), "a float's range leaves NaN out: its files are read");
+            // (and as a read with the memory columns off, or maintenance's, takes them: `query::files_once`)
+            let files: Vec<&crate::store::DataFile> = meta.files.iter().collect();
+            let read = crate::query::files_once(&lake, &lake.session(), &files, &meta, &meta.read_schema().unwrap()).await.expect("a read of the files");
+            read.create_physical_plan().await.expect("planned from the entries, no footer read");
+            assert_eq!(lake.node.metrics.footers_planned.load(std::sync::atomic::Ordering::Relaxed), 0, "no footer read to plan");
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A table partitioned by several fields, Iceberg's bucket among them (step 5, I3-a): each file holds one day and one
+    /// bucket of its rows, its part the two joined (`partition::split`), and its rows read back whole.
+    #[tokio::test]
+    async fn a_table_partitions_by_a_day_and_a_bucket() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            for sql in [
+                "CREATE TABLE p (id BIGINT, ts TIMESTAMP, s TEXT) WITH (partition_by = 'day(ts), bucket(4, id)')",
+                "INSERT INTO p SELECT value, to_timestamp_seconds(1794657600 + value * 3600), 's' || value FROM range(1, 41)",
+            ] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            }
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("p")).await.unwrap().unwrap();
+            let parts: std::collections::BTreeSet<&str> = meta.files.iter().map(|f| f.part.as_str()).collect();
+            assert!(parts.len() > 4 && parts.len() <= 12, "three days, four buckets: {parts:?}");
+            assert!(parts.iter().all(|p| p.split_once('/').is_some_and(|(day, b)| day.starts_with("2026-11-1") && b.parse::<u32>().is_ok_and(|b| b < 4))), "{parts:?}");
+            let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
+            let b = q("SELECT count(*), sum(id) FROM p").await.unwrap();
+            assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (40, 820));
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
     /// A table's JSON column is marked as one where queries plan over it (`TableMeta::read_schema`, step 5 piece 14c,
     /// E1): from its rows in memory and from its files, and through a view. Every write that
     /// reads the table back (an UPDATE, a DELETE, an INSERT … SELECT from itself, a CREATE TABLE AS, a tiering round, a

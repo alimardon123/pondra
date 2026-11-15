@@ -174,8 +174,10 @@ CREATE TABLE sessions (sid VARCHAR PRIMARY KEY, last_seen TIMESTAMP, page VARCHA
 
 Two clauses decide how a table's files are written, and they combine with a key.
 
-- **`PARTITION BY`** keeps one partition in each file: a column (`region`), or the year, month, day or
-  hour of a timestamp (`day(ts)`). A filter on it skips every other partition's files.
+- **`PARTITION BY`** keeps one partition in each file: a column (`region`), the year, month, day or
+  hour of a timestamp (`day(ts)`), or Iceberg's `bucket(16, id)` and `truncate(4, code)`, and several
+  of these at once (`PARTITION BY (day(ts), region)`). A filter on a column or a time skips every other
+  partition's files.
 - **`CLUSTER BY`** sorts each file by one or more columns, so a filter on them skips most of a file.
   With two or more columns the rows follow a Hilbert curve, so a filter on any one of them still skips
   most of a file.

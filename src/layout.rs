@@ -116,11 +116,11 @@ pub fn clauses(sql: &str) -> Result<Cow<'_, str>> {
         let stop = found.get(i + 1).map_or(end, |(_, n)| *n);
         let body = |skip: usize| if k + skip < stop { text.between(solid[k + skip], solid[stop - 1]) } else { "" };
         match *clause {
-            "PARTITION" => add("partition_by", partition_text(&expr(body(2))?))?,
-            "PARTITIONED" => {
-                let parts = exprs(body(2).trim().trim_start_matches('(').trim_end_matches(')'))?;
-                ensure!(parts.len() == 1, "PARTITIONED BY (…): one column, or day(ts): each file holds one partition");
-                add("partition_by", partition_text(&parts[0]))?;
+            "PARTITION" | "PARTITIONED" => {
+                // (fields: `day(ts)`, `(day(ts), bucket(16, id))`; each file holds one value of each)
+                let fields = body(2).trim();
+                let fields = fields.strip_prefix('(').and_then(|f| f.strip_suffix(')')).filter(|f| exprs(f).is_ok()).unwrap_or(fields);
+                add("partition_by", exprs(fields)?.iter().map(partition_text).collect::<Vec<_>>().join(", "))?;
             }
             "CLUSTER" => add("cluster_by", exprs(body(2))?.iter().flat_map(cluster_names).collect::<Vec<_>>().join(", "))?,
             "SEQUENCE" => add("order_by", column(&expr(body(2))?, "SEQUENCE BY")?)?,
@@ -287,6 +287,9 @@ mod tests {
             with("CREATE TABLE t (region VARCHAR PRIMARY KEY, amount DOUBLE MERGE sum, n BIGINT MERGE count)"),
             "CREATE TABLE t (region VARCHAR PRIMARY KEY, amount DOUBLE, n BIGINT) WITH (merge = 'amount:sum, n:count')"
         );
+        // (several fields, with Iceberg's bucket and truncate, as one spec)
+        assert_eq!(with("CREATE TABLE t (id BIGINT, ts TIMESTAMP) PARTITION BY (days(ts), bucket(16, id))"), "CREATE TABLE t (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'day(ts), bucket(16, id)')");
+        assert_eq!(with("CREATE TABLE t (id BIGINT, s TEXT) PARTITIONED BY (truncate(4, s))"), "CREATE TABLE t (id BIGINT, s TEXT) WITH (partition_by = 'truncate(4, s)')");
         assert_eq!(with("CREATE TABLE t CLUSTER BY a, b AS SELECT 1 AS a, 2 AS b"), "CREATE TABLE t WITH (cluster_by = 'a, b') AS SELECT 1 AS a, 2 AS b");
         assert_eq!(with("ALTER TABLE s TTL seen + INTERVAL 2 HOUR"), "ALTER TABLE s SET (ttl = 'seen:7200')");
         assert_eq!(with("ALTER TABLE s SEQUENCE BY seen;"), "ALTER TABLE s SET (order_by = 'seen')");

@@ -48,6 +48,15 @@ pub const LISTS: u32 = 6;
 /// and a file written before keeps them so until it is rewritten: every reader reads both (`bounds::Ranged`).
 pub const BOUNDS: u32 = 8;
 
+/// The format whose tables' columns keep a fixed-size list's size (`answer::fixed_name`: `FLOAT[3]`, `VECTOR(3)`), which a
+/// node from before reads as a list: format 8's, with `BOUNDS`.
+pub const FIXED: u32 = 8;
+
+/// Does a table made in this lake now keep a fixed-size list's size (`FIXED`)? A lake this process made does from its first
+/// statement: no release before has read it, and it starts at `FIXED` (`first`), which `raise` or `alone` commits as it
+/// opens, a moment after a program's or a page's first CREATE TABLE may come.
+pub async fn fixed(lake: &Lake) -> Result<bool> { Ok((lake.format.made && first() >= FIXED) || of(&lake.cat).await?.format >= FIXED) }
+
 /// Does a file written in this lake now keep its ranges typed (`BOUNDS`)?
 pub async fn typed(lake: &Lake) -> Result<bool> { Ok(of(&lake.cat).await?.format >= BOUNDS) }
 
@@ -322,6 +331,8 @@ mod tests {
         let new = Lake::open(h, true, false, crate::node_state::NodeState::unhosted()).await?;
         let old = Lake::open(b, true, false, crate::node_state::NodeState::unhosted()).await?;
         assert!(made(&new) && !made(&old));
+        // (a fixed-size list's size: kept in the lake made here before its format is committed, not in the other)
+        assert_eq!((fixed(&new).await?, fixed(&old).await?), (true, false), "FLOAT[3] keeps its size in the lake made here at once");
         alone(&new).await?;
         alone(&old).await?;
         assert_eq!((of(&new.cat).await?.format, of(&old.cat).await?.format), (BOUNDS, 5), "the lake made here moves on, the other stays");

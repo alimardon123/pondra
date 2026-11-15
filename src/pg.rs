@@ -748,7 +748,11 @@ impl Backend {
         };
         let (out, heard) = crate::panics::work(&self.app.lake.node, true, Box::pin(run)).await.unwrap_or_else(|m| (Err(self.err()(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
         for n in heard {
-            let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
+            let (severity, code, n) = match n.strip_prefix("WARNING: ") {
+                Some(w) => ("WARNING", "01000", w.to_string()), // (a cut answer's: `answer::cut_said`)
+                None => ("NOTICE", "00000", n),
+            };
+            let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new(severity.into(), code.into(), n).into())).await; // (a client gone: the answer fails too)
         }
         if trace() {
             eprintln!("pg told: {} µs: {}", t0.elapsed().as_micros(), sql.chars().take(60).collect::<String>());
@@ -1003,8 +1007,8 @@ impl Backend {
     async fn answer(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::app::Kept;
         let scope = self.signed().await?.scope; // (what its sign-in may read: planned for it, and its answer kept under its key)
-        let version = match crate::txn::open() {
-            true => None,
+        let version = match crate::txn::open() || scope.max_rows().is_some() {
+            true => None, // (a cut answer says so each time it is asked: `answer::cut`)
             false => self.app.remembers(sql, &scope).await,
         };
         let Some(version) = version else { return self.app.query(sql, None, &scope).await };
