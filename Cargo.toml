@@ -17,7 +17,7 @@ server = ["lake", "doors", "datafusion/compression"]
 # (designs/page-same-core.md §1). A page is to build it too: the deps here that a page can't build (SlateDB, moka,
 # aws-lc-rs, sysinfo, libc, tonic, tokio-rustls) go behind the platform layer, and `cargo check --no-default-features
 # --features lake` counts what is left.
-lake = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:toml", "dep:chrono-tz", "dep:postgres-types",
+lake = ["dep:http", "dep:slatedb", "dep:slatedb-common", "dep:reqwest", "tokio/full", "dep:toml", "dep:chrono-tz", "dep:postgres-types",
         "dep:zstd", "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:sysinfo", "dep:libc", "dep:moka",
         "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls", "dep:rustls-platform-verifier",
         "dep:sha1", "dep:sha2", "dep:hmac", "dep:subtle", "dep:getrandom", "dep:wasmtime"]
@@ -98,6 +98,7 @@ tokio = { version = "1", features = ["sync", "rt", "time", "test-util"] }
 # memory reading and no gRPC or TLS sockets (designs/page-same-core.md §5). Each is still `lake`'s, in `[features]`.
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)
 slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"], optional = true } # moka: in-memory block cache (foyer adds a disk tier we don't need)
+slatedb-common = { version = "0.16", default-features = false, optional = true } # (slatedb's own: its clock's trait, `kv::slate::Clock`)
 wasmtime = { version = "50", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "anyhow", "parallel-compilation"], optional = true } # extensions' WebAssembly parts, sandboxed (`wasm.rs`, ADR-075 §2); a page's host comes after 1.0
 moka = { version = "0.12.8", features = ["future"], optional = true } # (the catalog's block caches, as slatedb's own over the same moka, saying what they hold: `store::blocks`)
 # Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out

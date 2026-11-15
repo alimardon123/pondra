@@ -3683,6 +3683,7 @@ dependencies = [
  "sha1",
  "sha2 0.11.0",
  "slatedb",
+ "slatedb-common",
  "snap",
  "subtle",
  "sysinfo",
