@@ -28,8 +28,28 @@ pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     Ok(match (c.data_type(), t) {
         (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Timestamp(..)) => crate::casts::into(&with_seconds(c)?, t)?, // ('… 10:00')
         (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) => crate::casts::into(&bytea(c)?, t)?,
+        (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)) => crate::casts::into(&lists(c)?, t)?,
         _ => crate::casts::into(c, t)?,
     })
+}
+
+/// Text meant as lists, each read as a list's text (`casts::list_literal`): Postgres's `{1,2}`, or pgvector's and
+/// DuckDB's `[1,2,3]`, a VECTOR's text form. A list of text, which `casts::into` casts to the column's (refusing a list of
+/// another length for a VECTOR's, in pgvector's words). Arrow's cast made a list of one value of the whole text.
+fn lists(c: &ArrayRef) -> Result<ArrayRef> {
+    use datafusion::arrow::array::{ListBuilder, StringBuilder};
+    let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
+    let mut out = ListBuilder::new(StringBuilder::new());
+    for s in text.as_string::<i32>() {
+        match s {
+            Some(s) => {
+                out.values().extend(crate::casts::list_literal(s)?);
+                out.append(true);
+            }
+            None => out.append_null(),
+        }
+    }
+    Ok(Arc::new(out.finish()) as ArrayRef)
 }
 
 /// Text meant as a bytea's, read as Postgres reads it (`pg_bytea::parse`: the hex form `\x00ff` is the two bytes 00 ff, as
@@ -208,6 +228,27 @@ mod tests {
         let fields: Vec<Field> = names.iter().map(|n| Field::new(*n, if *n == "_deleted" { DataType::Boolean } else { DataType::Int32 }, true)).collect();
         let columns: Vec<ArrayRef> = names.iter().map(|n| -> ArrayRef { if *n == "_deleted" { Arc::new(BooleanArray::from(vec![false])) } else { Arc::new(Int32Array::from(vec![1])) } }).collect();
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("a row")
+    }
+
+    /// Text written into a list column is read as a list (Postgres's `{…}`, pgvector's and DuckDB's `[…]`), into a VECTOR's
+    /// only of its length, refused in pgvector's words otherwise.
+    #[test]
+    fn text_into_a_list_column_reads_as_a_list() {
+        use datafusion::arrow::util::display::array_value_to_string;
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some("[1,2,3]"), Some("{4, 5.5,6}"), None]));
+        let vector = DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, true)), 3);
+        let out = strict(&text, &vector).expect("three of each");
+        assert_eq!(out.data_type(), &vector);
+        let shown: Vec<String> = (0..3).map(|i| array_value_to_string(&out, i).unwrap()).collect();
+        assert_eq!(shown, ["[1.0, 2.0, 3.0]", "[4.0, 5.5, 6.0]", ""]);
+        let list = DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)));
+        let ints: ArrayRef = Arc::new(StringArray::from(vec!["{4, 5,NULL}"]));
+        assert_eq!(array_value_to_string(&strict(&ints, &list).unwrap(), 0).unwrap(), "[4, 5, ]", "a list of any length");
+        let short: ArrayRef = Arc::new(StringArray::from(vec!["[1,2]"]));
+        let e = anyhow::Error::from(strict(&short, &vector).unwrap_err());
+        assert_eq!((crate::codes::words(&e).as_str(), crate::codes::of(&e)), ("expected 3 dimensions, not 2", "22000"));
+        let bad: ArrayRef = Arc::new(StringArray::from(vec!["[1,2"]));
+        assert_eq!(crate::codes::of(&strict(&bad, &vector).unwrap_err()), "22P02", "malformed");
     }
 
     #[test]
