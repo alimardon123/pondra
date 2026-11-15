@@ -12547,6 +12547,243 @@ def max_rows():
     return f"max_rows: a MAX_ROWS cap cuts every door's answer and says so, the tightest option wins, and a bad option is refused, all {len(checks)} checks pass"
 
 
+def max_memory():
+    """A role or user option `MAX_MEMORY '<size>'` (`CREATE | ALTER USER | ROLE … MAX_MEMORY '16 MB'`, 0 lifts it): a user is
+    held to the tightest (smallest nonzero) of its own and its roles' MAX_MEMORY, a superuser to none. It caps what ALL of that
+    user's running statements on a node hold of query memory together: past it a sort spills to disk and still answers, and
+    anything else is refused 53200 (503 over HTTP) with `MAX_MEMORY <size>, which holds <user>`; a bad size is refused 22023.
+    pondra.users shows max_memory; pondra.history shows each statement's peak_memory."""
+    import base64, concurrent.futures, psycopg
+    import adbc_driver_flightsql.dbapi as adbc
+    lake = new_lake()
+    a = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", flight=f"127.0.0.1:{A.port + 30}", kafka=f"127.0.0.1:{A.port + 20}").start()
+    checks, info = {}, {"exceptions": []}
+    PW = "long enough pw"
+    MB16 = 16 * 1024 * 1024
+    SORT = "SELECT sum(r) AS s FROM (SELECT row_number() OVER (ORDER BY md5(v::text)) AS r FROM generate_series(1, 1000000) AS g(v)) AS q"
+    SUM = 500000500000
+    CAP64 = "MAX_MEMORY 64 KB, which holds ann"
+    SIZE_MSG = "MAX_MEMORY is a size: '2 GB' (or KB, MB, TB; 0: no limit)"
+    basic = lambda u: "Basic " + base64.b64encode(f"{u}:{PW}".encode()).decode()
+    ann, bob, boss = basic("ann"), basic("bob"), basic("boss")
+
+    def as_(auth, q, method="POST", path="/sql", timeout=30):
+        try:
+            return call(A.port, method, path, q.encode(), headers={"Authorization": auth} if auth else {}, timeout=timeout)
+        except Exception as e:
+            return f"ERROR {e}"
+
+    def raw(auth, q, path="/sql"):
+        """(status, headers, body): the headers too, which `call` leaves out. A failed call answers (None, {}, b'')."""
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+        try:
+            c.request("POST", path, q.encode(), {"Authorization": auth} if auth else {})
+            r = c.getresponse()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+        except Exception as e:
+            info["exceptions"].append(f"{path} {q[:60]}: {e}"[:300])
+            return None, {}, b""
+        finally:
+            c.close()
+
+    def pg(user="ann", autocommit=True):
+        return psycopg.connect(host="127.0.0.1", port=A.port + 10, user=user, password=PW, dbname="lake", connect_timeout=10, autocommit=autocommit)
+
+    def pg_run(user, q):
+        """(sqlstate, text, rows) of a statement over Postgres as `user`: the error it raises (None, None when it answers), its rows."""
+        pc = None
+        try:
+            pc = pg(user)
+            cur = pc.execute(q)
+            return None, None, (cur.fetchall() if cur.description else None)
+        except psycopg.Error as e:
+            return e.sqlstate, str(e), None
+        finally:
+            if pc is not None:
+                pc.close()
+
+    def flight_run(user, q):
+        """(error text, rows) of a statement over Flight SQL as `user`: the error it raises (None when it answers), its row count."""
+        conn = adbc.connect(f"grpc://127.0.0.1:{A.port + 30}", db_kwargs={"username": user, "password": PW})
+        try:
+            cur = conn.cursor()
+            cur.execute(q)
+            return None, cur.fetch_arrow_table().num_rows
+        except Exception as e:
+            return str(e), None
+        finally:
+            conn.close()
+
+    def jload(b):
+        try:
+            return json.loads(b)
+        except Exception:
+            return None
+
+    def mem_of(q_rows):
+        """name -> max_memory from a pondra.users answer."""
+        return {r.get("name"): r.get("max_memory") for r in q_rows} if isinstance(q_rows, list) else {}
+
+    USERS = "SELECT name, max_memory FROM pondra.users WHERE name IN ('small', 'ann', 'bob') ORDER BY name"
+
+    # Setup as the admin, the way max_rows does it: the first answer (no sign-in) makes boss; everything else is boss's
+    as_(None, f"CREATE USER boss PASSWORD '{PW}' SUPERUSER")
+    until(lambda: as_(boss, "SELECT 1 AS x"), [{"x": 1}], 10)
+    setup = [as_(boss, q) for q in [
+        "CREATE ROLE small MAX_MEMORY '16 MB'",
+        f"CREATE USER ann PASSWORD '{PW}'",
+        f"CREATE USER bob PASSWORD '{PW}'",
+        "GRANT small TO ann"]]
+    checks["as a superuser, role small with MAX_MEMORY '16 MB' is made, users ann and bob are made, and ann holds small"] = \
+        all("ERROR" not in str(r) for r in setup)
+    info["setup"] = setup
+
+    try:
+        users = as_(boss, USERS)
+        info["users"] = users
+        mem = mem_of(users)
+        checks["pondra.users shows max_memory: small 16 MB, and ann and bob none"] = \
+            mem.get("small") == "16 MB" and mem.get("ann") is None and mem.get("bob") is None
+    except Exception as e:
+        info["exceptions"].append(f"users: {e}"[:300])
+
+    # Under its cap a sort spills and answers; bob, with no cap, answers the same
+    try:
+        s_ann = as_(ann, SORT, timeout=60)
+        info["sort_ann"] = s_ann
+        checks["over HTTP, ann runs the sort and answers s 500000500000: it spills under its 16 MB cap"] = s_ann == [{"s": SUM}]
+    except Exception as e:
+        info["exceptions"].append(f"sort ann: {e}"[:300])
+    try:
+        s_bob = as_(bob, SORT, timeout=60)
+        info["sort_bob"] = s_bob
+        checks["over HTTP, bob runs the same sort and answers s 500000500000"] = s_bob == [{"s": SUM}]
+    except Exception as e:
+        info["exceptions"].append(f"sort bob: {e}"[:300])
+
+    # pondra.history: the peak each statement held. Rows appear a moment after the statement, so poll
+    def peaks():
+        rows = as_(boss, "SELECT \"user\", peak_memory FROM pondra.history WHERE statement LIKE '%row_number() OVER (ORDER BY md5%' AND outcome = 'ok'")
+        out = {}
+        for r in rows if isinstance(rows, list) else []:
+            out.setdefault(r.get("user"), []).append(r.get("peak_memory"))
+        return out
+
+    try:
+        until(lambda: all(u in peaks() for u in ("ann", "bob")), True, 20)
+        pk = peaks()
+        info["peaks"] = pk
+        checks["pondra.history: ann's sort peak_memory is at most 16 MB, held under its cap"] = \
+            bool(pk.get("ann")) and all(p is not None and p <= MB16 for p in pk["ann"])
+        checks["pondra.history: bob's sort peak_memory is more than 16 MB, since bob has no cap"] = \
+            bool(pk.get("bob")) and all(p is not None and p > MB16 for p in pk["bob"])
+    except Exception as e:
+        info["exceptions"].append(f"history: {e}"[:300])
+
+    # Two sorts of ann's at once: each under the cap, both answer
+    try:
+        with concurrent.futures.ThreadPoolExecutor(2) as ex:
+            twice = [f.result() for f in [ex.submit(as_, ann, SORT, timeout=60) for _ in range(2)]]
+        info["sort_ann_twice"] = twice
+        checks["ann runs the sort twice at once: both answer s 500000500000"] = twice == [[{"s": SUM}], [{"s": SUM}]]
+    except Exception as e:
+        info["exceptions"].append(f"sort ann twice: {e}"[:300])
+
+    # The cap lowered to 64 KB: ann is refused over HTTP (503), while bob, another user, still answers
+    try:
+        alter = as_(boss, "ALTER ROLE small MAX_MEMORY '64 KB'")
+        info["alter_64kb"] = alter
+        with concurrent.futures.ThreadPoolExecutor(2) as ex:
+            fa = ex.submit(raw, ann, SORT)
+            fb = ex.submit(as_, bob, SORT, timeout=60)
+            s6, h6, b6 = fa.result()
+            bob_now = fb.result()
+        text6 = (b6 or b"").decode(errors="replace")
+        info["ann_refused"] = {"status": s6, "body": text6[:400]}
+        checks["after ALTER ROLE small MAX_MEMORY '64 KB', ann's sort over HTTP is refused with status 503, the body saying MAX_MEMORY 64 KB, which holds ann"] = \
+            s6 == 503 and CAP64 in text6
+        info["bob_during"] = bob_now
+        checks["at the same time, bob's sort over HTTP answers s 500000500000: another user is not held to ann's cap"] = bob_now == [{"s": SUM}]
+    except Exception as e:
+        info["exceptions"].append(f"64 KB: {e}"[:300])
+
+    try:
+        st8, text8, _ = pg_run("ann", SORT)
+        info["pg_ann"] = [st8, text8]
+        checks["over Postgres as ann, the sort raises sqlstate 53200 with text MAX_MEMORY 64 KB, which holds ann"] = \
+            st8 == "53200" and CAP64 in (text8 or "")
+    except Exception as e:
+        info["exceptions"].append(f"pg ann: {e}"[:300])
+
+    try:
+        err9, _ = flight_run("ann", SORT)
+        info["flight_ann"] = err9
+        checks["over Flight SQL as ann, the sort raises an error whose text contains MAX_MEMORY 64 KB"] = \
+            err9 is not None and "MAX_MEMORY 64 KB" in err9
+    except Exception as e:
+        info["exceptions"].append(f"flight ann: {e}"[:300])
+
+    # A superuser takes none: boss, granted small, sorts under no cap
+    try:
+        grant = as_(boss, "GRANT small TO boss")
+        info["grant_boss"] = grant
+        s10 = as_(boss, SORT, timeout=60)
+        info["sort_boss"] = s10
+        checks["a superuser takes none: boss, granted small, runs the sort and answers s 500000500000"] = s10 == [{"s": SUM}]
+    except Exception as e:
+        info["exceptions"].append(f"boss sort: {e}"[:300])
+
+    # Refusals of a bad size, as boss: each names its fault in the text
+    try:
+        bad_1000 = raw(boss, "ALTER ROLE small MAX_MEMORY 1000")
+        bad_lots = raw(boss, "ALTER ROLE small MAX_MEMORY 'lots'")
+        info["refusals"] = {"1000": [bad_1000[0], (bad_1000[2] or b"")[:300].decode(errors="replace")],
+                            "lots": [bad_lots[0], (bad_lots[2] or b"")[:300].decode(errors="replace")]}
+        checks["ALTER ROLE small MAX_MEMORY 1000 is refused, the error saying MAX_MEMORY is a size: '2 GB' (or KB, MB, TB; 0: no limit)"] = \
+            SIZE_MSG in (bad_1000[2] or b"").decode(errors="replace")
+        checks["ALTER ROLE small MAX_MEMORY 'lots' is refused, the error saying MAX_MEMORY is a size: '2 GB' (or KB, MB, TB; 0: no limit)"] = \
+            SIZE_MSG in (bad_lots[2] or b"").decode(errors="replace")
+        st_lots, text_lots, _ = pg_run("boss", "ALTER ROLE small MAX_MEMORY 'lots'")
+        info["pg_lots"] = [st_lots, text_lots]
+        checks["over Postgres as boss, ALTER ROLE small MAX_MEMORY 'lots' is refused with sqlstate 22023 and the size text"] = \
+            st_lots == "22023" and SIZE_MSG in (text_lots or "")
+    except Exception as e:
+        info["exceptions"].append(f"refusals: {e}"[:300])
+
+    # Tightest wins: ann's own 1 GB against the role's 64 KB: still refused, naming the 64 KB
+    try:
+        as_(boss, "ALTER USER ann MAX_MEMORY '1 GB'")
+        mem12 = mem_of(as_(boss, USERS))
+        info["users_1gb"] = mem12
+        checks["ALTER USER ann MAX_MEMORY '1 GB': pondra.users shows ann 1 GB"] = mem12.get("ann") == "1 GB"
+        s12, h12, b12 = raw(ann, SORT)
+        text12 = (b12 or b"").decode(errors="replace")
+        info["ann_tightest"] = {"status": s12, "body": text12[:400]}
+        checks["tightest wins: ann's sort is still refused with status 503 naming MAX_MEMORY 64 KB, the role's being tighter than ann's 1 GB"] = \
+            s12 == 503 and CAP64 in text12
+    except Exception as e:
+        info["exceptions"].append(f"tightest: {e}"[:300])
+
+    # Lifting the role's option: small shows none, and ann (now under its own 1 GB) answers
+    try:
+        as_(boss, "ALTER ROLE small MAX_MEMORY 0")
+        mem13 = mem_of(as_(boss, USERS))
+        info["users_lifted"] = mem13
+        checks["ALTER ROLE small MAX_MEMORY 0: pondra.users shows small with no max_memory"] = "small" in mem13 and mem13["small"] is None
+        s13 = as_(ann, SORT, timeout=60)
+        info["sort_ann_lifted"] = s13
+        checks["ALTER ROLE small MAX_MEMORY 0: ann's sort answers s 500000500000, now under its own 1 GB"] = s13 == [{"s": SUM}]
+    except Exception as e:
+        info["exceptions"].append(f"lifted: {e}"[:300])
+
+    a.kill()
+    ok = all(v is True for v in checks.values()) and not info["exceptions"]
+    print(json.dumps({"max_memory": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"max_memory: a MAX_MEMORY cap holds a user's query memory across its statements, spills a sort or refuses the rest, the tightest option wins, a superuser takes none, and a bad size is refused, all {len(checks)} checks pass"
+
+
 def secrets():
     """Secrets (ADR-035 §3): each sealed with a data key of its own, which the master key wraps
     (the values never in the clear in the catalog); a user uses one only with USAGE on it; a
@@ -31552,7 +31789,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, row_filters, read_only, max_rows, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents, diffs, otherviews)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, row_filters, read_only, max_rows, max_memory, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents, diffs, otherviews)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -31753,7 +31990,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "diffs", "otherviews", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "row_filters", "read_only", "max_rows", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "diffs", "otherviews", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "row_filters", "read_only", "max_rows", "max_memory", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -31766,7 +32003,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "diffs": diffs, "otherviews": otherviews, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "row_filters": row_filters, "read_only": read_only, "max_rows": max_rows, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "diffs": diffs, "otherviews": otherviews, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "row_filters": row_filters, "read_only": read_only, "max_rows": max_rows, "max_memory": max_memory, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

@@ -862,77 +862,180 @@ impl MemoryPool for LakePool {
     fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.room(&self.part(), true, false)) }
 }
 
-/// The node's line a pool is on (`Ledger::line`): a lake's pool's, or a frugal retry's of one (`Halved`). None for a pool
+/// The node's line a pool is on (`Ledger::line`): a lake's pool's, or a capped one's over it (`Capped`). None for a pool
 /// of another kind.
 pub fn line_of(pool: &Arc<dyn MemoryPool>) -> Option<usize> {
-    match pool.downcast_ref::<Halved>() {
-        Some(halved) => line_of(&halved.inner),
+    match pool.downcast_ref::<Capped>() {
+        Some(capped) => line_of(&capped.inner),
         None => Some(pool.downcast_ref::<LakePool>()?.ledger().line()),
     }
 }
 
-/// A frugal retry's pool when the memory watch stopped its first try (`query::frugally`): the lake's, but held to half
-/// the room the first try had. The pool never refused that try, so the same pool would let the retry grow as far again,
-/// and be stopped again (11-08 audit H3); held to half, its spilling joins and sorts spill sooner.
+/// A pool held to a total of its own over another (the lake's), which still rules each grow: what its reservations hold
+/// together is counted in `holding`, and a grow past `most` is refused as the lake's pool refuses one, so a spilling operator
+/// spills and any other query stops (or runs again frugally, `query::frugally`). Within `most` the rules are the lake's
+/// (`FairSpillPool`'s): a spiller grows to its part of what can't spill leaves, so what can't (a sort's merge of its spills)
+/// finds the room it was promised and the others spill, where the first to grow would otherwise take it all. Two kinds:
+/// - `halved`: a frugal retry's when the memory watch stopped its first try. The pool never refused that try, so the same
+///   pool would let the retry grow as far again, and be stopped again (11-08 audit H3); held to half the room the first
+///   try had, its spilling joins and sorts spill sooner.
+/// - `for_user`: a principal's statements on this node under `MAX_MEMORY` (step 6 piece 6c). Every statement of theirs
+///   counts in one `Holding` (`users::capped_session`), so it is their total across what they run at once, never per statement;
+///   a refusal names the option.
 #[derive(Debug)]
-pub struct Halved {
+pub struct Capped {
     inner: Arc<dyn MemoryPool>,
     most: usize,
-    held: AtomicUsize,
+    holding: Arc<Holding>,
+    user: Option<String>, // (whose `MAX_MEMORY` it is, which a refusal names; None: a halved retry's)
 }
 
-impl Halved {
-    pub fn new(inner: Arc<dyn MemoryPool>) -> Arc<Halved> {
+/// What a capped pool's reservations hold, counted as a lake's are (`Part`): its spillers, what they hold, and what can't
+/// spill. A principal's under `MAX_MEMORY` is one on this node, which all its statements share (`users::Memory`).
+#[derive(Debug, Default)]
+pub struct Holding(Mutex<Part>);
+
+impl Holding {
+    fn part(&self) -> std::sync::MutexGuard<'_, Part> { self.0.lock().unwrap_or_else(PoisonError::into_inner) }
+
+    /// What they hold together.
+    pub fn held(&self) -> usize {
+        let p = self.part();
+        p.spillable + p.unspillable
+    }
+}
+
+impl Capped {
+    pub fn halved(inner: Arc<dyn MemoryPool>) -> Arc<Capped> {
         let most = match inner.memory_limit() {
             MemoryLimit::Finite(room) => room / 2,
             _ => usize::MAX,
         };
-        Arc::new(Halved { inner, most, held: AtomicUsize::new(0) })
+        Arc::new(Capped { inner, most, holding: Default::default(), user: None })
+    }
+
+    /// `user`'s statements over `inner`, all of them together at most `most` bytes, counted in `holding` (theirs on this node).
+    pub fn for_user(inner: Arc<dyn MemoryPool>, most: usize, holding: Arc<Holding>, user: &str) -> Arc<Capped> {
+        Arc::new(Capped { inner, most, holding, user: Some(user.to_string()) })
+    }
+
+    /// The pool as a refusal names it.
+    fn said(&self, held: usize) -> String {
+        match &self.user {
+            None => format!("halved({} of {})", human_readable_size(self.most), self.inner.name()),
+            Some(user) => format!(
+                "MAX_MEMORY {}, which holds {} (an option of its own or of a role it holds): its running statements hold {} together",
+                size_text(self.most as u64),
+                if user.is_empty() { "this user" } else { user },
+                human_readable_size(held),
+            ),
+        }
     }
 }
 
-impl std::fmt::Display for Halved {
+/// Bytes as a size option says them: the largest unit that holds them whole (`2 GB`, `1536 MB`, `100 bytes`).
+pub fn size_text(n: u64) -> String {
+    let units = [(1u64 << 40, "TB"), (1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+    match units.iter().find(|(u, _)| n >= *u && n % u == 0) {
+        Some((u, name)) => format!("{} {name}", n / u),
+        None => format!("{n} bytes"),
+    }
+}
+
+/// A size as an option takes it (`MAX_MEMORY '2 GB'`): a number and a unit, with or without a space between them (`2GB`),
+/// KB, MB, GB or TB (each 1024 of the one before, as `PONDRA_MEMORY_GB` counts), or bytes; a fraction is taken (`1.5 GB`).
+/// Without a unit only 0, which is no size. None for anything else.
+pub fn size_of(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
+    let n: f64 = text[..split].parse().ok().filter(|n: &f64| n.is_finite())?;
+    let unit = match text[split..].trim().to_ascii_lowercase().as_str() {
+        "" if n == 0.0 => 1,
+        "b" | "byte" | "bytes" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1u64 << 40,
+        _ => return None,
+    };
+    Some((n * unit as f64) as u64)
+}
+
+impl std::fmt::Display for Capped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "halved({} of {}, {})", human_readable_size(self.held.load(Relaxed)), human_readable_size(self.most), self.inner)
+        let what = if self.user.is_some() { "max_memory" } else { "halved" };
+        write!(f, "{what}({} of {}, {})", human_readable_size(self.holding.held()), human_readable_size(self.most), self.inner)
     }
 }
 
-impl MemoryPool for Halved {
-    fn name(&self) -> &str { "halved" }
-    fn register(&self, c: &MemoryConsumer) { self.inner.register(c) }
-    fn unregister(&self, c: &MemoryConsumer) { self.inner.unregister(c) }
+impl MemoryPool for Capped {
+    fn name(&self) -> &str { "capped" }
+
+    fn register(&self, c: &MemoryConsumer) {
+        if c.can_spill() {
+            self.holding.part().spillers += 1;
+        }
+        self.inner.register(c)
+    }
+
+    fn unregister(&self, c: &MemoryConsumer) {
+        if c.can_spill() {
+            let mut p = self.holding.part();
+            p.spillers = p.spillers.saturating_sub(1);
+        }
+        self.inner.unregister(c)
+    }
 
     fn grow(&self, r: &MemoryReservation, additional: usize) {
-        self.held.fetch_add(additional, Relaxed);
+        *self.holding.part().of(r) += additional;
         self.inner.grow(r, additional)
     }
 
     fn shrink(&self, r: &MemoryReservation, shrink: usize) {
-        self.held.fetch_sub(shrink, Relaxed);
+        {
+            let mut p = self.holding.part();
+            let held = p.of(r);
+            *held = held.saturating_sub(shrink);
+        }
         self.inner.shrink(r, shrink)
     }
 
     fn try_grow(&self, r: &MemoryReservation, additional: usize) -> Result<()> {
-        let most = self.most;
-        if let Err(held) = self.held.fetch_update(Relaxed, Relaxed, |h| h.checked_add(additional).filter(|&t| t <= most)) {
-            return Err(DataFusionError::ResourcesExhausted(format!(
-                "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: halved({} of {})",
-                human_readable_size(additional),
-                r.consumer().name(),
-                human_readable_size(r.size()),
-                human_readable_size(most.saturating_sub(held)),
-                human_readable_size(most),
-                self.inner.name(),
-            )));
+        {
+            let mut p = self.holding.part();
+            let most = self.most;
+            // (as `LakePool::available` within `most`: a spiller to its part of what can't spill leaves, what can't to what all leave)
+            let available = match r.consumer().can_spill() {
+                true => most.saturating_sub(p.unspillable).checked_div(p.spillers).unwrap_or(most).saturating_sub(r.size()),
+                false => most.saturating_sub(p.unspillable + p.spillable),
+            };
+            if additional > available {
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {}",
+                    human_readable_size(additional),
+                    r.consumer().name(),
+                    human_readable_size(r.size()),
+                    human_readable_size(available),
+                    self.said(p.spillable + p.unspillable),
+                )));
+            }
+            *p.of(r) += additional;
         }
         self.inner.try_grow(r, additional).inspect_err(|_| {
-            self.held.fetch_sub(additional, Relaxed);
+            let mut p = self.holding.part();
+            let held = p.of(r);
+            *held = held.saturating_sub(additional);
         })
     }
 
-    fn reserved(&self) -> usize { self.held.load(Relaxed) }
+    /// What its own reservations hold (a principal's pool: every statement of theirs on this node).
+    fn reserved(&self) -> usize { self.holding.held() }
     fn memory_limit(&self) -> MemoryLimit {
-        if self.most == usize::MAX { self.inner.memory_limit() } else { MemoryLimit::Finite(self.most) }
+        match self.inner.memory_limit() {
+            MemoryLimit::Finite(room) => MemoryLimit::Finite(room.min(self.most)),
+            _ if self.most < usize::MAX => MemoryLimit::Finite(self.most),
+            other => other,
+        }
     }
 }
 
@@ -1267,11 +1370,11 @@ mod tests {
         drop(reader);
     }
 
-    /// A frugal retry the memory watch sent holds half the room its first try had (`Halved`, 11-08 audit H3).
+    /// A frugal retry the memory watch sent holds half the room its first try had (`Capped::halved`, 11-08 audit H3).
     #[test]
     fn a_halved_pool_refuses_past_half_the_room_and_gives_back_what_it_took() {
         let ledger = Ledger::new(100, usize::MAX);
-        let half: Arc<dyn MemoryPool> = Halved::new(ledger.pool());
+        let half: Arc<dyn MemoryPool> = Capped::halved(ledger.pool());
         let s = MemoryConsumer::new("s").with_can_spill(true).register(&half);
         s.try_grow(50).expect("half the room");
         assert!(s.try_grow(1).is_err(), "and no more");
@@ -1279,6 +1382,64 @@ mod tests {
         s.free();
         assert_eq!((half.reserved(), ledger.reserved()), (0, 0));
         assert!(matches!(half.memory_limit(), MemoryLimit::Finite(50)));
+    }
+
+    /// A principal's statements under `MAX_MEMORY` hold one total (`Capped::for_user`): what one holds the other can't
+    /// take, a refusal names the option, and the lake's other queries aren't held to it.
+    #[test]
+    fn a_users_statements_hold_one_total_and_a_refusal_names_max_memory() {
+        let ledger = Ledger::new(1000, usize::MAX);
+        let lake: Arc<dyn MemoryPool> = ledger.pool();
+        let holding = Arc::new(Holding::default());
+        let one: Arc<dyn MemoryPool> = Capped::for_user(lake.clone(), 100, holding.clone(), "ann");
+        let two: Arc<dyn MemoryPool> = Capped::for_user(lake.clone(), 100, holding.clone(), "ann");
+        let a = MemoryConsumer::new("a").with_can_spill(true).register(&one);
+        let b = MemoryConsumer::new("b").register(&two);
+        a.try_grow(60).expect("within its 100");
+        let e = b.try_grow(60).expect_err("its other statement's 60 count");
+        assert!(e.to_string().contains("MAX_MEMORY 100 bytes, which holds ann"), "{e}");
+        assert!(matches!(e, DataFusionError::ResourcesExhausted(_)), "refused as the lake's pool refuses: a spiller spills");
+        b.try_grow(40).expect("what is left of its 100");
+        let other = MemoryConsumer::new("other").register(&lake);
+        other.try_grow(500).expect("another user's query isn't held to ann's");
+        assert_eq!((holding.held(), ledger.reserved()), (100, 600));
+        drop(a);
+        assert_eq!((holding.held(), ledger.reserved()), (40, 540), "a statement that ends gives its part back");
+        assert!(matches!(one.memory_limit(), MemoryLimit::Finite(100)));
+    }
+
+    /// Within its cap a principal's pool shares as the lake's does (`FairSpillPool`'s rules): a spiller grows to its part of
+    /// what can't spill leaves, so a sort's merge, which can't spill, finds room beside the other sorts, where the first to
+    /// grow would take it all (`tools/harness.py max_memory`: a sort that spills under 16 MB).
+    #[test]
+    fn within_max_memory_a_spiller_grows_to_its_part_and_a_merge_finds_room() {
+        let ledger = Ledger::new(1000, usize::MAX);
+        let ann: Arc<dyn MemoryPool> = Capped::for_user(ledger.pool(), 100, Default::default(), "ann");
+        let merge = MemoryConsumer::new("merge").register(&ann);
+        merge.try_grow(20).expect("kept aside to merge");
+        let a = MemoryConsumer::new("a").with_can_spill(true).register(&ann);
+        let b = MemoryConsumer::new("b").with_can_spill(true).register(&ann);
+        a.try_grow(40).expect("half of the 80 the merge leaves");
+        let e = a.try_grow(1).expect_err("and no more, though 40 are free: it spills");
+        assert!(matches!(e, DataFusionError::ResourcesExhausted(_)), "{e}");
+        b.try_grow(30).expect("the other's part");
+        merge.try_grow(10).expect("what the spillers leave, for the merge");
+        assert!(merge.try_grow(1).is_err(), "and not what they hold");
+        drop(b);
+        a.try_grow(30).expect("one spiller now: all that the merge leaves");
+        assert_eq!((ann.reserved(), ledger.reserved()), (100, 100));
+    }
+
+    /// A size option's text (`MAX_MEMORY '2 GB'`), and the size said back.
+    #[test]
+    fn a_size_is_a_number_and_a_unit() {
+        for (text, n) in [("2 GB", Some(2u64 << 30)), ("2GB", Some(2 << 30)), ("1.5 gb", Some(3 << 29)), ("512 MB", Some(512 << 20)), ("64kb", Some(64 << 10)), ("0", Some(0)), ("0 GB", Some(0))] {
+            assert_eq!(size_of(text), n, "{text}");
+        }
+        for text in ["1000", "2 GBs", "much", "", "-1 GB", "GB"] {
+            assert_eq!(size_of(text), None, "{text}: a number without a unit (bytes or MB?), or no size");
+        }
+        assert_eq!((size_text(2 << 30), size_text(1536 << 20), size_text(100)), ("2 GB".into(), "1536 MB".into(), "100 bytes".into()));
     }
 
     /// A cache inside the line that gives nothing back (a table's tail, the footers).
