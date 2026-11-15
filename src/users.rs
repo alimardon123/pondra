@@ -55,16 +55,36 @@ pub struct User {
     pub limits: Limits,
 }
 
-/// A user's quota, on each node: at most `max_queries` of its statements at once (the rest wait
-/// their turn, 30 s at most), each at most `timeout_secs` (`MAX_QUERIES 4`,
-/// `STATEMENT_TIMEOUT '5 minutes'`; 0 is none). Without its own: `PONDRA_USER_QUERIES`,
-/// `PONDRA_USER_TIMEOUT` (seconds). A superuser has none.
+/// A role's options, its guardrails (step 6 piece 6: an agent's are a role's): its quota on each node, at most
+/// `max_queries` of its statements at once (the rest wait their turn, 30 s at most), each at most `timeout_secs`
+/// (`MAX_QUERIES 4`, `STATEMENT_TIMEOUT '5 minutes'`; 0 is none), and `read_only` (`READ ONLY`: it reads, and writes
+/// nothing to the lake, whatever it is granted). Without its own: `PONDRA_USER_QUERIES`, `PONDRA_USER_TIMEOUT` (seconds).
+/// A principal is held to the tightest of its own, its roles' and public's (`tightest`); a superuser to none. None is
+/// unset, so a user with none sees no change.
 #[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Debug)]
 pub struct Limits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_queries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+impl Limits {
+    /// These and `other` together, the tightest of each: the smaller number, and READ ONLY if either is. A role's numbers
+    /// bind each member on its own: MAX_QUERIES counts a member's statements, never its role's together.
+    pub fn tightest(self, other: &Limits) -> Limits {
+        fn least<T: Ord + Copy + Default>(a: Option<T>, b: Option<T>) -> Option<T> { a.into_iter().chain(b).filter(|n| *n != T::default()).min() } // (0: none)
+        Limits {
+            max_queries: least(self.max_queries, other.max_queries),
+            timeout_secs: least(self.timeout_secs, other.timeout_secs),
+            read_only: (self.read_only == Some(true) || other.read_only == Some(true)).then_some(true),
+        }
+    }
+
+    /// Is it READ ONLY?
+    pub fn read_only(&self) -> bool { self.read_only == Some(true) }
 }
 
 /// A password as SCRAM-SHA-256 keeps it (RFC 5802, 7677): what checks it, never what makes it.
@@ -200,7 +220,16 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
             let name = plain(&w.name()?)?;
             w.is("with");
             let (mut verifier, mut superuser, mut login2, mut limits) = (None, None, None, Limits::default());
+            let mut said: Vec<&str> = vec![]; // (each option once: a second is a mistake, not a change of mind)
             while !w.0.is_empty() {
+                let option = ["password", "superuser", "nosuperuser", "login", "nologin", "max_queries", "statement_timeout", "read"].into_iter().find(|o| w.peek_word().as_deref() == Some(*o));
+                if let Some(o) = option {
+                    let same = |x: &str| x == o || [("superuser", "nosuperuser"), ("login", "nologin")].iter().any(|(a, b)| (x == *a && o == *b) || (x == *b && o == *a));
+                    if said.iter().any(|x| same(x)) {
+                        return Err(crate::codes::coded("42601", format!("{} is given twice: each option once", o.to_uppercase())));
+                    }
+                    said.push(o);
+                }
                 if w.is("password") {
                     let p = w.string()?;
                     ensure!(p.chars().count() >= 8, "a password has at least 8 characters");
@@ -220,6 +249,16 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
                         Some(W::Num(n)) => n.parse().map_err(|_| anyhow!("MAX_QUERIES is a whole number: 4 (0: no limit)"))?,
                         _ => bail!("MAX_QUERIES is a whole number: 4 (0: no limit)"),
                     });
+                } else if w.is("read") {
+                    limits.read_only = Some(if w.is("only") {
+                        true
+                    } else if w.is("write") {
+                        false
+                    } else {
+                        bail!("READ ONLY (it reads, and writes nothing to the lake, whatever it is granted) or READ WRITE {}", w.near())
+                    });
+                } else if w.is("max_model_calls") {
+                    return Err(crate::codes::coded("0A000", "MAX_MODEL_CALLS comes with ai_agent, in 1.1: a role's model calls aren't counted yet"));
                 } else if w.is("statement_timeout") {
                     w.sym('=');
                     limits.timeout_secs = Some(match w.next() {
@@ -231,7 +270,7 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
                         _ => bail!("STATEMENT_TIMEOUT '5 minutes' (or seconds, hours; 0: none)"),
                     });
                 } else {
-                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN, NOLOGIN, MAX_QUERIES n or STATEMENT_TIMEOUT '…' {}", w.near());
+                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN, NOLOGIN, MAX_QUERIES n, STATEMENT_TIMEOUT '…', READ ONLY or READ WRITE {}", w.near());
                 }
             }
             Ok(match verb.as_str() {
@@ -239,7 +278,7 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
                 _ => {
                     // (a usage error, 42601, as Postgres's syntax errors are: 11-08 audit M12)
                     if verifier.is_none() && superuser.is_none() && login2.is_none() && limits == Limits::default() {
-                        return Err(crate::codes::coded("42601", format!("ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN | MAX_QUERIES n | STATEMENT_TIMEOUT '…'")));
+                        return Err(crate::codes::coded("42601", format!("ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN | MAX_QUERIES n | STATEMENT_TIMEOUT '…' | READ ONLY | READ WRITE")));
                     }
                     Change::Alter { name, verifier, superuser, limits, login: login2 }
                 }
@@ -441,6 +480,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 return Ok(j!({"user": name, "unchanged": true}));
             }
             ensure!(name != "public", "public is every user: GRANT … TO public");
+            let limits = Limits { read_only: limits.read_only.filter(|r| *r), ..limits }; // (READ WRITE: as none)
             let u = User { login, verifier, superuser, created_ms: crate::log::now_ms(), limits, ..Default::default() };
             lake.cat.commit(vec![put(&name, &u)], &[]).await?;
             j!({ if login { "user" } else { "role" }: name })
@@ -458,6 +498,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             }
             if let Some(s) = limits.timeout_secs {
                 u.limits.timeout_secs = Some(s).filter(|s| *s > 0);
+            }
+            if let Some(r) = limits.read_only {
+                u.limits.read_only = Some(r).filter(|r| *r); // (READ WRITE: unset, as a user that never had it)
             }
             if let Some(s) = superuser {
                 u.superuser = s;
@@ -538,7 +581,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             }
             let mut puts = vec![];
             for n in &to {
-                let mut u = must(n, get(n).await?)?;
+                let mut u = grantee(lake, n).await?; // (public: made when first granted to, a role as a privilege)
                 for r in &roles {
                     ensure!(r != n && !member(lake, r, n, 0).await?, "{r} would then be a member of itself");
                     if !u.roles.contains(r) {
@@ -1188,7 +1231,7 @@ async fn token_principal(lake: &Lake, user: &str, until: Option<u64>) -> Option<
 pub struct Access {
     grants: Vec<Grant>,
     pub(crate) names: HashSet<String>, // (itself, its roles, public: whose grants they are; `rights::Scope::names`)
-    pub limits: Limits,     // (its own)
+    pub limits: Limits,     // (the tightest of its own, its roles' and public's: `Limits::tightest`)
     key: std::sync::OnceLock<String>, // (`key`: worked out once, at the first remembered answer)
 }
 
@@ -1347,6 +1390,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
             let mut todo = vec![("public".to_string(), None, false), (user.to_string(), Some(me.clone()), false)];
             todo.extend(claimed.iter().map(|r| (r.clone(), None, true)));
             let mut superuser = me.superuser;
+            let mut limits = Limits::default(); // (the tightest of its own, its roles' and public's: `Limits::tightest`)
             while let Some((n, u, claim)) = todo.pop() {
                 if seen.contains(&n) {
                     continue;
@@ -1363,17 +1407,19 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
                 }
                 let Some(u) = u else { continue };
                 superuser |= u.superuser && n != "public";
+                limits = limits.tightest(&u.limits);
                 grants.extend(u.grants.iter().cloned());
                 todo.extend(u.roles.iter().map(|r| (r.clone(), None, false)));
             }
-            let access = Arc::new(Access { grants, names: seen, limits: me.limits, ..Default::default() });
+            let access = Arc::new(Access { grants, names: seen, limits, ..Default::default() });
             if let Some(s) = &signs {
                 s.access.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
             }
             (access, superuser)
         }
     };
-    let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
+    // (READ ONLY: a reader's role, whatever it is granted; a superuser takes no option from a role or public)
+    let role = if superuser { Role::Admin } else if access.writes() && !access.limits.read_only() { Role::Write } else { Role::Read };
     Ok(Principal { name: user.to_string(), role, scope: if superuser { crate::rights::Scope::everything() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None, reads: false }.asking())
 }
 
@@ -1610,6 +1656,7 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         ("member_of", s(&|_, u| Some(u.roles.join(", ")).filter(|r| !r.is_empty()))),
         ("max_queries", Arc::new(all.iter().map(|(_, u)| u.limits.max_queries.map(|n| n as i64)).collect::<datafusion::arrow::array::Int64Array>()) as ArrayRef),
         ("statement_timeout", s(&|_, u| u.limits.timeout_secs.map(span))),
+        ("read_only", Arc::new(all.iter().map(|(_, u)| Some(u.limits.read_only())).collect::<BooleanArray>()) as ArrayRef), // (its own: a role's reaches its members)
         ("created", Arc::new(all.iter().map(|(_, u)| (u.created_ms > 0).then_some(u.created_ms as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
     ])?;
     let rows: Vec<(String, &Grant)> = all.iter().flat_map(|(k, u)| u.grants.iter().map(move |g| (k[2..].to_string(), g))).collect();
@@ -1793,6 +1840,57 @@ mod tests {
                 _ => panic!("{sql}: not refused"),
             }
         }
+    }
+
+    /// A role's options (step 6 piece 6a): each once, READ ONLY or READ WRITE, MAX_MODEL_CALLS not yet; a member is held to
+    /// the tightest of its own, its roles' and public's; READ ONLY reads and writes nothing, whatever is granted, and READ
+    /// WRITE takes it back; a superuser takes none.
+    #[tokio::test]
+    async fn a_member_is_held_to_the_tightest_of_its_roles_options() -> Result<()> {
+        let said = |s: &str| match crate::write::parse(s) {
+            Some(crate::write::Stmt::Refused(code, e)) => format!("{code}: {e}"),
+            Some(crate::write::Stmt::Invalid(e)) => e,
+            Some(_) => "ok".into(),
+            None => "none".into(),
+        };
+        assert_eq!(said("CREATE ROLE agent READ ONLY MAX_QUERIES 2"), "ok");
+        assert_eq!(said("ALTER USER bot WITH READ WRITE"), "ok");
+        assert_eq!(said("ALTER USER bot MAX_QUERIES 2 READ ONLY MAX_QUERIES 3"), "42601: MAX_QUERIES is given twice: each option once");
+        assert_eq!(said("ALTER USER bot LOGIN NOLOGIN"), "42601: NOLOGIN is given twice: each option once");
+        assert_eq!(said("ALTER USER bot MAX_MODEL_CALLS 10"), "0A000: MAX_MODEL_CALLS comes with ai_agent, in 1.1: a role's model calls aren't counted yet");
+        assert!(said("ALTER USER bot READ MOSTLY").contains("READ ONLY (it reads, and writes nothing to the lake, whatever it is granted) or READ WRITE"));
+        crate::auth::as_node(async move {
+            let dir = std::env::temp_dir().join(format!("pondra-role-options-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"]]}"#).await?;
+            for sql in ["CREATE ROLE agent READ ONLY MAX_QUERIES 2", "CREATE USER bot PASSWORD 'long enough' MAX_QUERIES 5 STATEMENT_TIMEOUT '1 minute'",
+                        "CREATE USER boss PASSWORD 'long enough' SUPERUSER", "GRANT agent TO bot", "GRANT agent TO boss", "GRANT SELECT, INSERT ON t TO bot",
+                        "CREATE ROLE slow STATEMENT_TIMEOUT '10 seconds'", "GRANT slow TO public"] {
+                let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(sql) else { panic!("{sql}") };
+                for d in ds {
+                    crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
+                }
+            }
+            let t = crate::rights::Object::Table("t");
+            let bot = principal(&lake, "bot").await?;
+            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(2), timeout_secs: Some(10), read_only: Some(true) }), "its role's 2, public's role's 10 s");
+            assert_eq!(bot.role, Role::Read, "a reader, though granted INSERT");
+            assert!(crate::rights::may(&bot, crate::rights::Action::Select, t).is_ok());
+            assert_eq!(crate::rights::may(&bot, crate::rights::Action::Insert, t).err().map(|r| r.text).as_deref(),
+                Some("permission denied: bot is READ ONLY (an option of its own or of a role it holds), so it may not write"));
+            assert!(crate::rights::may(&bot, crate::rights::Action::Define, crate::rights::Object::Lake).is_err());
+            let boss = principal(&lake, "boss").await?;
+            assert!(boss.scope.limits().is_none() && crate::rights::may(&boss, crate::rights::Action::Insert, t).is_ok(), "a superuser takes no option from a role");
+            let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse("ALTER ROLE agent READ WRITE MAX_QUERIES 0") else { panic!() };
+            for d in ds {
+                crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
+            }
+            let bot = principal(&lake, "bot").await?;
+            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(5), timeout_secs: Some(10), read_only: None }), "READ WRITE and 0 take the role's back: its own 5");
+            assert!(bot.role == Role::Write && crate::rights::may(&bot, crate::rights::Action::Insert, t).is_ok());
+            anyhow::Ok(())
+        })
+        .await
     }
 
     #[tokio::test]
