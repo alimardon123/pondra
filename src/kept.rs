@@ -3,7 +3,7 @@
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
 //! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
-//! The names kept free for later (`CREATE TABLE … USING x`, `VECTOR(n)` and the other AI types) are refused here too, by name, and only a
+//! The names kept free for later (`CREATE TABLE … USING x`, `HALFVEC(n)` and the other AI types) are refused here too, by name, and only a
 //! statement that spells one of them is tokenised. The list also holds what Postgres has and Pondra doesn't yet: advisory
 //! locks, and LISTEN, UNLISTEN and NOTIFY. Migration tools send those first, so the answer says what to write instead. A
 //! function is looked for anywhere in a statement, but only one that spells `advisory`, `pg_notify` or a name of `FUNCTIONS`
@@ -15,12 +15,12 @@ use datafusion::sql::sqlparser::tokenizer::Token;
 
 /// What a table's `USING x` says, where a table is made; `{}` is the format named.
 const USING: &str = "CREATE TABLE … USING {}: tables kept in another format come with extensions (1.2); Pondra keeps its tables in its own lake, published as Delta or Iceberg with WITH (publish = …)";
-/// The types kept free for after 1.0 (ADR-051), each a word written before `(`, and what it says: a vector or a tensor is
-/// FLOAT[] until then. 1.1 gives them their meaning without changing what anything meant (designs/ai-data-plan.md).
+/// The types kept free for after 1.0 (ADR-051), each a word written before `(`, and what it says: a vector is VECTOR(n)
+/// (`friendly::vector`: FLOAT[n]) and a tensor FLOAT[] until then. 1.1 gives them their meaning without changing what
+/// anything meant (designs/ai-data-plan.md).
 const TYPES: &[(&str, &str)] = &[
-    ("vector", "VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"),
-    ("halfvec", "HALFVEC(n): half-precision vectors come with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"),
-    ("sparsevec", "SPARSEVEC(n): sparse vectors come with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"),
+    ("halfvec", "HALFVEC(n): half-precision vectors come with vector indexes (ADR-051, after 1.0); a vector is VECTOR(n) until then"),
+    ("sparsevec", "SPARSEVEC(n): sparse vectors come with vector indexes (ADR-051, after 1.0); a vector is VECTOR(n) until then"),
     ("tensor", "TENSOR(…): tensors come after 1.0 (ADR-051); a tensor is a FLOAT[] list until then"),
 ];
 /// The function names kept free for 1.1, and what each says. 1.1 gives each its meaning without changing what anything
@@ -113,7 +113,7 @@ pub fn refusal(sql: &str) -> Option<String> {
 /// and `CREATE TABLE … USING x` (`head` is the statement's first word). Read from the tokens, so a string or a join's
 /// `USING (id)` is not one. A statement that spells none, the common case, is not tokenised.
 fn type_kept(sql: &str, head: &str) -> Option<String> {
-    let typed = contains_ci(sql, "vec") || contains_ci(sql, "tensor"); // (vector, halfvec, sparsevec, tensor)
+    let typed = contains_ci(sql, "vec") || contains_ci(sql, "tensor"); // (halfvec, sparsevec, tensor)
     let using = head == "create" && contains_ci(sql, "using");
     if !typed && !using {
         return None;
@@ -331,8 +331,8 @@ mod tests {
         }
     }
 
-    /// `CREATE TABLE … USING x` names the format a table is kept in, and `VECTOR(n)` a column's or a cast's type: both
-    /// refused by name, with the words that say when they come.
+    /// `CREATE TABLE … USING x` names the format a table is kept in, and `HALFVEC(n)` a column's or a cast's type: both
+    /// refused by name, with the words that say when they come. `VECTOR(n)` is a type now (FLOAT[n]), not refused here.
     #[test]
     fn names_the_types_kept_free() {
         let using = "CREATE TABLE … USING delta: tables kept in another format come with extensions (1.2)";
@@ -340,10 +340,9 @@ mod tests {
         assert!(refusal("create or replace table if not exists t (a int) using Lance").unwrap().starts_with("CREATE TABLE … USING Lance: tables kept"));
         assert!(refusal("CREATE TABLE t USING parquet AS SELECT 1 AS a").unwrap().starts_with("CREATE TABLE … USING parquet: tables kept"));
         assert!(refusal("CREATE TABLE t (a INT) USING delta").unwrap().ends_with("published as Delta or Iceberg with WITH (publish = …)"));
-        let vector = "VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then";
-        assert_eq!(refusal("CREATE TABLE t (id INT, v VECTOR(3))").as_deref(), Some(vector));
-        assert_eq!(refusal("ALTER TABLE t ADD COLUMN v VECTOR(3)").as_deref(), Some(vector));
-        assert_eq!(refusal("SELECT CAST(x AS VECTOR(FLOAT, 3)) FROM t").as_deref(), Some(vector));
+        for sql in ["CREATE TABLE t (id INT, v VECTOR(3))", "ALTER TABLE t ADD COLUMN v VECTOR(3)", "SELECT CAST(x AS VECTOR(3)) FROM t"] {
+            assert!(refusal(sql).is_none(), "{sql}: VECTOR(n) is a type (FLOAT[n])");
+        }
         // (the AI types kept free too, designs/ai-data-plan.md)
         assert!(refusal("CREATE TABLE t (v HALFVEC(768))").unwrap().starts_with("HALFVEC(n): half-precision vectors come with vector indexes"));
         assert!(refusal("ALTER TABLE t ADD COLUMN v sparsevec(30000)").unwrap().starts_with("SPARSEVEC(n): sparse vectors"));

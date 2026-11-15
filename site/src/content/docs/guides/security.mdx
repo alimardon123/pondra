@@ -478,6 +478,26 @@ ran
 ran
 ```
 
+**`MAX_ROWS n`** holds each answer sent to a member to n rows: past them the answer is cut, and
+every door says so. Over HTTP the `x-pondra-cut` header names the rows it was cut at and a notice
+says why; Postgres sends a WARNING before the rows; an Arrow or Flight SQL stream's schema carries
+`pondra.cut`; MCP's answer has the notice. Only rows sent back are cut: an `INSERT … SELECT`, a
+`CREATE TABLE … AS` and a refresh run whole. A script under such a role sees a short answer, so it
+reads the header.
+
+```python
+admin.sql("ALTER ROLE agent READ WRITE MAX_ROWS 3")
+admin.sql("GRANT agent TO ann")
+answer = requests.post("http://localhost:8086/sql", data="SELECT v FROM generate_series(1, 10) AS g(v)",
+                       auth=("ann", "correct-horse-battery"))
+print(len(answer.json()), answer.headers["x-pondra-cut"])
+admin.sql("REVOKE agent FROM ann")
+```
+
+```text
+3 3
+```
+
 ## The audit log
 
 **`pondra.audit`** says who did what, through which door and from where, and what came of it.

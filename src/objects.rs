@@ -623,7 +623,9 @@ pub(crate) fn sql_type(t: &str) -> String {
             }
             D::Decimal128(p, s) | D::Decimal256(p, s) => format!("DECIMAL({p}, {s})"),
             D::Interval(_) => "INTERVAL".into(),
-            D::List(f) | D::LargeList(f) | D::FixedSizeList(f, _) => format!("{}[]", of(f.data_type())),
+            D::FixedSizeList(f, n) if *f.data_type() == D::Float32 => format!("VECTOR({n})"), // (FLOAT[n]: one spelling, pgvector's)
+            D::FixedSizeList(f, n) => format!("{}[{n}]", of(f.data_type())),
+            D::List(f) | D::LargeList(f) => format!("{}[]", of(f.data_type())),
             d => d.to_string(),
         }
     }

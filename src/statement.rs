@@ -263,6 +263,7 @@ pub(crate) async fn query<W: Wire>(app: &App, one: &str, how: &How<'_>, files: b
     // rights: a file here it reads is named in the statement as expanded, or in a view it reads, and
     // so never remembered.
     let remembered = match wire.kept_as() {
+        Some(_) if scope.max_rows().is_some() => None, // (a cut answer says so each time it is asked: `answer::cut`)
         Some(kept) => app.remembers(one, scope).await.map(|version| (kept, version)),
         None => None,
     };

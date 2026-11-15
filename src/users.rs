@@ -58,7 +58,8 @@ pub struct User {
 /// A role's options, its guardrails (step 6 piece 6: an agent's are a role's): its quota on each node, at most
 /// `max_queries` of its statements at once (the rest wait their turn, 30 s at most), each at most `timeout_secs`
 /// (`MAX_QUERIES 4`, `STATEMENT_TIMEOUT '5 minutes'`; 0 is none), and `read_only` (`READ ONLY`: it reads, and writes
-/// nothing to the lake, whatever it is granted). Without its own: `PONDRA_USER_QUERIES`, `PONDRA_USER_TIMEOUT` (seconds).
+/// nothing to the lake, whatever it is granted), and `max_rows` (`MAX_ROWS 1000`: an answer it is sent has at most that
+/// many rows, cut and said so: `App::run_query`). Without its own: `PONDRA_USER_QUERIES`, `PONDRA_USER_TIMEOUT` (seconds).
 /// A principal is held to the tightest of its own, its roles' and public's (`tightest`); a superuser to none. None is
 /// unset, so a user with none sees no change.
 #[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Debug)]
@@ -69,6 +70,8 @@ pub struct Limits {
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
 }
 
 impl Limits {
@@ -80,6 +83,7 @@ impl Limits {
             max_queries: least(self.max_queries, other.max_queries),
             timeout_secs: least(self.timeout_secs, other.timeout_secs),
             read_only: (self.read_only == Some(true) || other.read_only == Some(true)).then_some(true),
+            max_rows: least(self.max_rows, other.max_rows),
         }
     }
 
@@ -222,7 +226,7 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
             let (mut verifier, mut superuser, mut login2, mut limits) = (None, None, None, Limits::default());
             let mut said: Vec<&str> = vec![]; // (each option once: a second is a mistake, not a change of mind)
             while !w.0.is_empty() {
-                let option = ["password", "superuser", "nosuperuser", "login", "nologin", "max_queries", "statement_timeout", "read"].into_iter().find(|o| w.peek_word().as_deref() == Some(*o));
+                let option = ["password", "superuser", "nosuperuser", "login", "nologin", "max_queries", "statement_timeout", "read", "max_rows"].into_iter().find(|o| w.peek_word().as_deref() == Some(*o));
                 if let Some(o) = option {
                     let same = |x: &str| x == o || [("superuser", "nosuperuser"), ("login", "nologin")].iter().any(|(a, b)| (x == *a && o == *b) || (x == *b && o == *a));
                     if said.iter().any(|x| same(x)) {
@@ -249,6 +253,12 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
                         Some(W::Num(n)) => n.parse().map_err(|_| anyhow!("MAX_QUERIES is a whole number: 4 (0: no limit)"))?,
                         _ => bail!("MAX_QUERIES is a whole number: 4 (0: no limit)"),
                     });
+                } else if w.is("max_rows") {
+                    w.sym('=');
+                    limits.max_rows = Some(match w.next() {
+                        Some(W::Num(n)) => n.parse().map_err(|_| crate::codes::coded("22023", "MAX_ROWS is a whole number: 1000 (0: no limit)"))?,
+                        _ => return Err(crate::codes::coded("22023", "MAX_ROWS is a whole number: 1000 (0: no limit)")),
+                    });
                 } else if w.is("read") {
                     limits.read_only = Some(if w.is("only") {
                         true
@@ -270,7 +280,7 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
                         _ => bail!("STATEMENT_TIMEOUT '5 minutes' (or seconds, hours; 0: none)"),
                     });
                 } else {
-                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN, NOLOGIN, MAX_QUERIES n, STATEMENT_TIMEOUT '…', READ ONLY or READ WRITE {}", w.near());
+                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN, NOLOGIN, MAX_QUERIES n, STATEMENT_TIMEOUT '…', MAX_ROWS n, READ ONLY or READ WRITE {}", w.near());
                 }
             }
             Ok(match verb.as_str() {
@@ -278,7 +288,7 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
                 _ => {
                     // (a usage error, 42601, as Postgres's syntax errors are: 11-08 audit M12)
                     if verifier.is_none() && superuser.is_none() && login2.is_none() && limits == Limits::default() {
-                        return Err(crate::codes::coded("42601", format!("ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN | MAX_QUERIES n | STATEMENT_TIMEOUT '…' | READ ONLY | READ WRITE")));
+                        return Err(crate::codes::coded("42601", format!("ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN | MAX_QUERIES n | STATEMENT_TIMEOUT '…' | MAX_ROWS n | READ ONLY | READ WRITE")));
                     }
                     Change::Alter { name, verifier, superuser, limits, login: login2 }
                 }
@@ -480,7 +490,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 return Ok(j!({"user": name, "unchanged": true}));
             }
             ensure!(name != "public", "public is every user: GRANT … TO public");
-            let limits = Limits { read_only: limits.read_only.filter(|r| *r), ..limits }; // (READ WRITE: as none)
+            let limits = Limits { read_only: limits.read_only.filter(|r| *r), max_rows: limits.max_rows.filter(|n| *n > 0), ..limits }; // (READ WRITE, MAX_ROWS 0: as none)
             let u = User { login, verifier, superuser, created_ms: crate::log::now_ms(), limits, ..Default::default() };
             lake.cat.commit(vec![put(&name, &u)], &[]).await?;
             j!({ if login { "user" } else { "role" }: name })
@@ -501,6 +511,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             }
             if let Some(r) = limits.read_only {
                 u.limits.read_only = Some(r).filter(|r| *r); // (READ WRITE: unset, as a user that never had it)
+            }
+            if let Some(n) = limits.max_rows {
+                u.limits.max_rows = Some(n).filter(|n| *n > 0);
             }
             if let Some(s) = superuser {
                 u.superuser = s;
@@ -1657,6 +1670,7 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         ("max_queries", Arc::new(all.iter().map(|(_, u)| u.limits.max_queries.map(|n| n as i64)).collect::<datafusion::arrow::array::Int64Array>()) as ArrayRef),
         ("statement_timeout", s(&|_, u| u.limits.timeout_secs.map(span))),
         ("read_only", Arc::new(all.iter().map(|(_, u)| Some(u.limits.read_only())).collect::<BooleanArray>()) as ArrayRef), // (its own: a role's reaches its members)
+        ("max_rows", Arc::new(all.iter().map(|(_, u)| u.limits.max_rows.map(|n| n as i64)).collect::<datafusion::arrow::array::Int64Array>()) as ArrayRef),
         ("created", Arc::new(all.iter().map(|(_, u)| (u.created_ms > 0).then_some(u.created_ms as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
     ])?;
     let rows: Vec<(String, &Grant)> = all.iter().flat_map(|(k, u)| u.grants.iter().map(move |g| (k[2..].to_string(), g))).collect();
@@ -1858,12 +1872,13 @@ mod tests {
         assert_eq!(said("ALTER USER bot MAX_QUERIES 2 READ ONLY MAX_QUERIES 3"), "42601: MAX_QUERIES is given twice: each option once");
         assert_eq!(said("ALTER USER bot LOGIN NOLOGIN"), "42601: NOLOGIN is given twice: each option once");
         assert_eq!(said("ALTER USER bot MAX_MODEL_CALLS 10"), "0A000: MAX_MODEL_CALLS comes with ai_agent, in 1.1: a role's model calls aren't counted yet");
+        assert_eq!(said("ALTER ROLE agent MAX_ROWS 'many'"), "22023: MAX_ROWS is a whole number: 1000 (0: no limit)");
         assert!(said("ALTER USER bot READ MOSTLY").contains("READ ONLY (it reads, and writes nothing to the lake, whatever it is granted) or READ WRITE"));
         crate::auth::as_node(async move {
             let dir = std::env::temp_dir().join(format!("pondra-role-options-{}", uuid::Uuid::new_v4()));
             let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
             crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"]]}"#).await?;
-            for sql in ["CREATE ROLE agent READ ONLY MAX_QUERIES 2", "CREATE USER bot PASSWORD 'long enough' MAX_QUERIES 5 STATEMENT_TIMEOUT '1 minute'",
+            for sql in ["CREATE ROLE agent READ ONLY MAX_QUERIES 2 MAX_ROWS 100", "CREATE USER bot PASSWORD 'long enough' MAX_QUERIES 5 STATEMENT_TIMEOUT '1 minute' MAX_ROWS 500",
                         "CREATE USER boss PASSWORD 'long enough' SUPERUSER", "GRANT agent TO bot", "GRANT agent TO boss", "GRANT SELECT, INSERT ON t TO bot",
                         "CREATE ROLE slow STATEMENT_TIMEOUT '10 seconds'", "GRANT slow TO public"] {
                 let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(sql) else { panic!("{sql}") };
@@ -1873,7 +1888,7 @@ mod tests {
             }
             let t = crate::rights::Object::Table("t");
             let bot = principal(&lake, "bot").await?;
-            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(2), timeout_secs: Some(10), read_only: Some(true) }), "its role's 2, public's role's 10 s");
+            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(2), timeout_secs: Some(10), read_only: Some(true), max_rows: Some(100) }), "its role's 2 and 100 rows, public's role's 10 s");
             assert_eq!(bot.role, Role::Read, "a reader, though granted INSERT");
             assert!(crate::rights::may(&bot, crate::rights::Action::Select, t).is_ok());
             assert_eq!(crate::rights::may(&bot, crate::rights::Action::Insert, t).err().map(|r| r.text).as_deref(),
@@ -1881,12 +1896,12 @@ mod tests {
             assert!(crate::rights::may(&bot, crate::rights::Action::Define, crate::rights::Object::Lake).is_err());
             let boss = principal(&lake, "boss").await?;
             assert!(boss.scope.limits().is_none() && crate::rights::may(&boss, crate::rights::Action::Insert, t).is_ok(), "a superuser takes no option from a role");
-            let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse("ALTER ROLE agent READ WRITE MAX_QUERIES 0") else { panic!() };
+            let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse("ALTER ROLE agent READ WRITE MAX_QUERIES 0 MAX_ROWS 0") else { panic!() };
             for d in ds {
                 crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
             }
             let bot = principal(&lake, "bot").await?;
-            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(5), timeout_secs: Some(10), read_only: None }), "READ WRITE and 0 take the role's back: its own 5");
+            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(5), timeout_secs: Some(10), read_only: None, max_rows: Some(500) }), "READ WRITE and 0 take the role's back: its own 5 and 500 rows");
             assert!(bot.role == Role::Write && crate::rights::may(&bot, crate::rights::Action::Insert, t).is_ok());
             anyhow::Ok(())
         })

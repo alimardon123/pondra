@@ -57,7 +57,7 @@ pub(crate) fn passes() -> Vec<crate::passes::Pass> {
         "object_construct", "isnull", "charindex", "convert", "try_convert", "getdate", "sysdatetime", "eomonth", "datepart", "curdate", "unix_timestamp", "unix_seconds", "timestamp_seconds",
         "str_to_date", "date_format", "timestampdiff", "countif", "date", "date_trunc", "timestamp_trunc", "datetime_trunc", "timestamp_diff", "datetime_diff", "format_date", "format_timestamp",
         "format_datetime", "parse_date", "parse_timestamp", "parse_datetime", "transform", "format", "top", "int64", "float64", "number", "byteint", "within", "safe", "materialized",
-        "timestamp_ntz", "time",
+        "timestamp_ntz", "time", "vector",
     ];
     forms.extend(tables);
     vec![
@@ -131,7 +131,7 @@ fn wants_forms(sql: &str) -> bool {
     // DECLARE: `year`, `long` or `money` as a column's name sends a query through no parse)
     static TYPES: LazyLock<Regex> = LazyLock::new(|| {
         let names: Vec<&str> = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).collect();
-        let t = format!(r"(?:{}|timestamp_ntz|time\s+with\s+time\s+zone)", names.join("|"));
+        let t = format!(r"(?:{}|timestamp_ntz|time\s+with\s+time\s+zone|vector)", names.join("|")); // (and pgvector's VECTOR(n): `vector`)
         Regex::new(&format!(r"(?i)(?:\bas\s+|::\s*){t}\b|\b{t}\s*'|(?:^|;)\s*(?:--[^\n]*\n\s*)*(?:create|alter|declare)\b[^;]*\b{t}\b")).expect("a regex")
     });
     // (another database's function Pondra refuses by name: the names `dialect_fns::OURS` lists, as calls)
@@ -1203,6 +1203,7 @@ fn spell(t: &mut DataType) -> Result<()> {
         DataType::Bit(_) => named("bit")?,
         DataType::BitVarying(_) => named("varbit")?,
         DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => named("timetz")?,
+        DataType::Custom(name, args) if name.to_string().eq_ignore_ascii_case("vector") => Some(vector(args)?),
         DataType::Custom(name, args) if args.is_empty() => named(&name.to_string())?,
         _ => None,
     };
@@ -1210,6 +1211,23 @@ fn spell(t: &mut DataType) -> Result<()> {
         *t = s;
     }
     Ok(())
+}
+
+/// pgvector's `VECTOR(n)`: `REAL[n]`, DuckDB's `FLOAT[n]`, one type (a lake at format 8 keeps its size: `answer::fixed_name`),
+/// n from 1 to 16000 as pgvector takes, refused in its words (22023); `VECTOR` alone is `REAL[]`, of any length.
+fn vector(args: &[String]) -> Result<DataType> {
+    let real = |n| DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(DataType::Real), n));
+    let refused = |m: String| Err(crate::codes::coded("22023", m));
+    match args {
+        [] => Ok(real(None)),
+        [n] => match n.trim().parse::<u64>() {
+            Ok(0) => refused("dimensions for type vector must be at least 1".into()),
+            Ok(n) if n > 16000 => refused("dimensions for type vector cannot exceed 16000".into()),
+            Ok(n) => Ok(real(Some(n))),
+            Err(_) => refused(format!("VECTOR({n}): its dimensions are a whole number, 1 to 16000")),
+        },
+        _ => refused(format!("VECTOR({}): one number, its dimensions (1 to 16000)", args.join(", "))),
+    }
 }
 
 /// A type as a routine's parameter or its RETURNS writes it (routines.rs keeps types as text), spelled as a column's

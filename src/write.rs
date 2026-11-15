@@ -125,8 +125,10 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
     let (retention, columns, ttl) = async {
         let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
-        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`).
-        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::type_name(&crate::answer::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
+        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`), and a fixed-size
+        // list keeps its size only where the lake does (format 8: `answer::fixed_name`).
+        let fixed = crate::format::fixed(lake).await?;
+        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::fixed_name(&crate::answer::dtype(t)?, fixed)))).collect::<Result<Vec<_>>>()?;
         let ttl = ttl.map(|t| -> Result<(String, u64)> {
             let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
             ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "TTL: a timestamp or date column of a keyed table");
@@ -882,7 +884,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
         }
         (None, None) => declared().await?,
     };
-    let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+    let fixed = crate::format::fixed(from).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
+    let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::fixed_name(f.data_type(), fixed))).collect();
     // (what the statement declares, read from its AST alone: `rules/create.rs`, refused in the order a node always has)
     let d = crate::rules::create::declared(c)?;
     if d.keyed() && !columns.iter().any(|(c, _)| c == "_deleted") {
@@ -981,10 +984,11 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
                 Ok(t) => crate::rules::create::sql_type(t)?,
                 Err(_) => None,
             };
+            let fixed = crate::format::fixed(lake).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.to_columns();
-            columns.push((column.to_string(), crate::answer::type_name(ctx.table("t").await?.schema().field(0).data_type())));
+            columns.push((column.to_string(), crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed)));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
                 spec["enums"] = j!({column: e});
@@ -2858,6 +2862,33 @@ mod section {
         ] {
             assert_eq!(shown(&super::parse(sql)), format!("invalid {said}"), "{sql}");
         }
+    }
+
+    /// The repository's statements of the families the statements section reads by their words (SECRET, FUNCTION, MACRO,
+    /// TASK, COPY, ATTACH, EXTERNAL TABLE, and their DROP, ALTER and EXECUTE), each one text, as they read when the corpus
+    /// was kept: what each says, its refusal's form or SQLSTATE (11-10 audit L9: #761's differential test, kept as a
+    /// fixture). `PONDRA_KEEP_CORPUS=1` keeps it again from the repository's texts, after a change meant to move them.
+    #[test]
+    fn every_text_of_the_corpus_reads_as_kept() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/statements/corpus.json");
+        if std::env::var_os("PONDRA_KEEP_CORPUS").is_some() {
+            let placeholder = regex::Regex::new(r"\{[\w:?#]*\}").expect("a regex"); // (a format string's `{}`: no SQL)
+            let family = regex::Regex::new(r"(?is)^\s*(?:(?:create|drop|alter|execute|show)\b[^;]{0,60}?\b(?:secret|function|macro|task|external\s+table)\b|copy\b|attach\b|detach\b)").expect("a regex");
+            let kept: std::collections::BTreeMap<String, String> = crate::passes::tests::texts("|backup|restore|export|import|undrop")
+                .into_iter()
+                .filter(|t| !placeholder.is_match(t) && family.is_match(t) && crate::routines::split(t).len() == 1)
+                .map(|t| {
+                    let said = shown(&super::parse(&t));
+                    (t, said)
+                })
+                .collect();
+            std::fs::create_dir_all(path.parent().expect("a folder")).expect("the folder");
+            std::fs::write(&path, serde_json::to_string_pretty(&kept).expect("JSON") + "\n").expect("the corpus written");
+        }
+        let kept: std::collections::BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(&path).expect("the corpus")).expect("its JSON");
+        let differ: Vec<_> = kept.iter().filter_map(|(sql, was)| Some((sql, was, shown(&super::parse(sql)))).filter(|(_, was, now)| was != &now)).collect();
+        assert!(differ.is_empty(), "{} of {} texts read otherwise than kept (text, kept, now): {differ:#?}", differ.len(), kept.len());
+        assert!(kept.len() > 100, "the corpus holds {} texts", kept.len());
     }
 }
 

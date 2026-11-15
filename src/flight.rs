@@ -557,6 +557,7 @@ where
 /// the schema and the end. An encoding error ends the stream with its status. `busy` is held until the stream ends or is
 /// dropped, as `piece_stream`'s is.
 fn whole(w: Worded, schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::node_state::Busy) -> Out<FlightData> {
+    let schema = crate::answer::with_cut(schema, &batches); // (a cut answer's stream says so: `MAX_ROWS`)
     // (at most one piece: the answer is encoded at once, its piece then its end, as the stream below writes them, and is
     // sent as those messages; an encoding error ends it after the messages before it, as the stream does)
     let mut pieces = crate::answer::pieces(batches.into_iter().map(|b| crate::answer::as_sent(b, Some("arrow"))));

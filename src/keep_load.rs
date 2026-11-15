@@ -197,6 +197,7 @@ fn entry(kept: Kept, typed: bool) -> Result<(Bytes, DataFile)> {
     let file = DataFile {
         rows,
         bytes: kept.bytes.len() as u64,
+        sizes: crate::manifest::sizes(&kept.footer),
         stats,
         bounds,
         nulls: Some(seen.nulls()),
