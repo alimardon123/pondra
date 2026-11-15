@@ -1007,6 +1007,39 @@ mod tests {
         .await
     }
 
+    /// A table's files are planned from their catalog entries (step 5 piece 14b): no footer is read to plan a query over
+    /// them, and an aggregate their exact ranges answer reads no file at all. Here the files are gone from the store
+    /// after tiering: a plan of a filter still comes, and `min` and `max` of an integer column still answer. (A file
+    /// written before its entry kept its text columns' sizes is planned from its footer, as before.)
+    #[tokio::test]
+    async fn a_tables_files_are_planned_without_reading_a_footer() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            for sql in ["CREATE TABLE f (id BIGINT, v DOUBLE, s TEXT)", "INSERT INTO f SELECT value, value * 0.5, 's' || value FROM range(1, 1001)"] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            }
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("f")).await.unwrap().unwrap();
+            assert!(!meta.files.is_empty() && meta.files.iter().all(|f| f.sizes.get("s").is_some_and(|b| *b > 0)), "each file keeps its text's size");
+            for f in &meta.files {
+                lake.delete(&f.path).await;
+            }
+            let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
+            q("EXPLAIN SELECT id FROM f WHERE id > 500").await.expect("planned from the entries, no footer read");
+            let b = q("SELECT min(id), max(id) FROM f").await.expect("answered from the entries' exact ranges");
+            assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (1, 1000));
+            assert!(q("SELECT max(v) FROM f").await.is_err(), "a float's range leaves NaN out: its files are read");
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
     /// A table's JSON column is marked as one where queries plan over it (`TableMeta::read_schema`, step 5 piece 14c,
     /// E1): from its rows in memory and from its files, and through a view. Every write that
     /// reads the table back (an UPDATE, a DELETE, an INSERT … SELECT from itself, a CREATE TABLE AS, a tiering round, a

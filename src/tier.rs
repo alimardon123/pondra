@@ -1330,7 +1330,8 @@ impl Encoding {
         let buf = std::mem::take(w.inner_mut());
         let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(&footer), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
         let bytes = buf.len() as u64;
-        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, nulls, sketch, sys, ..Default::default() }))
+        let sizes = crate::manifest::sizes(&footer);
+        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, sizes, nulls, sketch, sys, ..Default::default() }))
     }
 
     /// The file finished and put in the table's folder, and its hot columns held there (a table whose
