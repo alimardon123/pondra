@@ -3327,6 +3327,7 @@ python3 tools/harness.py measures       # measures in views: the query's own gra
 python3 tools/harness.py agents         # the agent benchmark without a model: each shop question's gold SQL on Pondra == DuckDB == Postgres as the scorer reads answers, the agent loop with a scripted model, and saved answers replayed (tools/agent_bench.py; a model run: agent-bench.yml)
 python3 tools/harness.py facts          # a view's PRIMARY KEY, UNIQUE and FOREIGN KEY NOT ENFORCED: parts, ALTER VIEW, SHOW CREATE again, OR REPLACE, Postgres's catalog, refusals
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
+python3 tools/random_views.py --rounds 300 # random writes under materialized views of each way they are kept (rows, by key, whole): each view == its query after every round (li1113/F3)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
