@@ -689,7 +689,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
 /// A job's rows as files, one a partition.
 async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<RecordBatch>, keys: &[String], ord: u64, whole: bool) -> Result<Vec<DataFile>> {
     let parts = match &meta.partition {
-        Some(spec) => split(spec, batches).await?,
+        Some(spec) => crate::partition::split(spec, batches).await?,
         None => vec![(String::new(), batches)],
     };
     let mut files = vec![];
@@ -711,46 +711,6 @@ pub async fn fold_into(from: &Lake, to: &Lake, table: &str, meta: &TableMeta, af
         false => (meta.key.clone(), latest(from, table, &{ let mut entry = meta.clone(); entry.files = vec![]; entry.tiered = after; entry }, upto, true, scope).await?),
     };
     write_parts(to, table, &meta, batches, &keys, upto, false).await
-}
-
-/// A partitioned table's rows, one group per partition value (`day(ts)`: the day, `col`: the value).
-pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
-    use datafusion::arrow::{array::{AsArray, UInt32Array}, compute::{concat_batches, take_record_batch}};
-    let Some(first) = batches.first() else { return Ok(vec![]) };
-    let all = concat_batches(&first.schema(), &batches)?;
-    let ctx = datafusion::prelude::SessionContext::new();
-    ctx.register_batch("t", all.clone())?;
-    let values = ctx.sql(&format!("SELECT {} FROM t", partition_expr(spec))).await?.collect().await?;
-    let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    let mut i = 0u32;
-    for b in &values {
-        let text = datafusion::arrow::compute::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
-        for v in text.as_string::<i32>().iter() {
-            groups.entry(v.unwrap_or("null").to_string()).or_default().push(i);
-            i += 1;
-        }
-    }
-    groups.into_iter().map(|(p, rows)| Ok((p, vec![take_record_batch(&all, &UInt32Array::from(rows))?]))).collect()
-}
-
-/// A partition spec as SQL: `day(ts)` → `date_trunc('day', "ts")`; a plain column → itself.
-pub fn partition_expr(spec: &str) -> String {
-    match spec.split_once('(').map(|(f, c)| (f.trim(), c.trim_end_matches(')').trim())) {
-        Some((unit @ ("year" | "month" | "day" | "hour"), col)) => format!("date_trunc('{unit}', \"{col}\")"),
-        _ => format!("\"{}\"", spec.trim()),
-    }
-}
-
-/// A partition spec is a column, or year/month/day/hour of a timestamp or date column.
-pub fn check_partition(spec: &str, columns: &[(String, String)]) -> Result<()> {
-    let (unit, col) = match spec.split_once('(') {
-        Some((f, c)) => (Some(f.trim()), c.trim_end_matches(')').trim()),
-        None => (None, spec.trim()),
-    };
-    let t = columns.iter().find(|(n, _)| n == col).map(|(_, t)| t.as_str());
-    let time = t.is_some_and(|t| t.starts_with("Timestamp") || t.starts_with("Date"));
-    anyhow::ensure!(t.is_some() && (unit.is_none() || (matches!(unit, Some("year" | "month" | "day" | "hour")) && time)), "PARTITION BY: a column, or year/month/day/hour(a timestamp column)");
-    Ok(())
 }
 
 /// Append tables with `cluster_by`: every file's rows sorted by that column (folds and merges
@@ -1458,7 +1418,7 @@ async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatc
             pending.push(b);
         }
         if n >= chunk || (end && n > 0) {
-            for (part, batches) in split(spec, std::mem::take(&mut pending)).await? {
+            for (part, batches) in crate::partition::split(spec, std::mem::take(&mut pending)).await? {
                 files.extend(write_file(lake, table, &batches, keys).await?.map(|f| DataFile { part, ..f }));
             }
             n = 0;

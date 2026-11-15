@@ -179,6 +179,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod cursors;
 #[cfg(feature = "lake")] mod guard;
 #[cfg(feature = "lake")] mod hilbert;
+#[cfg(feature = "lake")] mod partition;
 #[cfg(feature = "lake")] mod history;
 #[cfg(feature = "lake")] mod ddl;
 #[cfg(feature = "lake")] mod apply;

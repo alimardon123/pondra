@@ -150,7 +150,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         ensure!(order.is_none() || (!key.is_empty() && merge.is_empty()), "SEQUENCE BY: a keyed table's (PRIMARY KEY), whose rows replace each other");
         ensure!(order.iter().all(|o| columns.iter().any(|(n, _)| n == o) && !key.contains(o)), "SEQUENCE BY: a column of the table, not its key");
         if let Some(p) = &partition {
-            crate::tier::check_partition(p, &columns)?;
+            crate::partition::Spec::parse(p)?.check(&columns)?;
         }
         ensure!(not_null.iter().chain(defaults.keys()).chain(identity.keys()).all(|c| columns.iter().any(|(n, _)| n == c)), "NOT NULL, DEFAULT and identity: columns of the table");
         crate::rules::create::constraint_columns(&columns, &constraints)?;

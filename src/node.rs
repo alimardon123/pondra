@@ -1034,6 +1034,42 @@ mod tests {
             let b = q("SELECT min(id), max(id) FROM f").await.expect("answered from the entries' exact ranges");
             assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (1, 1000));
             assert!(q("SELECT max(v) FROM f").await.is_err(), "a float's range leaves NaN out: its files are read");
+            // (and as a read with the memory columns off, or maintenance's, takes them: `query::files_once`)
+            let files: Vec<&crate::store::DataFile> = meta.files.iter().collect();
+            let read = crate::query::files_once(&lake, &lake.session(), &files, &meta, &meta.read_schema().unwrap()).await.expect("a read of the files");
+            read.create_physical_plan().await.expect("planned from the entries, no footer read");
+            assert_eq!(lake.node.metrics.footers_planned.load(std::sync::atomic::Ordering::Relaxed), 0, "no footer read to plan");
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A table partitioned by several fields, Iceberg's bucket among them (step 5, I3-a): each file holds one day and one
+    /// bucket of its rows, its part the two joined (`partition::split`), and its rows read back whole.
+    #[tokio::test]
+    async fn a_table_partitions_by_a_day_and_a_bucket() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            for sql in [
+                "CREATE TABLE p (id BIGINT, ts TIMESTAMP, s TEXT) WITH (partition_by = 'day(ts), bucket(4, id)')",
+                "INSERT INTO p SELECT value, to_timestamp_seconds(1794657600 + value * 3600), 's' || value FROM range(1, 41)",
+            ] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            }
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("p")).await.unwrap().unwrap();
+            let parts: std::collections::BTreeSet<&str> = meta.files.iter().map(|f| f.part.as_str()).collect();
+            assert!(parts.len() > 4 && parts.len() <= 12, "three days, four buckets: {parts:?}");
+            assert!(parts.iter().all(|p| p.split_once('/').is_some_and(|(day, b)| day.starts_with("2026-11-1") && b.parse::<u32>().is_ok_and(|b| b < 4))), "{parts:?}");
+            let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
+            let b = q("SELECT count(*), sum(id) FROM p").await.unwrap();
+            assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (40, 820));
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })

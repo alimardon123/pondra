@@ -498,6 +498,25 @@ admin.sql("REVOKE agent FROM ann")
 3 3
 ```
 
+**`MAX_MEMORY '2 GB'`** holds what a member's running statements on a node hold of its query memory
+together, not each one's (`KB`, `MB`, `GB` or `TB`, with or without a space; `0` lifts it). Past it a
+sort, a join or an aggregation that can spill to disk spills and answers; anything else is refused
+(SQLSTATE 53200) naming the option, while the other users' queries run on.
+
+```python
+admin.sql("ALTER ROLE agent MAX_ROWS 0 MAX_MEMORY '64 KB'")
+admin.sql("GRANT agent TO ann")
+sort = "SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY md5(v::text)) AS r FROM generate_series(1, 100000) AS g(v))"
+print(attempt_as(ann, sort).split("memory pool: ")[-1].split(" (")[0])
+print(attempt_as(admin, sort))
+admin.sql("REVOKE agent FROM ann")
+```
+
+```text
+MAX_MEMORY 64 KB, which holds ann
+ran
+```
+
 ## The audit log
 
 **`pondra.audit`** says who did what, through which door and from where, and what came of it.

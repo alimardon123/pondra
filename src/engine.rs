@@ -181,6 +181,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add::<crate::learned::Kept>();
             states.add::<crate::users::SignIns>();
             states.add::<crate::users::Turns>();
+            states.add::<crate::users::Memory>();
             states.add::<crate::temp::Sessions>();
             states.add::<crate::tier::Rounds>();
             states.add::<crate::guard::Seen>();
@@ -615,6 +616,9 @@ fn analyze_output(exec: &AnalyzeExec, schema: &SchemaRef, rows: usize, duration:
 /// A lake's sessions: the catalog keeps the lake (`store::Lake`), and the engine makes the sessions that query it, with
 /// the lake's own functions in each.
 #[cfg(feature = "lake")]
+type Pool = Arc<dyn datafusion::execution::memory_pool::MemoryPool>;
+
+#[cfg(feature = "lake")]
 impl crate::store::Lake {
     /// A fresh SQL session on the shared runtime, in its node's partitions (`Lake::partitions`).
     pub fn session(&self) -> SessionContext {
@@ -625,9 +629,18 @@ impl crate::store::Lake {
     /// costs more than it saves and many queries run at once. Its functions, planners and rules
     /// are the same for every query, so they are made once (`made`) and copied; each copy gets
     /// catalogs of its own, so the tables a query registers are its alone.
-    pub fn session_with(&self, partitions: usize) -> SessionContext {
+    pub fn session_with(&self, partitions: usize) -> SessionContext { self.session_on(partitions, None) }
+
+    /// `session_with`, its statements' memory going through the pool `over` makes over the lake's when given: a
+    /// principal's under `MAX_MEMORY` (`users::capped_session`, `query::session_for`). Only the pool differs: the caches, the
+    /// object stores and the spill disk are the lake's.
+    pub fn session_on(&self, partitions: usize, over: Option<&dyn Fn(Pool) -> Pool>) -> SessionContext {
         crate::store::spill_room(); // (the spill disk's room as it is now: `Spills` looked at it once, when the first spill made the disk)
-        let state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
+        let mut state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
+        if let Some(over) = over {
+            let rt = Arc::new(RuntimeEnv { memory_pool: over(state.runtime_env().memory_pool.clone()), ..(**state.runtime_env()).clone() });
+            state = SessionStateBuilder::new_from_existing(state).with_runtime_env(rt).build();
+        }
         let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
         let ctx = with_catalog(state, Arc::new(catalog));
         for (_, add) in &crate::registry::get().section::<LakeFunctions>().0 {
