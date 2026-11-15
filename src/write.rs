@@ -2863,6 +2863,33 @@ mod section {
             assert_eq!(shown(&super::parse(sql)), format!("invalid {said}"), "{sql}");
         }
     }
+
+    /// The repository's statements of the families the statements section reads by their words (SECRET, FUNCTION, MACRO,
+    /// TASK, COPY, ATTACH, EXTERNAL TABLE, and their DROP, ALTER and EXECUTE), each one text, as they read when the corpus
+    /// was kept: what each says, its refusal's form or SQLSTATE (11-10 audit L9: #761's differential test, kept as a
+    /// fixture). `PONDRA_KEEP_CORPUS=1` keeps it again from the repository's texts, after a change meant to move them.
+    #[test]
+    fn every_text_of_the_corpus_reads_as_kept() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/statements/corpus.json");
+        if std::env::var_os("PONDRA_KEEP_CORPUS").is_some() {
+            let placeholder = regex::Regex::new(r"\{[\w:?#]*\}").expect("a regex"); // (a format string's `{}`: no SQL)
+            let family = regex::Regex::new(r"(?is)^\s*(?:(?:create|drop|alter|execute|show)\b[^;]{0,60}?\b(?:secret|function|macro|task|external\s+table)\b|copy\b|attach\b|detach\b)").expect("a regex");
+            let kept: std::collections::BTreeMap<String, String> = crate::passes::tests::texts("|backup|restore|export|import|undrop")
+                .into_iter()
+                .filter(|t| !placeholder.is_match(t) && family.is_match(t) && crate::routines::split(t).len() == 1)
+                .map(|t| {
+                    let said = shown(&super::parse(&t));
+                    (t, said)
+                })
+                .collect();
+            std::fs::create_dir_all(path.parent().expect("a folder")).expect("the folder");
+            std::fs::write(&path, serde_json::to_string_pretty(&kept).expect("JSON") + "\n").expect("the corpus written");
+        }
+        let kept: std::collections::BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(&path).expect("the corpus")).expect("its JSON");
+        let differ: Vec<_> = kept.iter().filter_map(|(sql, was)| Some((sql, was, shown(&super::parse(sql)))).filter(|(_, was, now)| was != &now)).collect();
+        assert!(differ.is_empty(), "{} of {} texts read otherwise than kept (text, kept, now): {differ:#?}", differ.len(), kept.len());
+        assert!(kept.len() > 100, "the corpus holds {} texts", kept.len());
+    }
 }
 
 #[cfg(test)]
