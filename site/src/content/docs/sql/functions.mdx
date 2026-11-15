@@ -193,7 +193,7 @@ The functions below read the same documents. Each takes the document, then a pat
 ```sql
 CREATE TABLE events (id BIGINT, payload VARCHAR);
 INSERT INTO events VALUES
-  (1, '{"customer": {"name": "ann"}, "amount": 4.5, "tags": ["a", "b"]}'),
+  (1, '{"user": {"name": "ann"}, "amount": 4.5, "tags": ["a", "b"]}'),
   (2, '{"user": {"name": "bo"}, "amount": 2.0, "tags": []}');
 
 SELECT id,
