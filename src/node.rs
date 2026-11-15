@@ -1040,6 +1040,37 @@ mod tests {
         .await
     }
 
+    /// A table partitioned by several fields, Iceberg's bucket among them (step 5, I3-a): each file holds one day and one
+    /// bucket of its rows, its part the two joined (`partition::split`), and its rows read back whole.
+    #[tokio::test]
+    async fn a_table_partitions_by_a_day_and_a_bucket() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            for sql in [
+                "CREATE TABLE p (id BIGINT, ts TIMESTAMP, s TEXT) WITH (partition_by = 'day(ts), bucket(4, id)')",
+                "INSERT INTO p SELECT value, to_timestamp_seconds(1794657600 + value * 3600), 's' || value FROM range(1, 41)",
+            ] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            }
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("p")).await.unwrap().unwrap();
+            let parts: std::collections::BTreeSet<&str> = meta.files.iter().map(|f| f.part.as_str()).collect();
+            assert!(parts.len() > 4 && parts.len() <= 12, "three days, four buckets: {parts:?}");
+            assert!(parts.iter().all(|p| p.split_once('/').is_some_and(|(day, b)| day.starts_with("2026-11-1") && b.parse::<u32>().is_ok_and(|b| b < 4))), "{parts:?}");
+            let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
+            let b = q("SELECT count(*), sum(id) FROM p").await.unwrap();
+            assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (40, 820));
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
     /// A table's JSON column is marked as one where queries plan over it (`TableMeta::read_schema`, step 5 piece 14c,
     /// E1): from its rows in memory and from its files, and through a view. Every write that
     /// reads the table back (an UPDATE, a DELETE, an INSERT … SELECT from itself, a CREATE TABLE AS, a tiering round, a
