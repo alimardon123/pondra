@@ -190,3 +190,65 @@ async fn crashes_and_kills_lose_and_double_nothing() {
         assert_eq!(third, serde_json::json!({"n": thirds, "uniq": thirds}), "seed {seed}: thirds\n{met}");
     }
 }
+
+/// The harness's `finals_on_three`: rows appended to three members (whichever answers: the same producer's batch is
+/// applied once) while the leader is killed twice; a materialized view's final groups are each kept once, equal to the
+/// ad hoc query, on every member.
+#[tokio::test(start_paused = true)]
+async fn finals_on_three_are_each_kept_once_through_two_leader_kills() {
+    let iso = |s: i64| chrono::DateTime::from_timestamp(s, 0).unwrap().format("%Y-%m-%dT%H:%M:%S").to_string();
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        c.set_start(|s| s.tier_secs = 1.0);
+        for m in 0..3 {
+            c.start(m).await.unwrap();
+        }
+        c.sql(0, "CREATE TABLE clicks (visitor VARCHAR, ts TIMESTAMP, amount BIGINT)").await.unwrap();
+        c.sql(0, "CREATE MATERIALIZED VIEW per_minute WITH (lateness = '2 seconds') AS SELECT date_bin(INTERVAL '1 minute', ts) AS minute, visitor, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY 1, 2 EMIT FINAL").await.unwrap();
+        let (base, mut seqs, mut killed) = (1_790_000_000 / 60 * 60, [0u64; 3], 0);
+        let append = |rows: Vec<serde_json::Value>, k: usize, seq: u64| {
+            let (c, body) = (&c, rows.iter().map(|r| format!("{r}\n")).collect::<String>());
+            async move {
+                for t in 0..200 {
+                    let m = (k + t) % 3;
+                    if c.up(m) && matches!(c.ask(m, "POST", &format!("/append/clicks?producer=p{}&seq={seq}", k % 3), body.clone().into_bytes()).await, Ok((200..=299, _))) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                panic!("seed {seed}: an append was never taken\n{}", c.met());
+            }
+        };
+        for k in 0..120usize {
+            // (20 minutes of event time)
+            let rows = (0..5).map(|j| serde_json::json!({"visitor": format!("v{}", (k + j) % 4), "ts": iso(base + k as i64 * 10 + j as i64), "amount": k * 10 + j})).collect();
+            seqs[k % 3] += 1;
+            append(rows, k, seqs[k % 3]).await;
+            if k == 40 || k == 80 {
+                let mut lead = None;
+                for m in 0..3 {
+                    if c.role(m).await.as_deref() == Some("leader") {
+                        lead = Some(m);
+                    }
+                }
+                let lead = lead.unwrap_or_else(|| panic!("seed {seed}: no member leads\n{}", c.met()));
+                c.kill(lead);
+                killed += 1;
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                c.start(lead).await.unwrap();
+            }
+        }
+        seqs[0] += 1;
+        append(vec![serde_json::json!({"visitor": "v0", "ts": iso(base + 3600), "amount": 0})], 0, seqs[0]).await; // (the watermark past them all)
+        let want = c.sql(0, &format!("SELECT date_bin(INTERVAL '1 minute', ts) AS minute, visitor, count(*) AS n, sum(amount) AS total FROM clicks WHERE ts < '{}' GROUP BY 1, 2 ORDER BY 1, 2", iso(base + 1200))).await.unwrap();
+        assert_eq!(rows(&want).len(), 80, "seed {seed}: the ad hoc query's groups");
+        for m in 0..3 {
+            let got = || async { c.sql(m, "SELECT minute, visitor, n, total FROM per_minute ORDER BY 1, 2").await.ok() };
+            c.until(&format!("member {m}'s final groups"), Duration::from_secs(60), || async { got().await.as_ref() == Some(&want) }).await.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        }
+        let groups = c.sql(0, "SELECT count(*) AS g, count(DISTINCT (minute, visitor)) AS d FROM per_minute").await.unwrap();
+        assert_eq!(rows(&groups).first(), Some(&serde_json::json!({"g": 80, "d": 80})), "seed {seed}: each group once");
+        assert_eq!(killed, 2);
+        println!("seed {seed}: 80 final groups once on each of three members, the leader killed twice");
+    }
+}
