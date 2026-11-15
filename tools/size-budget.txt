@@ -4,7 +4,12 @@
 #
 # 11-03, at 20c2732: the program 156,330,304 bytes, its download 56,123,799 (main's linux-x64 build, run 41626771333).
 # Each budget leaves about 2% for growth before someone has to say why.
-linux-x64 159500000 57300000
+# 11-15, #831 (SlateDB's clock read from ours; it changes the lock file, so it is held to this line): the program
+# 160,248,912 bytes, its download 57,383,773 (the train's run 43667077339). The bytes are main's own: main's build had
+# passed this line already on 11-14, at 160,004,688 and 57,527,392 (16d7a4b8, run 43604524256), its growth since 11-03
+# (3.7 MB, 2.3%), which only a pull request that changes the lock file measures against this line. #831 adds a struct.
+# Again about 2% for growth.
+linux-x64 163500000 58700000
 #
 # A pull request's own build is held to linux-x64-release (build.yml), so a pull request that adds bytes fails itself,
 # not main after it. That build is the release profile (no LTO, 16 codegen units, not stripped), about twice the
