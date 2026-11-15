@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use slatedb::config::{CompactionWorkerOptions, CompactorOptions, DbReaderOptions, DurabilityLevel, FlushOptions, FlushType, GarbageCollectorDirectoryOptions, GarbageCollectorOptions, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
+use slatedb_common::clock::{SystemClock, SystemClockTicker};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -72,7 +73,7 @@ impl Writer {
         // (a flush's blocks stay out of the cache: everything committed is in the overlay already)
         let flushed = slatedb::BlockCachePolicy::default().with_flush_targets(&[slatedb::CacheTarget::Index, slatedb::CacheTarget::Filters]);
         let (cache, blocks) = caches();
-        let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(cache).with_block_cache_policy(flushed).build().await?;
+        let db = Db::builder("catalog", store.clone()).with_system_clock(Clock::started()).with_settings(settings).with_db_cache(cache).with_block_cache_policy(flushed).build().await?;
         let upkeep = upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local, &node);
         Ok(Writer { db, upkeep, blocks, flush_now: local, node })
     }
@@ -85,7 +86,7 @@ impl Reader {
         let opts = DbReaderOptions { manifest_poll_interval: poll, skip_wal_replay: streamed, object_store_cache_options: object_cache(cache_dir), ..Default::default() };
         // FollowLatest writes nothing, so readers work with read-only bucket credentials.
         let (cache, blocks) = caches();
-        let r = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(cache).build().await?;
+        let r = DbReader::builder("catalog", store).with_system_clock(Clock::started()).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(cache).build().await?;
         Ok(Reader { r, blocks })
     }
 }
@@ -282,12 +283,36 @@ impl slatedb::db_cache::DbCache for Blocks {
     fn entry_count(&self) -> u64 { self.0.entry_count() }
 }
 
+/// SlateDB's clock: its own (`DefaultSystemClock`: the wall at its start, moved on by tokio's clock), but the wall read
+/// from the core's (`clock::wall_us`). On a node that is the machine's, as SlateDB's own; in the sim, whose members share
+/// one paused clock, a catalog opened later doesn't tick behind the ticks one opened earlier left in the bucket (SlateDB
+/// refuses a tick behind its last: a new leader's sequencer failed so, again and again).
+#[derive(Debug)]
+struct Clock {
+    start: chrono::DateTime<chrono::Utc>,
+    at: crate::clock::Instant,
+}
+
+impl Clock {
+    fn started() -> Arc<dyn SystemClock> {
+        Arc::new(Clock { start: chrono::DateTime::from_timestamp_micros(crate::clock::wall_us() as i64).unwrap_or_default(), at: crate::clock::now() })
+    }
+}
+
+impl SystemClock for Clock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> { self.start + crate::clock::now().duration_since(self.at) }
+
+    fn sleep<'a>(&'a self, d: Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> { Box::pin(tokio::time::sleep(d)) }
+
+    fn ticker<'a>(&'a self, d: Duration) -> SystemClockTicker<'a> { SystemClockTicker::new(self, d) }
+}
+
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
 /// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
 /// for neither (C5). A failure in either stops the node, as one in the writer would.
 fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool, node: &Arc<crate::node_state::NodeState>) -> Upkeep {
-    let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
-    let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_options(gc).build();
+    let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_system_clock(Clock::started()).with_options(compactor).build();
+    let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_system_clock(Clock::started()).with_options(gc).build();
     let (c, g, once) = (compactor.clone(), gc.clone(), gc.clone());
     let once: Once = Arc::new(move || {
         let gc = once.clone();
