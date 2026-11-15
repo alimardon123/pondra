@@ -48,6 +48,13 @@ pub const LISTS: u32 = 6;
 /// and a file written before keeps them so until it is rewritten: every reader reads both (`bounds::Ranged`).
 pub const BOUNDS: u32 = 8;
 
+/// The format whose tables' columns keep a fixed-size list's size (`answer::fixed_name`: `FLOAT[3]`, `VECTOR(3)`), which a
+/// node from before reads as a list: format 8's, with `BOUNDS`.
+pub const FIXED: u32 = 8;
+
+/// Does a table made in this lake now keep a fixed-size list's size (`FIXED`)?
+pub async fn fixed(lake: &Lake) -> Result<bool> { Ok(of(&lake.cat).await?.format >= FIXED) }
+
 /// Does a file written in this lake now keep its ranges typed (`BOUNDS`)?
 pub async fn typed(lake: &Lake) -> Result<bool> { Ok(of(&lake.cat).await?.format >= BOUNDS) }
 

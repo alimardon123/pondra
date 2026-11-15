@@ -576,9 +576,9 @@ fn element(t: &str) -> Option<Value> {
 /// The table's columns as a Delta schema, if every type has a Delta equivalent.
 pub fn schema_string(columns: &[(String, String)]) -> Option<String> {
     let fields = columns.iter().map(|(name, t)| {
-        if let Some(item) = t.strip_suffix("[]") {
+        if let Some(item) = crate::answer::list_item(t) {
             // A list column (an embedding, say): Delta's array type.
-            let element = element(item)?;
+            let element = element(&item)?;
             return Some(json!({"name": name, "type": {"type": "array", "elementType": element, "containsNull": true}, "nullable": true, "metadata": {}}));
         }
         let t = match t.as_str() {
