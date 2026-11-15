@@ -93,6 +93,13 @@ fn file_url(_: &str) -> Option<url::Url> {
     None
 }
 
+/// Whether `own` may plan a file: its entry keeps every variable-width column's size. One written before entries kept them
+/// is planned from its footer (`Metrics::footers_planned`): without them a plan would size its text by its rows alone, and
+/// pick other sides for its joins.
+pub(crate) fn sized(f: &crate::data_file::DataFile, schema: &Schema) -> bool {
+    schema.fields().iter().all(|c| c.data_type().primitive_width().is_some() || f.sizes.contains_key(c.name()))
+}
+
 /// A lake's own files with nothing to leave out (no deletes, no lineage to add), as one scan planned from their entries
 /// alone: each file's size, rows and ranges are the catalog's, so planning reads no footer (step 5 piece 14b). `full`: a
 /// file's place (`Lake::full`). Its ranges are exact (the writer's own, `bounds::kept`, or a footer's that says so:
