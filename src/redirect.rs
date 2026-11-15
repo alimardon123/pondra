@@ -43,7 +43,7 @@ enum Found {
 /// database it reads inlined, read the same way. Another database's tables and views, a CTE's name, a table function
 /// and a name the host doesn't know are as written. The names are looked up first (the host is asked), then the query
 /// is rewritten (`redirected`).
-pub(crate) fn redirect<'a, H: Host>(host: &'a H, sql: String, db: String, depth: usize) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+pub(crate) fn redirect<'a, H: Host + ?Sized>(host: &'a H, sql: String, db: String, depth: usize) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         if depth > DEEPEST {
             return Err(crate::codes::coded("54000", format!("a definition read over another database's tables inlines the views it reads, and these read views more than {DEEPEST} deep")));

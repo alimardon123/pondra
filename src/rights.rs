@@ -35,25 +35,93 @@ pub enum Action {
     RunCode,
 }
 
+/// A privilege a grant gives (step 6, typed as the #610 review's piece 2 asked): a table's four; USAGE, a secret's; CLONE, a
+/// database's or a schema's (ADR-058); APPLY, a database's; and an extension kind's own (`Of`: READ on a connection,
+/// `objects::Kind::privileges`). A grant keeps it as its lower-case word, as grants always were (`word`, serde), and SQL
+/// shows it in upper case (`Display`).
+#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Usage,
+    Clone,
+    Apply,
+    Of(std::sync::Arc<str>), // (an extension kind's own, in lower case)
+}
+
+impl Privilege {
+    /// A table's privileges: what `ALL` gives on one, and those a filter on rows may hold.
+    pub const TABLE: [Privilege; 4] = [Privilege::Select, Privilege::Insert, Privilege::Update, Privilege::Delete];
+
+    /// The privilege a word names, in any case: a core one, else an extension kind's own.
+    pub fn of(word: &str) -> Privilege {
+        match word.to_ascii_lowercase().as_str() {
+            "select" => Privilege::Select,
+            "insert" => Privilege::Insert,
+            "update" => Privilege::Update,
+            "delete" => Privilege::Delete,
+            "usage" => Privilege::Usage,
+            "clone" => Privilege::Clone,
+            "apply" => Privilege::Apply,
+            other => Privilege::Of(other.into()),
+        }
+    }
+
+    /// Its word as a grant keeps it: `select`, a kind's own in lower case.
+    pub fn word(&self) -> &str {
+        match self {
+            Privilege::Select => "select",
+            Privilege::Insert => "insert",
+            Privilege::Update => "update",
+            Privilege::Delete => "delete",
+            Privilege::Usage => "usage",
+            Privilege::Clone => "clone",
+            Privilege::Apply => "apply",
+            Privilege::Of(w) => w,
+        }
+    }
+
+    /// Is it a table's (SELECT, INSERT, UPDATE or DELETE)?
+    pub fn of_tables(&self) -> bool { Privilege::TABLE.contains(self) }
+}
+
+impl std::fmt::Display for Privilege {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.word().to_uppercase()) }
+}
+
+impl From<&str> for Privilege {
+    fn from(word: &str) -> Privilege { Privilege::of(word) }
+}
+
+impl serde::Serialize for Privilege {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> { s.serialize_str(self.word()) }
+}
+
+impl<'de> serde::Deserialize<'de> for Privilege {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Privilege, D::Error> { Ok(Privilege::of(&String::deserialize(d)?)) }
+}
+
 impl Action {
-    /// The action a grant's privilege names (`select`, `insert`, `update`, `delete`).
-    pub fn of(privilege: &str) -> Option<Action> {
+    /// The action a grant's privilege names (SELECT, INSERT, UPDATE, DELETE).
+    pub fn of(privilege: &Privilege) -> Option<Action> {
         match privilege {
-            "select" => Some(Action::Select),
-            "insert" => Some(Action::Insert),
-            "update" => Some(Action::Update),
-            "delete" => Some(Action::Delete),
+            Privilege::Select => Some(Action::Select),
+            Privilege::Insert => Some(Action::Insert),
+            Privilege::Update => Some(Action::Update),
+            Privilege::Delete => Some(Action::Delete),
             _ => None,
         }
     }
 
     /// The privilege a user is granted for it (None: a user is never granted it: a superuser's).
-    pub fn privilege(self) -> Option<&'static str> {
+    pub fn privilege(self) -> Option<Privilege> {
         match self {
-            Action::Select | Action::SelectAll => Some("select"),
-            Action::Insert => Some("insert"),
-            Action::Update | Action::Lock => Some("update"),
-            Action::Delete => Some("delete"),
+            Action::Select | Action::SelectAll => Some(Privilege::Select),
+            Action::Insert => Some(Privilege::Insert),
+            Action::Update | Action::Lock => Some(Privilege::Update),
+            Action::Delete => Some(Privilege::Delete),
             Action::Define | Action::Export | Action::Write | Action::RunCode => None,
         }
     }
@@ -195,17 +263,25 @@ fn may_in(who: &Principal, action: Action, object: Object, sql: bool) -> Result<
     }
     let (Some(a), Some(privilege)) = (&who.scope.access, action.privilege()) else { return Ok(()) };
     let granted = match action {
-        Action::SelectAll => a.columns(privilege, &table) == Some(None),
-        _ => a.may(privilege, &table),
+        Action::SelectAll => a.columns(&privilege, &table) == Some(None),
+        _ => a.may(&privilege, &table),
     };
     // (every column and every row: a table some of whose rows its grants hide is read with SELECT, which filters them)
-    if granted && action == Action::SelectAll && a.rows(privilege, &table, false).is_some() {
+    if granted && action == Action::SelectAll && a.rows(&privilege, &table, false).is_some() {
         return Err(Refusal::new(format!("permission denied: {table} shows {} some of its rows only (a filter on its rows in a grant): read it with SELECT", who.name)));
     }
     // (a load's rows replace their keys' rows or delete them, unread: a writer some of whose rows its grants hide changes them
     // with SQL, which reads them through the filter, so it never replaces or deletes a row it can't read)
-    if granted && !sql && matches!(action, Action::Update | Action::Delete) && a.rows("select", &table, false).is_some() {
-        return Err(Refusal::new(format!("permission denied: {table} shows {} some of its rows only (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT", who.name)));
+    // (and a load's new rows aren't checked against a filter on the rows its writer may insert: SQL's INSERT checks them)
+    if granted && !sql && action == Action::Insert && a.rows(&Privilege::Insert, &table, false).is_some() {
+        return Err(Refusal::new(format!("permission denied: {table} lets {} insert some rows only (a filter on its rows in a grant): insert them with SQL's INSERT, which checks each", who.name)));
+    }
+    if granted && !sql && matches!(action, Action::Update | Action::Delete) && [&privilege, &Privilege::Select].iter().any(|p| a.rows(p, &table, false).is_some()) {
+        let held = match a.rows(&Privilege::Select, &table, false) {
+            Some(_) => format!("shows {} some of its rows only", who.name),
+            None => format!("lets {} {} some of its rows only", who.name, privilege.word()),
+        };
+        return Err(Refusal::new(format!("permission denied: {table} {held} (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT")));
     }
     if granted {
         return Ok(());
@@ -213,7 +289,7 @@ fn may_in(who: &Principal, action: Action, object: Object, sql: bool) -> Result<
     if !a.knows(&table) {
         return Err(Refusal::unseen(&table)); // (never "permission denied": that would say it is there)
     }
-    let p = privilege.to_uppercase();
+    let p = privilege.to_string();
     let what = if action == Action::SelectAll { format!("{p} on every column of") } else { format!("{p} on") };
     Err(Refusal::new(format!("permission denied: {what} {table} (GRANT {p} ON {table} TO {})", who.name)))
 }
@@ -281,6 +357,7 @@ pub struct Scope {
     access: Option<std::sync::Arc<crate::users::Access>>,
     asker: Option<std::sync::Arc<Asker>>, // (None: made without a principal, which names no one and is no superuser's)
     key: Option<std::sync::Arc<str>>, // (`key` when its grants filter rows: theirs with its reader filled in; None: `Access::key`)
+    writing: Option<std::sync::Arc<(String, String)>>, // (a write's table and its privilege's filter on its rows, ANDed to SELECT's: `writing`)
 }
 
 /// Who a scope is for, as planning asks it (`pondra.history`'s rows, `pondra.audit`): its principal's name, whether that
@@ -306,15 +383,15 @@ pub fn scope() -> Scope {
 impl Scope {
     /// Everything, this lake's and the lakes attached to it: a token's, a superuser's, an open node's, and the node's own
     /// work's (`auth::Principal::node`). `tools/scope_check.py` counts where one is made.
-    pub fn everything() -> Scope { Scope { access: None, asker: None, key: None } }
+    pub fn everything() -> Scope { Scope { access: None, asker: None, key: None, writing: None } }
 
     /// Nothing: no table, column, name or code. Whoever isn't signed in (`Principal::of(Role::None)`), and work with no
     /// caller that isn't the node's own (`scope`).
-    pub fn nothing() -> Scope { Scope { access: Some(std::sync::Arc::new(Default::default())), asker: None, key: None } }
+    pub fn nothing() -> Scope { Scope { access: Some(std::sync::Arc::new(Default::default())), asker: None, key: None, writing: None } }
 
     /// What a user who isn't a superuser may see: what `access` grants it (`users::principal_with` makes it once, as the
     /// principal is made).
-    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope { access: Some(access), asker: None, key: None } }
+    pub fn granted(access: std::sync::Arc<crate::users::Access>) -> Scope { Scope { access: Some(access), asker: None, key: None, writing: None } }
 
     /// The scope a planning session was made for (`query::session_for`): the session carries it to everything planned in it
     /// (a `SessionConfig` extension), so no planning reads the task's caller. A session made without one sees nothing: it
@@ -345,7 +422,7 @@ impl Scope {
             filled.dedup();
             crate::users::sha256(&serde_json::to_string(&(a.key(), filled)).unwrap_or_default())[..32].into()
         });
-        Scope { access: self.access.clone(), asker: Some(std::sync::Arc::new(asker)), key }
+        Scope { access: self.access.clone(), asker: Some(std::sync::Arc::new(asker)), key, writing: None }
     }
 
     /// Is it a superuser's (`pondra.audit`, every row of `pondra.history`)? Whole, and its principal an admin. Never whole
@@ -376,12 +453,37 @@ impl Scope {
     /// The rows of `table` (as the catalog names it) it may use for `privilege` (as `Action::privilege` names it), as one
     /// SQL condition over the table's columns with its reader filled in (`row_filter::filled`): None, every row (whole,
     /// or a grant with no filter). Its grants' filters join with OR. `query::Guarded` plans it (step 6 piece 5b).
-    pub fn rows(&self, privilege: &str, table: &str) -> Option<String> { self.rows_of(privilege, table, false) }
+    pub fn rows(&self, privilege: &Privilege, table: &str) -> Option<String> { self.rows_of(privilege, table, false) }
 
     /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count (`named`).
-    pub fn rows_named(&self, privilege: &str, table: &str) -> Option<String> { self.rows_of(privilege, table, true) }
+    pub fn rows_named(&self, privilege: &Privilege, table: &str) -> Option<String> { self.rows_of(privilege, table, true) }
 
-    fn rows_of(&self, privilege: &str, table: &str, named: bool) -> Option<String> {
+    fn rows_of(&self, privilege: &Privilege, table: &str, named: bool) -> Option<String> {
+        let granted = self.granted_rows(privilege, table, named);
+        match self.writing.as_deref() {
+            Some((t, also)) if *privilege == Privilege::Select && !named && t == table => Some(match granted {
+                Some(read) => format!("({read}) AND ({also})"),
+                None => also.clone(),
+            }),
+            _ => granted,
+        }
+    }
+
+    /// The scope a write reads the rows of `table` it changes with (`change::rows_of`): its SELECT filter on them and
+    /// `privilege`'s (UPDATE's or DELETE's, step 6 piece 5c) together, so it changes only rows both hold, and its own
+    /// conditions run on those only (`query::Guarded`, its barrier). Every read of `table` it plans takes both, a
+    /// subquery's too. Itself when `privilege` has no filter on `table`. Its key is its own: no answer is shared with a read's.
+    pub fn writing(&self, privilege: &Privilege, table: &str) -> Scope {
+        let Some(also) = self.rows(privilege, table) else { return self.clone() };
+        let key = crate::users::sha256(&serde_json::to_string(&(self.key(), privilege, table, &also)).unwrap_or_default())[..32].into();
+        Scope { key: Some(key), writing: Some(std::sync::Arc::new((table.to_string(), also))), ..self.clone() }
+    }
+
+    /// Does a grant filter the rows of `table` it may use, for any privilege? Then a write of it is planned, so each filter
+    /// reads the rows it changes: never a key's row read without planning (`txn::point_change`, `upsert_point`).
+    pub fn filtered(&self, table: &str) -> bool { Privilege::TABLE.iter().any(|p| self.rows(p, table).is_some()) }
+
+    fn granted_rows(&self, privilege: &Privilege, table: &str, named: bool) -> Option<String> {
         let filters = self.access.as_ref()?.rows(privilege, table, named)?;
         let reader = self.asker.as_ref().map(|a| a.name.as_str());
         let filled: Vec<String> = filters.iter().map(|f| crate::row_filter::filled(f, reader)).collect();
@@ -395,7 +497,7 @@ impl Scope {
     /// planning (`serve::point`), as `query::Guarded` asks of a plan's scan: every column it returns and its key's.
     /// A table some of whose rows its grants hide (`rows`) is read only as planned, through `query::Guarded`, never by its key.
     pub fn reads<'a>(&self, table: &str, mut columns: impl Iterator<Item = &'a str>) -> bool {
-        if self.rows("select", table).is_some() {
+        if self.rows(&Privilege::Select, table).is_some() {
             return false;
         }
         match self.columns(table) {
@@ -410,14 +512,14 @@ impl Scope {
     pub fn sees(&self, object: Object) -> bool {
         match (&self.access, object) {
             (None, _) => true,
-            (Some(a), Object::Table(t)) => a.may("select", t),
+            (Some(a), Object::Table(t)) => a.may(&Privilege::Select, t),
             (Some(_), Object::Lake) => false,
         }
     }
 
     /// The same, for a table or view of another lake attached here (`l.t`, `l.s.t`): only grants naming it count, as its
     /// reads ask (`named`). ON ALL TABLES and ON SCHEMA are this lake's, so they show none of another's.
-    pub fn sees_named(&self, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.named("select", table).is_some()) }
+    pub fn sees_named(&self, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.named(&Privilege::Select, table).is_some()) }
 
     /// Does it know `table` (as the catalog names it) is there? Whole, or holding any privilege on it (SELECT, INSERT,
     /// UPDATE or DELETE, on it, its schema or the lake). A table it doesn't know is answered as one that isn't there,
@@ -429,17 +531,20 @@ impl Scope {
     pub fn knows_named(&self, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.knows_named(table)) }
 
     /// The columns of `table` (as the catalog names it) it reads: None, none; Some(None), every column; Some(these).
-    pub fn columns(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.access.as_ref().map_or(Some(None), |a| a.columns("select", table)) }
+    pub fn columns(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.access.as_ref().map_or(Some(None), |a| a.columns(&Privilege::Select, table)) }
 
-    /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count; ON ALL TABLES
-    /// and ON SCHEMA are this lake's. `privilege` as `Action::privilege` names it.
-    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.access.as_ref().map_or(Some(None), |a| a.named(privilege, table)) }
+    /// SELECT's columns of `table`, a table of another lake attached here (`named`): as `columns`, of the grants naming it.
+    pub fn columns_named(&self, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.named(&Privilege::Select, table) }
+
+    /// `privilege`'s columns of `table`, a table of another lake attached here (`l.t`, `l.s.t`): only grants naming it count;
+    /// ON ALL TABLES and ON SCHEMA are this lake's.
+    pub fn named(&self, privilege: &Privilege, table: &str) -> Option<Option<std::collections::HashSet<String>>> { self.access.as_ref().map_or(Some(None), |a| a.named(privilege, table)) }
 
     /// May it use the secret `name` (GRANT USAGE ON SECRET)?
     pub fn secret(&self, name: &str) -> bool { self.access.as_ref().is_none_or(|a| a.secret(name)) }
 
     /// May it use the object `name` of an extension's `kind` for `privilege` (`READ` on a connection)? Whole: always.
-    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool { self.access.as_ref().is_none_or(|a| a.may_use(kind, name, privilege)) }
+    pub fn may_use(&self, kind: &str, name: &str, privilege: &Privilege) -> bool { self.access.as_ref().is_none_or(|a| a.may_use(kind, name, privilege)) }
 
     /// The schemas a user granted CLONE may branch (ADR-058): None, no CLONE grant (and a whole scope, which needs none);
     /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
@@ -466,7 +571,7 @@ pub fn asks(stmt: &Stmt) -> (String, Vec<Action>) {
         Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::CopyInto(t, ..) => (catalog_name(t), vec![Action::Insert]), // (COPY INTO's rows are an INSERT's)
         Stmt::Update(t, ..) => (catalog_name(t), vec![Action::Update]),
         Stmt::Delete(t, _) => (catalog_name(t), vec![Action::Delete]),
-        Stmt::Merge(m) => (catalog_name(&m.target), m.privileges().into_iter().filter_map(Action::of).collect()),
+        Stmt::Merge(m) => (catalog_name(&m.target), m.privileges().iter().filter_map(Action::of).collect()),
         // (a `$` table is Pondra's: a superuser's CREATE or definition of one is refused as a row write to it is. A replace's
         // staged table is defined by the leader's own steps, which no door checks: `write::create_as`)
         Stmt::Create(c) => (catalog_name(&crate::text::object(&c.name)), vec![Action::Define]),
@@ -498,11 +603,29 @@ mod tests {
     use std::sync::Arc;
 
     fn user(grants: &[(&str, On, &[&str])]) -> Principal {
-        let grants = grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect(), rows: None }).collect();
+        let grants = grants.iter().map(|(p, on, cols)| Grant { privilege: Privilege::of(p), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect(), rows: None }).collect();
         Principal { name: "ann".into(), scope: Scope::granted(Arc::new(Access::granted(grants))), ..Principal::of(Role::Read) }
     }
 
     fn said(r: Result<(), Refusal>) -> String { r.err().map(|r| r.text).unwrap_or_else(|| "ok".into()) }
+
+    /// A privilege is kept as the word a grant always kept (users' files read as before), shown in upper case, and a word
+    /// no core privilege names is an extension kind's own.
+    #[test]
+    fn a_privilege_is_kept_as_its_word() {
+        for p in [Privilege::Select, Privilege::Insert, Privilege::Update, Privilege::Delete, Privilege::Usage, Privilege::Clone, Privilege::Apply] {
+            assert_eq!(Privilege::of(p.word()), p);
+            assert_eq!(Privilege::of(&p.to_string()), p, "in any case");
+            assert_eq!(serde_json::to_string(&p).unwrap(), format!("\"{}\"", p.word()));
+            assert_eq!(serde_json::from_str::<Privilege>(&format!("\"{}\"", p.word())).unwrap(), p);
+        }
+        assert_eq!(Privilege::of("READ"), Privilege::Of("read".into()));
+        assert_eq!(Privilege::of("read").to_string(), "READ");
+        let g: Grant = serde_json::from_str(r#"{"privilege":"select","on":{"kind":"table","name":"t"}}"#).unwrap();
+        assert_eq!((g.privilege.clone(), serde_json::to_string(&g).unwrap().as_str()), (Privilege::Select, r#"{"privilege":"select","on":{"kind":"table","name":"t"}}"#));
+        assert!(Privilege::TABLE.iter().all(Privilege::of_tables) && !Privilege::Usage.of_tables() && !Privilege::of("read").of_tables());
+        assert_eq!(Privilege::TABLE.iter().filter_map(Action::of).filter_map(Action::privilege).collect::<Vec<_>>(), Privilege::TABLE);
+    }
 
     /// Every action, by a token of each role, a superuser and a user with grants: what `may` answers, in its words.
     #[test]
@@ -635,7 +758,7 @@ mod tests {
     #[test]
     fn a_scope_is_kept_by_what_it_holds() {
         let scope = |grants: &[(&str, On, &[&str])], names: &[&str]| {
-            let mut a = Access::granted(grants.iter().map(|(p, on, cols)| Grant { privilege: p.to_string(), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect(), rows: None }).collect());
+            let mut a = Access::granted(grants.iter().map(|(p, on, cols)| Grant { privilege: Privilege::of(p), on: on.clone(), columns: cols.iter().map(|c| c.to_string()).collect(), rows: None }).collect());
             a.names = names.iter().map(|n| n.to_string()).collect();
             Scope::granted(Arc::new(a))
         };
@@ -677,16 +800,16 @@ mod tests {
         let as_ = |name: &str, a: &Arc<Access>| Principal { name: name.into(), scope: Scope::granted(a.clone()), ..Principal::of(Role::Read) }.asking();
         let mine = access(vec![grant("select", t(), Some("owner = current_user")), grant("select", On::Schema("public".into()), Some("dept = 'x'")), grant("insert", t(), None)]);
         let (ann, bob) = (as_("ann", &mine), as_("bob", &mine));
-        assert_eq!(ann.scope.rows("select", "t").as_deref(), Some("(dept = 'x') OR (owner = 'ann')"));
-        assert_eq!(bob.scope.rows("select", "t").as_deref(), Some("(dept = 'x') OR (owner = 'bob')"));
-        assert_eq!(ann.scope.rows("select", "u").as_deref(), Some("dept = 'x'"), "the schema's grant, for every table of it");
-        assert_eq!(ann.scope.rows("insert", "t"), None, "another privilege's grant, with no filter: every row");
-        assert_eq!(Scope::granted(mine.clone()).rows("select", "t").as_deref(), Some("(dept = 'x') OR (owner = NULL)"), "no reader: no one's rows");
-        assert_eq!(Principal::node().scope.rows("select", "t"), None);
+        assert_eq!(ann.scope.rows(&Privilege::Select, "t").as_deref(), Some("(dept = 'x') OR (owner = 'ann')"));
+        assert_eq!(bob.scope.rows(&Privilege::Select, "t").as_deref(), Some("(dept = 'x') OR (owner = 'bob')"));
+        assert_eq!(ann.scope.rows(&Privilege::Select, "u").as_deref(), Some("dept = 'x'"), "the schema's grant, for every table of it");
+        assert_eq!(ann.scope.rows(&Privilege::Insert, "t"), None, "another privilege's grant, with no filter: every row");
+        assert_eq!(Scope::granted(mine.clone()).rows(&Privilege::Select, "t").as_deref(), Some("(dept = 'x') OR (owner = NULL)"), "no reader: no one's rows");
+        assert_eq!(Principal::node().scope.rows(&Privilege::Select, "t"), None);
         let every = access(vec![grant("select", t(), Some("owner = current_user")), grant("select", On::Lake, None)]);
-        assert_eq!(as_("ann", &every).scope.rows("select", "t"), None, "one grant with no filter: every row");
+        assert_eq!(as_("ann", &every).scope.rows(&Privilege::Select, "t"), None, "one grant with no filter: every row");
         let named = access(vec![grant("select", On::Table("l.t".into()), Some("n > 1")), grant("select", On::Lake, Some("n > 2"))]);
-        assert_eq!(as_("ann", &named).scope.rows_named("select", "l.t").as_deref(), Some("n > 1"), "another lake's table: only grants naming it");
+        assert_eq!(as_("ann", &named).scope.rows_named(&Privilege::Select, "l.t").as_deref(), Some("n > 1"), "another lake's table: only grants naming it");
 
         assert_ne!(ann.scope.key(), bob.scope.key(), "one filter on current_user, the same grants and names: two keys");
         assert_eq!(ann.scope.key(), as_("ann", &mine).scope.key());
@@ -703,6 +826,25 @@ mod tests {
             assert_eq!(said(may_in(&writer, action, Object::Table("t"), true)), "ok", "SQL's change reads them through the filter");
         }
         assert_eq!(said(may(&writer, Action::Insert, Object::Table("t"))), "ok", "a load's new rows change no row");
+
+        // (UPDATE's and DELETE's filters, piece 5c-1: a write reads its rows with SELECT's and its own together)
+        let editor = as_("ann", &access(vec![grant("select", t(), Some("dept = 'x'")), grant("update", t(), Some("owner = current_user")), grant("delete", t(), None)]));
+        let writing = editor.scope.writing(&Privilege::Update, "t");
+        assert_eq!(writing.rows(&Privilege::Select, "t").as_deref(), Some("(dept = 'x') AND (owner = 'ann')"));
+        assert_eq!(writing.rows(&Privilege::Select, "u"), None, "another table's reads are as before");
+        assert_eq!(writing.rows(&Privilege::Update, "t").as_deref(), Some("owner = 'ann'"));
+        assert_ne!(writing.key(), editor.scope.key(), "no answer is shared with a read's");
+        assert_eq!(editor.scope.writing(&Privilege::Delete, "t").key(), editor.scope.key(), "no filter on DELETE's rows: the scope itself");
+        let updater = as_("ann", &access(vec![grant("select", t(), None), grant("update", t(), Some("owner = current_user"))]));
+        assert_eq!(updater.scope.writing(&Privilege::Update, "t").rows(&Privilege::Select, "t").as_deref(), Some("owner = 'ann'"));
+        assert!(editor.scope.filtered("t") && updater.scope.filtered("t") && !updater.scope.filtered("u") && !Principal::node().scope.filtered("t"));
+        assert_eq!(said(may(&updater, Action::Update, Object::Table("t"))), "permission denied: t lets ann update some of its rows only (a filter on its rows in a grant): change them with SQL's UPDATE, DELETE, MERGE or INSERT … ON CONFLICT");
+        assert_eq!(said(may_in(&updater, Action::Update, Object::Table("t"), true)), "ok");
+        // (INSERT's, piece 5c-2: a load's new rows are refused, SQL's INSERT checks each)
+        let inserter = as_("ann", &access(vec![grant("select", t(), None), grant("insert", t(), Some("owner = current_user"))]));
+        assert_eq!(said(may(&inserter, Action::Insert, Object::Table("t"))), "permission denied: t lets ann insert some rows only (a filter on its rows in a grant): insert them with SQL's INSERT, which checks each");
+        assert_eq!(said(may_in(&inserter, Action::Insert, Object::Table("t"), true)), "ok");
+        assert!(inserter.scope.filtered("t"));
         assert!(!ann.scope.reads("t", ["owner"].into_iter()), "a key lookup: SQL answers it, through its filter");
         assert!(as_("ann", &plain).scope.reads("t", ["owner"].into_iter()));
     }

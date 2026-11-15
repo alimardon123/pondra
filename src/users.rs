@@ -10,6 +10,7 @@
 //! the lake; USAGE on a secret. A superuser may do everything, as the admin token does. The three
 //! tokens stay, as the first admin and for scripts (`auth.rs`).
 use crate::auth::{Principal, Role};
+use crate::rights::Privilege;
 use crate::words::{Words, W};
 use crate::store::{json, Lake};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -86,7 +87,7 @@ pub struct Token {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Grant {
-    pub privilege: String, // select, insert, update, delete, usage, clone, apply
+    pub privilege: Privilege, // (kept as its word: select, insert, update, delete, usage, clone, apply, a kind's own)
     pub on: On,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>, // (SELECT on these only)
@@ -98,7 +99,7 @@ pub struct Grant {
 
 impl Grant {
     /// CLONE and APPLY are the database's own (`ON DATABASE`, ADR-058), not every table's.
-    pub fn of_database(&self) -> bool { matches!(self.privilege.as_str(), "clone" | "apply") }
+    pub fn of_database(&self) -> bool { matches!(self.privilege, Privilege::Clone | Privilege::Apply) }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -127,8 +128,8 @@ pub enum Change {
     Alter { name: String, verifier: Option<Verifier>, superuser: Option<bool>, #[serde(default)] limits: Limits, #[serde(default)] login: Option<bool> },
     Drop { name: String, if_exists: bool },
     // (`rows`: `… WHERE condition`, a filter on the rows, as `row_filter::kept` prints it)
-    Grant { privileges: Vec<String>, on: On, columns: Vec<String>, to: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] rows: Option<String> },
-    Revoke { privileges: Vec<String>, on: On, columns: Vec<String>, from: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] rows: Option<String> },
+    Grant { privileges: Vec<Privilege>, on: On, columns: Vec<String>, to: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] rows: Option<String> },
+    Revoke { privileges: Vec<Privilege>, on: On, columns: Vec<String>, from: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] rows: Option<String> },
     GrantRole { roles: Vec<String>, to: Vec<String> },
     RevokeRole { roles: Vec<String>, from: Vec<String> },
     // (`hash`: a token made by whoever asked, `pondra token`, which sends only its hash: the token
@@ -140,7 +141,6 @@ pub enum Change {
     DropProvider { name: String, if_exists: bool },
 }
 
-const PRIVILEGES: [&str; 7] = ["select", "insert", "update", "delete", "usage", "clone", "apply"]; // (CLONE: a database's or a schema's, ADR-058; APPLY: a database's)
 
 // ---------------------------------------------------------------- statements
 
@@ -328,19 +328,19 @@ fn grant(w: &mut Words, grant: bool, rows: Option<&str>) -> Result<Change> {
     let kind = w.peek_word().and_then(|k| granted_kind(&k)); // (`ON CONNECTION shop`: its kind's privileges, below)
     for p in list {
         match p.as_str() {
-            "all" if kind.is_some() => privileges.extend(kind.iter().flat_map(|k| k.privileges.iter().map(|p| p.to_lowercase()))),
-            p if kind.is_some() => privileges.push(p.to_string()),
-            "all" => privileges.extend(["select", "insert", "update", "delete"].map(String::from)),
-            p if PRIVILEGES.contains(&p) => privileges.push(p.to_string()),
+            "all" if kind.is_some() => privileges.extend(kind.iter().flat_map(|k| k.privileges.iter().map(|p| Privilege::of(p)))),
+            p if kind.is_some() => privileges.push(Privilege::of(p)),
+            "all" => privileges.extend(Privilege::TABLE),
+            p if !matches!(Privilege::of(p), Privilege::Of(_)) => privileges.push(Privilege::of(p)), // (CLONE: a database's or a schema's, ADR-058; APPLY: a database's)
             p => bail!("{p}: the privileges are SELECT, INSERT, UPDATE, DELETE, ALL (on tables), USAGE (on secrets), CLONE (on a database or a schema) and APPLY (on a database)"),
         }
     }
     let on = if let Some(k) = kind {
         w.next(); // (its kind's word)
         let name = w.name()?;
-        let given: Vec<String> = k.privileges.iter().map(|p| p.to_lowercase()).collect();
+        let given: Vec<Privilege> = k.privileges.iter().map(|p| Privilege::of(p)).collect();
         if let Some(p) = privileges.iter().find(|p| !given.contains(p)) {
-            return Err(crate::codes::coded("0LP01", format!("{}: a {}'s privileges are {}", p.to_uppercase(), k.name, k.privileges.join(" and "))));
+            return Err(crate::codes::coded("0LP01", format!("{p}: a {}'s privileges are {}", k.name, k.privileges.join(" and "))));
         }
         ensure!(columns.is_empty(), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
         let to = if grant { "to" } else { "from" };
@@ -372,12 +372,12 @@ fn grant(w: &mut Words, grant: bool, rows: Option<&str>) -> Result<Change> {
         w.is("table");
         On::Table(w.name()?)
     };
-    ensure!(columns.is_empty() || privileges == ["select"] && matches!(on, On::Table(_)), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
+    ensure!(columns.is_empty() || privileges == [Privilege::Select] && matches!(on, On::Table(_)), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
     let usage = matches!(on, On::Secret(_));
-    ensure!(privileges.iter().all(|p| (p == "usage") == usage), "{}", if usage { "a secret's privilege is USAGE" } else { "USAGE is a secret's" });
-    ensure!(!privileges.iter().any(|p| p == "clone") || database.is_some() || matches!(on, On::Schema(_)), "CLONE is a database's or a schema's: GRANT CLONE ON DATABASE prod | SCHEMA sales TO r");
-    ensure!(!privileges.iter().any(|p| p == "apply") || database.is_some(), "APPLY is a database's: GRANT APPLY ON DATABASE prod TO ci");
-    ensure!(database.is_none() || privileges.iter().all(|p| p == "clone" || p == "apply"), "ON DATABASE is for CLONE and APPLY alone: a database's tables are ON ALL TABLES");
+    ensure!(privileges.iter().all(|p| (*p == Privilege::Usage) == usage), "{}", if usage { "a secret's privilege is USAGE" } else { "USAGE is a secret's" });
+    ensure!(!privileges.contains(&Privilege::Clone) || database.is_some() || matches!(on, On::Schema(_)), "CLONE is a database's or a schema's: GRANT CLONE ON DATABASE prod | SCHEMA sales TO r");
+    ensure!(!privileges.contains(&Privilege::Apply) || database.is_some(), "APPLY is a database's: GRANT APPLY ON DATABASE prod TO ci");
+    ensure!(database.is_none() || privileges.iter().all(|p| matches!(p, Privilege::Clone | Privilege::Apply)), "ON DATABASE is for CLONE and APPLY alone: a database's tables are ON ALL TABLES");
     w.expect(to)?;
     role_word(w);
     let who = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
@@ -386,9 +386,10 @@ fn grant(w: &mut Words, grant: bool, rows: Option<&str>) -> Result<Change> {
         if database.is_some() || !matches!(on, On::Table(_)) {
             return Err(a_tables());
         }
-        // (an INSERT's, an UPDATE's and a DELETE's filter is kept by their writes, which piece 5c makes)
-        if privileges.iter().any(|p| p != "select") {
-            return Err(crate::codes::coded("0A000", "a filter on rows is SELECT's: GRANT SELECT ON t TO r WHERE …"));
+        // (SELECT's reads, UPDATE's and DELETE's writes read through theirs, and INSERT's rows are checked by it: `change::rows_of`,
+        // `write::rows_of`. ALL is the four)
+        if privileges.iter().any(|p| !p.of_tables()) {
+            return Err(crate::codes::coded("0A000", "a filter on rows is a table's privileges', SELECT, INSERT, UPDATE and DELETE: GRANT INSERT ON t TO r WHERE …"));
         }
     }
     Ok(if grant { Change::Grant { privileges, on, columns, to: who, database, rows } } else { Change::Revoke { privileges, on, columns, from: who, database, rows } })
@@ -397,14 +398,14 @@ fn grant(w: &mut Words, grant: bool, rows: Option<&str>) -> Result<Change> {
 /// What a grant's `ON DATABASE d` is on. This database's own (as it always was), or CLONE on a
 /// database attached here: a user may branch it through its attachment (ADR-058). Anything else is
 /// run on the database it names.
-fn on_database(lake: &Lake, on: On, database: Option<&str>, privileges: &[String]) -> Result<On> {
+fn on_database(lake: &Lake, on: On, database: Option<&str>, privileges: &[Privilege]) -> Result<On> {
     let here = crate::ddl::lake_name(lake);
     let Some(d) = database else { return Ok(on) };
     if d == here {
         return Ok(On::Lake);
     }
     let attached = lake.attached.read().unwrap().iter().any(|(n, _)| n == d);
-    ensure!(attached && privileges.iter().all(|p| p == "clone"), "this is the database {here}: GRANT … ON DATABASE {d} is run on {d} (CLONE also on a database attached here)");
+    ensure!(attached && privileges.iter().all(|p| *p == Privilege::Clone), "this is the database {here}: GRANT … ON DATABASE {d} is run on {d} (CLONE also on a database attached here)");
     Ok(On::Database(d.to_string()))
 }
 
@@ -496,7 +497,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             for n in &to {
                 let mut u = grantee(lake, n).await?;
                 for p in &privileges {
-                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if p == "select" { columns.clone() } else { vec![] }, rows: rows.clone() };
+                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if *p == Privilege::Select { columns.clone() } else { vec![] }, rows: rows.clone() };
                     // (the newest grant of it with this filter stands, its columns replaced; one with another filter, or
                     // none, is its own grant: the rows of each are read)
                     u.grants.retain(|x| !(x.privilege == g.privilege && x.on == g.on && x.rows == g.rows));
@@ -1182,9 +1183,6 @@ async fn token_principal(lake: &Lake, user: &str, until: Option<u64>) -> Option<
 
 // ---------------------------------------------------------------- who is asking, and what they may do
 
-/// The privileges a grant gives on a table (or view): holding any of them, a user knows the table is there.
-const TABLE_PRIVILEGES: [&str; 4] = ["select", "insert", "update", "delete"];
-
 /// What a user may do: every grant of its own, its roles' (and theirs') and public's.
 #[derive(Default, Debug)]
 pub struct Access {
@@ -1200,10 +1198,10 @@ impl Access {
     pub fn granted(grants: Vec<Grant>) -> Access { Access { grants, ..Default::default() } }
     /// The columns of `table` (as the catalog names it) it may use for `privilege`: None, none;
     /// Some(None), every column; Some(Some(these)).
-    pub fn columns(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
+    pub fn columns(&self, privilege: &Privilege, table: &str) -> Option<Option<HashSet<String>>> {
         let schema = crate::text::split(table).0;
         let mut some: Option<HashSet<String>> = None;
-        for g in self.grants.iter().filter(|g| g.privilege == privilege) {
+        for g in self.grants.iter().filter(|g| g.privilege == *privilege) {
             match &g.on {
                 On::Lake => return Some(None),
                 On::Schema(s) if s == schema => return Some(None),
@@ -1214,13 +1212,13 @@ impl Access {
         }
         some.map(Some)
     }
-    pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    pub fn may(&self, privilege: &Privilege, table: &str) -> bool { self.columns(privilege, table).is_some() }
     /// The filters on the rows of `table` it may use for `privilege` (`Grant.rows`), its grants' that give it: None, every
     /// row (one of them has none, or no grant gives it, which `columns` refuses); Some(these), the rows where any holds, as
     /// Postgres's permissive policies join. `named`: a table of another lake attached here, which only grants naming it
     /// give (`named`). Rows and columns join apart, as Postgres's column grants and policies do: the columns one grant
     /// gives are read in the rows any gives.
-    pub fn rows(&self, privilege: &str, table: &str, named: bool) -> Option<Vec<&str>> {
+    pub fn rows(&self, privilege: &Privilege, table: &str, named: bool) -> Option<Vec<&str>> {
         let schema = crate::text::split(table).0;
         let gives = |g: &Grant| match &g.on {
             On::Table(t) => t == table,
@@ -1229,7 +1227,7 @@ impl Access {
             _ => false,
         };
         let mut some: Option<Vec<&str>> = None;
-        for g in self.grants.iter().filter(|g| g.privilege == privilege && gives(g)) {
+        for g in self.grants.iter().filter(|g| g.privilege == *privilege && gives(g)) {
             match &g.rows {
                 None => return None,
                 Some(r) => some.get_or_insert_with(Vec::new).push(r.as_str()),
@@ -1244,10 +1242,11 @@ impl Access {
     /// Every filter on rows its grants hold, any privilege's, any table's (`rights::Scope::key`: what is filled in for its
     /// reader is in the key).
     pub(crate) fn filters(&self) -> impl Iterator<Item = &str> { self.grants.iter().filter_map(|g| g.rows.as_deref()) }
-    /// Whether it holds any privilege on `table`: SELECT, INSERT, UPDATE or DELETE, on it, its schema or the lake.
-    pub fn knows(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.columns(p, table).is_some()) }
+    /// Whether it holds any privilege on `table` (or view), SELECT, INSERT, UPDATE or DELETE, on it, its schema or the
+    /// lake: then it knows the table is there.
+    pub fn knows(&self, table: &str) -> bool { Privilege::TABLE.iter().any(|p| self.columns(p, table).is_some()) }
     /// The same, for a table of another lake attached here (`named`).
-    pub fn knows_named(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.named(p, table).is_some()) }
+    pub fn knows_named(&self, table: &str) -> bool { Privilege::TABLE.iter().any(|p| self.named(p, table).is_some()) }
     /// What it holds, as one name (`rights::Scope::key`): its grants and its names, each in any order, hashed. Not its
     /// limits, which change no answer.
     pub fn key(&self) -> &str {
@@ -1262,9 +1261,9 @@ impl Access {
     }
     /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming
     /// it count; ON ALL TABLES and ON SCHEMA are this lake's.
-    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
+    pub fn named(&self, privilege: &Privilege, table: &str) -> Option<Option<HashSet<String>>> {
         let mut some: Option<HashSet<String>> = None;
-        for g in self.grants.iter().filter(|g| g.privilege == privilege && g.on == On::Table(table.to_string())) {
+        for g in self.grants.iter().filter(|g| g.privilege == *privilege && g.on == On::Table(table.to_string())) {
             if g.columns.is_empty() {
                 return Some(None);
             }
@@ -1272,17 +1271,17 @@ impl Access {
         }
         some.map(Some)
     }
-    pub fn secret(&self, name: &str) -> bool { self.grants.iter().any(|g| g.privilege == "usage" && g.on == On::Secret(name.to_string())) }
+    pub fn secret(&self, name: &str) -> bool { self.grants.iter().any(|g| g.privilege == Privilege::Usage && g.on == On::Secret(name.to_string())) }
     /// Whether it may use the object `name` of an extension's `kind` for `privilege` (`READ` on a connection), granted to it,
     /// a role of its or public.
-    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool {
-        self.grants.iter().any(|g| g.privilege.eq_ignore_ascii_case(privilege) && matches!(&g.on, On::Object { kind: k, name: n } if k == kind && n == name))
+    pub fn may_use(&self, kind: &str, name: &str, privilege: &Privilege) -> bool {
+        self.grants.iter().any(|g| g.privilege == *privilege && matches!(&g.on, On::Object { kind: k, name: n } if k == kind && n == name))
     }
     /// The schemas this user may clone a branch of, or pin one for (ADR-058): None, no CLONE grant;
     /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
     pub fn clones(&self) -> Option<Vec<String>> {
         let mut some: Option<Vec<String>> = None;
-        for g in self.grants.iter().filter(|g| g.privilege == "clone") {
+        for g in self.grants.iter().filter(|g| g.privilege == Privilege::Clone) {
             match &g.on {
                 On::Lake => return Some(vec![]),
                 On::Schema(s) => some.get_or_insert_with(Vec::new).push(s.clone()),
@@ -1293,10 +1292,10 @@ impl Access {
     }
     /// Whether this user may clone `db`, a database attached here, through its attachment (GRANT CLONE
     /// ON DATABASE db, ADR-058): `branch::door`.
-    pub fn clones_of(&self, db: &str) -> bool { self.grants.iter().any(|g| g.privilege == "clone" && g.on == On::Database(db.to_string())) }
+    pub fn clones_of(&self, db: &str) -> bool { self.grants.iter().any(|g| g.privilege == Privilege::Clone && g.on == On::Database(db.to_string())) }
     /// Whether this user may apply to this database (GRANT APPLY ON DATABASE, ADR-058): `apply::ask`.
-    pub fn applies(&self) -> bool { self.grants.iter().any(|g| g.privilege == "apply" && g.on == On::Lake) }
-    fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
+    pub fn applies(&self) -> bool { self.grants.iter().any(|g| g.privilege == Privilege::Apply && g.on == On::Lake) }
+    fn writes(&self) -> bool { self.grants.iter().any(|g| matches!(g.privilege, Privilege::Insert | Privilege::Update | Privilege::Delete)) }
 }
 
 /// What this lake's sign-ins worked out goes at once (elsewhere, within `fresh`'s second): its users' access, whether anyone
@@ -1500,7 +1499,7 @@ pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::wri
     across(other, ns, scope).await?;
     let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
     match privileges.iter().find(|p| scope.named(p, &table).is_none()) {
-        Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
+        Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p, p),
         None => Ok(()),
     }
 }
@@ -1618,7 +1617,7 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
     let g = |f: &dyn Fn(&String, &Grant) -> Option<String>| Arc::new(rows.iter().map(|(n, g)| f(n, g)).collect::<StringArray>()) as ArrayRef;
     let grants = RecordBatch::try_from_iter(vec![
         ("grantee", g(&|n, _| Some(n.clone()))),
-        ("privilege", g(&|_, g| Some(g.privilege.to_uppercase()))),
+        ("privilege", g(&|_, g| Some(g.privilege.to_string()))),
         ("on_kind", g(&|_, g| Some(match &g.on { On::Table(_) => "table", On::Schema(_) => "schema", On::Lake if g.of_database() => "database", On::Lake => "lake", On::Secret(_) => "secret", On::Database(_) => "database", On::Object { kind, .. } => kind }.into()))),
         ("on_name", g(&|_, g| match &g.on { On::Table(n) | On::Schema(n) | On::Secret(n) | On::Database(n) | On::Object { name: n, .. } => Some(n.clone()), On::Lake if g.of_database() => Some(here.clone()), On::Lake => None })),
         ("columns", g(&|_, g| Some(g.columns.join(", ")).filter(|c| !c.is_empty()))),
@@ -1781,8 +1780,10 @@ mod tests {
         }
         assert_eq!(p("GRANT USAGE ON SECRET s TO ann WHERE a = 1")["code"], "0A000");
         assert_eq!(p("GRANT analyst TO ann WHERE a = 1")["code"], "0A000");
-        assert_eq!(p("GRANT INSERT ON t TO ann WHERE a = 1")["error"], "a filter on rows is SELECT's: GRANT SELECT ON t TO r WHERE …");
-        assert_eq!(p("GRANT ALL ON t TO ann WHERE a = 1")["code"], "0A000");
+        assert_eq!(p("GRANT INSERT ON t TO ann WHERE a = 1")["rows"], "a = 1");
+        assert_eq!(p("GRANT ALL ON t TO ann WHERE a = 1")["privileges"], j!(["select", "insert", "update", "delete"]), "the four, each with it");
+        assert_eq!(p("GRANT UPDATE, DELETE ON t TO ann WHERE Dept = 'eng'")["rows"], "dept = 'eng'", "UPDATE's and DELETE's: their writes read through it");
+        assert_eq!(p("REVOKE DELETE ON t FROM ann WHERE dept = 'eng'")["rows"], "dept = 'eng'");
         assert_eq!(p("GRANT SELECT ON t TO ann WHERE")["code"], "42601");
         assert_eq!(p("GRANT SELECT ON t TO ann WHERE a = 1; DROP TABLE t")["code"], "42601", "one condition, and nothing after it");
         // (Postgres's own filters on rows: refused, naming ours)

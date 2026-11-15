@@ -552,7 +552,7 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
                 On::Object { kind, name } => format!("{} {}", kind.to_uppercase(), ident(name)), // (an extension's kind: `GRANT READ ON CONNECTION shop`)
             };
             let rows = g.rows.as_ref().map_or(String::new(), |r| format!(" WHERE {r}")); // (its filter on rows, as kept)
-            out.push(format!("GRANT {}{columns} ON {on} TO {}{rows}", g.privilege.to_uppercase(), ident(&k[2..])));
+            out.push(format!("GRANT {}{columns} ON {on} TO {}{rows}", g.privilege, ident(&k[2..])));
         }
     }
     Ok(out)

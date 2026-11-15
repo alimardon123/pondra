@@ -7,8 +7,8 @@
 //! (in a string or a comment too), and its marks, each a run of symbols or letters anywhere. A pass whose trigger is not in
 //! a text must have nothing to do there; the corpus test and the check (`checked`) hold every pass to that.
 //!
-//! The tree passes (`pattern::rewrite`, `pg_casts::rewrite`, `friendly::rewrite`, the measures) are still named in
-//! `front::expand`: they take the host, whose futures aren't boxed yet (step 8's PR 9 brings them here).
+//! The tree passes (`pondra.diff`, the measures, the expander, MATCH_RECOGNIZE, Postgres's casts, DuckDB's forms) are the
+//! registry's too, in their own section (`front::Trees`, step 8's PR 9b): they take the host, which lives a floor above.
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use datafusion::sql::sqlparser::ast::{Expr, Statement};
 use datafusion::sql::sqlparser::dialect::Dialect;
@@ -178,26 +178,19 @@ impl Passes {
         Ok(out)
     }
 
-    /// Whether any `Wants` pass has something to do in `sql`, each asked only when its trigger fired; or, when a hook's
-    /// trigger fired, whether GenericDialect refuses the text, so the front reads it with the fallback dialect.
-    pub fn wants(&self, sql: &str) -> anyhow::Result<bool> {
-        let fired = self.fired(sql);
-        let mut wanted = false;
-        for (i, p) in self.all.iter().enumerate() {
-            match (p.run, fired.has(i)) {
-                (Run::Wants(f), true) => wanted = wanted || f(sql),
-                (Run::Wants(f), false) if checked() => anyhow::ensure!(!f(sql), "{}", missed(p, sql)),
-                (Run::Parse(_), true) => wanted = wanted || crate::parsed::generic(sql).is_err(),
-                _ => {}
-            }
-            if wanted && !checked() {
-                return Ok(true);
-            }
-        }
-        if checked() && !wanted && crate::parsed::generic(sql).is_err() {
-            self.hooks_fired(sql, &crate::dialect::parse(sql).1)?; // (a hook that would read the text: its trigger fired)
-        }
-        Ok(wanted)
+    /// What the `Wants` passes say of `sql`: each look asked once, only when its trigger fired, and only when the front
+    /// needs it (`Wants`).
+    pub fn wants<'s>(&'s self, sql: &'s str) -> Wants<'s> {
+        Wants { passes: self, sql, fired: self.fired(sql), asked: 0, said: 0 }
+    }
+
+    /// The `Wants` passes named, as bits by their place in the section (`Wants::any_of`); None when a name is no `Wants`
+    /// pass's.
+    pub fn wants_mask(&self, names: &[&str]) -> Option<u128> {
+        names.iter().try_fold(0u128, |mask, name| {
+            let i = self.all.iter().position(|p| p.name == *name && matches!(p.run, Run::Wants(_)))?;
+            Some(mask | 1 << i)
+        })
     }
 
     /// The fallback dialect's hooks, in their order.
@@ -215,6 +208,76 @@ impl Passes {
             anyhow::ensure!(fired.has(i), "{}", missed(p, sql));
         }
         Ok(())
+    }
+}
+
+/// What the `Wants` passes say of one text (`Passes::wants`): first whether any has something to do (`any`), then, for a
+/// tree pass, whether one of its looks has (`any_of`). Each look is asked once, and only when its trigger fired.
+pub struct Wants<'s> {
+    passes: &'s Passes,
+    sql: &'s str,
+    fired: Fired,
+    asked: u128,
+    said: u128,
+}
+
+impl Wants<'_> {
+    /// Whether the pass at `i` has something to do in the text: a `Wants` pass's look, or a hook's trigger in a text
+    /// GenericDialect refuses (asked the first time only).
+    fn says(&mut self, i: usize) -> anyhow::Result<bool> {
+        let bit = 1u128 << i;
+        if self.asked & bit == 0 {
+            self.asked |= bit;
+            let p = &self.passes.all[i];
+            let yes = match (p.run, self.fired.has(i)) {
+                (Run::Wants(f), true) => f(self.sql),
+                (Run::Wants(f), false) if checked() => {
+                    anyhow::ensure!(!f(self.sql), "{}", missed(p, self.sql));
+                    false
+                }
+                (Run::Parse(_), true) => crate::parsed::generic(self.sql).is_err(),
+                _ => false,
+            };
+            if yes {
+                self.said |= bit;
+            }
+        }
+        Ok(self.said & bit != 0)
+    }
+
+    /// Whether any `Wants` pass has something to do in the text; or, when a hook's trigger fired, whether GenericDialect
+    /// refuses it, so the front reads it with the fallback dialect. It stops at the first that has, unless checked.
+    pub fn any(&mut self) -> anyhow::Result<bool> {
+        let mut wanted = false;
+        for i in 0..self.passes.all.len() {
+            let ask = match self.passes.all[i].run {
+                Run::Wants(_) => !wanted || checked(), // (checked: every look, so one whose trigger missed is refused)
+                Run::Parse(_) => !wanted,              // (a hook only when no look has: the text is parsed then anyway)
+                _ => false,
+            };
+            if ask {
+                wanted |= self.says(i)?;
+            }
+            if wanted && !checked() {
+                return Ok(true);
+            }
+        }
+        if checked() && !wanted && crate::parsed::generic(self.sql).is_err() {
+            self.passes.hooks_fired(self.sql, &crate::dialect::parse(self.sql).1)?; // (a hook that would read the text: its trigger fired)
+        }
+        Ok(wanted)
+    }
+
+    /// Whether one of the `Wants` passes in `mask` (`Passes::wants_mask`) has something to do in the text.
+    pub fn any_of(&mut self, mask: u128) -> anyhow::Result<bool> {
+        let mut rest = mask;
+        while rest != 0 {
+            if self.says(rest.trailing_zeros() as usize)? {
+                return Ok(true);
+            }
+            rest &= rest - 1;
+        }
+        Ok(false)
     }
 }
 

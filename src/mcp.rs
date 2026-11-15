@@ -267,7 +267,7 @@ async fn list(app: &App, scope: &crate::rights::Scope) -> Result<Value> {
             // (a table granted in part: the columns granted, as every listing shows them: `rights::Scope::columns`)
             let shown = match prefix.is_empty() {
                 true => scope.columns(name),
-                false => scope.named("select", &format!("{prefix}{name}")),
+                false => scope.columns_named(&format!("{prefix}{name}")),
             }
             .flatten();
             let reads = |c: &str| shown.as_ref().is_none_or(|s| s.contains(c));
