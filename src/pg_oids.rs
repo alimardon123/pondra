@@ -8,12 +8,13 @@ use datafusion::arrow::datatypes::DataType;
 pub struct PgType(pub u32, pub &'static str, pub &'static str, pub i16, pub char, pub u32);
 
 /// pgvector's `vector`, and its array. pgvector's types have no oid of their own: each database gets one when CREATE
-/// EXTENSION runs, in the schema it names, public by default. Pondra's are fixed, in public (`schema`). A VECTOR(n) column
-/// is still sent as `real[]`, which every driver reads as a list; the type is here for the drivers that look `vector` up
-/// to send one (pgvector's `register_vector`), so a parameter of it is read (`pg_values`). `bit` is there for the same
-/// call, which looks up both.
-pub const VECTOR: u32 = 16385;
-pub const VECTORS: u32 = 16386;
+/// EXTENSION runs, in the schema it names, public by default. Pondra's are fixed, in public (`schema`), above the oids
+/// the catalog gives the lake's objects (`pg_catalog::oid`: 16384 up to 2,000,016,384), so none lands on one, and below
+/// 2^31 for the drivers that hold an oid as a signed int. A VECTOR(n) column is still sent as `real[]`, which every
+/// driver reads as a list; the type is here for the drivers that look `vector` up to send one (pgvector's
+/// `register_vector`), so a parameter of it is read (`pg_values`). `bit` is there for the same call, which looks up both.
+pub const VECTOR: u32 = 2_100_000_001;
+pub const VECTORS: u32 = 2_100_000_002;
 
 /// A type's schema: pg_catalog's (11), or public's (2200) for pgvector's.
 pub fn schema(oid: u32) -> u32 { if oid == VECTOR || oid == VECTORS { 2200 } else { 11 } }
