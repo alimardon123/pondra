@@ -724,9 +724,33 @@ impl<'a> Expander<'a> {
 /// The most expressions one function's call may come to, written out.
 const LARGEST: usize = 100_000;
 
+/// The front's tree pass (`front::Trees`): the macros, functions and views a statement calls or names, a FROM first and
+/// an attached catalog's names, expanded, when the front found one (`Facts::expands`). A view's or a function's own
+/// statements (CREATE VIEW, MACRO, FUNCTION) keep their text.
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "expander.expand", order: 30, looks: &[], run: tree } }
+
+fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
+    Box::pin(async move {
+        if !facts.expands() {
+            return Ok(false);
+        }
+        let all = &facts.routines.own;
+        let columns = columns(front, stmts, all).await?;
+        for s in stmts.iter_mut() {
+            if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateFunction(_) | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
+                let mut expander = Expander { name: &facts.name, all, lake: &facts.routines.lake, views: facts.views, outside: &facts.outside, depth: 0, own: 0, columns: &columns, scopes: vec![] };
+                if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut expander) {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(true)
+    })
+}
+
 /// The columns of the lake's tables that `stmts` and the SQL functions' bodies read, by name,
 /// when a function reads a table: what an argument's columns are told apart by (`Expander::owner`).
-pub(crate) async fn columns<H: crate::front::Host>(host: &H, stmts: &[Statement], all: &HashMap<String, Routine>) -> Result<HashMap<String, Vec<String>>> {
+pub(crate) async fn columns<H: crate::front::Host + ?Sized>(host: &H, stmts: &[Statement], all: &HashMap<String, Routine>) -> Result<HashMap<String, Vec<String>>> {
     let name = host.name();
     let reading: Vec<&Routine> = all.values().filter(|r| r.kind != Kind::Procedure && !r.python() && crate::text::mentions(&r.body, "from")).collect();
     if reading.is_empty() {
@@ -923,6 +947,9 @@ impl VisitorMut for Expander<'_> {
                 Ok(q) => q,
                 Err(e) => return ControlFlow::Break(e.context(format!("{name}"))),
             };
+            if crate::grouping::wanted(sql) {
+                crate::grouping::regroup(&mut q); // (a frame groups as the same query sent alone: `front::expand`)
+            }
             crate::walk::visit_mut(&mut q, &mut Expander { views: &NONE, depth: self.depth + 1, scopes: vec![], ..*self })?; // (its functions; its names are the lake's)
             let shown = name.0.last().and_then(|part| part.as_ident()).map_or_else(|| object(name), crate::text::ident); // (`FROM page.public.v` reads as v, as in Postgres)
             let alias = alias.clone().or_else(|| Some(ast::TableAlias { explicit: true, name: ast::Ident::new(shown), columns: vec![], at: None }));

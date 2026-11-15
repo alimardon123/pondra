@@ -287,6 +287,7 @@ permission denied: INSERT on notes
 | `GRANT SELECT [(a, b)] \| INSERT \| UPDATE \| DELETE \| ALL ON t TO r` | a table or view, or some of its columns |
 | `GRANT … ON SCHEMA s` or `ON ALL TABLES IN SCHEMA s` | every table of a schema, now and later |
 | `GRANT … ON ALL TABLES` | every table of the lake (and of the lakes attached to it) |
+| `GRANT SELECT ON t TO r WHERE condition` | some of a table's rows ([below](#a-grants-rows)) |
 | `GRANT USAGE ON SECRET s TO r` | queries may read the URLs its scope covers (below) |
 | `GRANT r TO u`, `REVOKE r FROM u`, `REVOKE … FROM r` | roles held, and grants taken back |
 | `GRANT … TO public` | every user |
@@ -323,6 +324,58 @@ through the Iceberg catalog) needs every column of it. SELECT on all of a materi
 the rows its expectations left out, every column of each, in
 [`pondra.rejects`](/pondra/sql/system-tables/#flows-and-expectations): a view of
 `CHECK (region = 'EU') ON VIOLATION DROP ROW` shows its readers every non-EU row too.
+
+### A grant's rows
+
+A grant may hold some of a table's rows only: those where its condition holds. Postgres keeps such a filter
+as a policy on the table; here it is the grant's, so one statement says who reads what:
+
+```python
+admin.sql("CREATE TABLE regional (id BIGINT, region VARCHAR, owner VARCHAR)")
+admin.sql("INSERT INTO regional VALUES (1, 'eu', 'bob'), (2, 'us', 'ann'), (3, 'us', 'bob')")
+admin.sql("GRANT SELECT ON regional TO staff WHERE region = 'eu'")
+admin.sql("GRANT SELECT ON regional TO staff WHERE owner = current_user")
+print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
+admin.sql("REVOKE SELECT ON regional FROM staff WHERE region = 'eu'")
+print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
+```
+
+```text
+[{'id': 1}, {'id': 2}]
+[{'id': 2}]
+```
+
+- The condition reads its own row only: the table's columns, literals, immutable functions, and `current_user`
+  (or `current_role`, `session_user`), which is whoever reads. No subquery, aggregate, window, parameter or function
+  that may answer otherwise each time (`random()`, `now()`). It is checked when it is granted, and kept as written
+  again from its parse (`pondra.grants` shows it, in the `rows` column).
+- It is a table's: on a view, a schema or every table it is refused. `GRANT ALL ON t TO r WHERE condition` gives
+  each of SELECT, INSERT, UPDATE and DELETE that filter.
+- A reader's grants on one table add up: the rows any of their filters holds for, and every row if one grant has
+  none. Columns add up apart from rows, as in Postgres, so a grant of other columns with no filter shows every row
+  of those columns.
+- Rows a reader may not see never reach its query: counts, sums and joins are of its rows only, and a condition
+  that would fail on a hidden row (`1 / (amount - 1)`) never fails its query. `EXPLAIN` says a grant's filter is
+  there, and doesn't show it. The planner's counts of a filtered table are unknown to its reader.
+- A stream of the whole table (Kafka, `/watch`, `/lookup`, Flight's log, another engine through the Iceberg catalog)
+  is refused to a reader a filter holds, saying to read it with SELECT.
+- A writer a filter holds changes only rows it reads: an UPDATE, DELETE or MERGE leaves a hidden row as it is, and
+  an insert of a key a hidden row holds is refused as any taken key is (23505), so that row isn't replaced. A load
+  whose rows replace their keys' rows (COPY, Flight or Kafka into a keyed table) is refused to them, naming SQL's ways,
+  and so is an INSERT into a merge table, whose rows add up by key as they're read.
+- UPDATE's and DELETE's own filters (`GRANT UPDATE ON t TO r WHERE condition`) say which rows a writer changes: its
+  UPDATE or DELETE changes the rows both its SELECT filter and that one hold, and leaves the rest as they are, as
+  Postgres's policy `USING` does; a MERGE's UPDATE and DELETE clauses keep theirs. An UPDATE whose new version its
+  filter doesn't hold is refused (42501), as Postgres's `WITH CHECK`. A subquery of the same table in the statement
+  reads those rows too.
+- INSERT's filter says which rows a writer adds: each row an INSERT, a MERGE's insert or an upsert proposes must meet
+  it, or the statement is refused (42501) and writes nothing, as Postgres's `WITH CHECK`. Such an INSERT's rows are
+  worked out where it runs, to be checked. A load (COPY FROM STDIN, Flight, Kafka, an Iceberg engine's commit, the
+  HTTP `/insert`) doesn't check them, so it is refused to that writer, naming SQL's INSERT.
+- `REVOKE … WHERE condition` takes back the grant of that filter only; `REVOKE` without one, every grant of the
+  privilege.
+- `CREATE POLICY` and `ALTER TABLE … ROW LEVEL SECURITY` are refused, naming this: a table no grant filters is read
+  whole by whoever may read it, so there is nothing to switch on.
 
 ## Secrets
 
@@ -402,6 +455,49 @@ quota: ann's statements run at most 1 s (STATEMENT_TIMEOUT); this one was stoppe
 A write stopped this way may still land if it was already committing, as with Postgres's
 `statement_timeout` on a remote commit.
 
+A role's options reach its members, and the tightest wins: a member runs at most the fewest
+statements at once, each for the shortest time, that it, a role it holds or `public` sets, so
+nothing a member sets lifts a role's (each member's statements are counted on their own). One more
+option makes a role an agent's guardrail: **`READ ONLY`**, which reads and writes nothing to the
+lake, whatever it is granted, at every door. Its session's temporary tables and `$variables` still
+work, and a `CALL` runs, each of its statements checked as the caller's. `READ WRITE` takes it back.
+
+```python
+admin.sql("CREATE ROLE agent READ ONLY MAX_QUERIES 4")
+admin.sql("GRANT INSERT ON notes TO ann")
+admin.sql("GRANT agent TO ann")
+print(attempt_as(ann, "INSERT INTO notes VALUES (3, 'third')"))
+print(attempt_as(ann, "SELECT count(*) AS n FROM notes"))
+admin.sql("REVOKE agent FROM ann")
+print(attempt_as(ann, "INSERT INTO notes VALUES (3, 'third')"))
+```
+
+```text
+permission denied: ann is READ ONLY (an option of its own or of a role it holds), so it may not write
+ran
+ran
+```
+
+**`MAX_ROWS n`** holds each answer sent to a member to n rows: past them the answer is cut, and
+every door says so. Over HTTP the `x-pondra-cut` header names the rows it was cut at and a notice
+says why; Postgres sends a WARNING before the rows; an Arrow or Flight SQL stream's schema carries
+`pondra.cut`; MCP's answer has the notice. Only rows sent back are cut: an `INSERT … SELECT`, a
+`CREATE TABLE … AS` and a refresh run whole. A script under such a role sees a short answer, so it
+reads the header.
+
+```python
+admin.sql("ALTER ROLE agent READ WRITE MAX_ROWS 3")
+admin.sql("GRANT agent TO ann")
+answer = requests.post("http://localhost:8086/sql", data="SELECT v FROM generate_series(1, 10) AS g(v)",
+                       auth=("ann", "correct-horse-battery"))
+print(len(answer.json()), answer.headers["x-pondra-cut"])
+admin.sql("REVOKE agent FROM ann")
+```
+
+```text
+3 3
+```
+
 ## The audit log
 
 **`pondra.audit`** says who did what, through which door and from where, and what came of it.
@@ -428,6 +524,7 @@ for row in admin.sql("""SELECT "user", door, class, statement, outcome FROM pond
 {'user': 'ann', 'door': 'http', 'class': 'write', 'statement': "INSERT INTO notes VALUES (2, 'second')", 'outcome': 'refused'}
 {'user': 'admin', 'door': 'http', 'class': 'role', 'statement': "CREATE TOKEN nightly FOR USER ann EXPIRES IN '***'", 'outcome': 'ok'}
 {'user': 'admin', 'door': 'http', 'class': 'role', 'statement': "ALTER USER ann MAX_QUERIES 2 STATEMENT_TIMEOUT '***'", 'outcome': 'ok'}
+{'user': 'ann', 'door': 'http', 'class': 'write', 'statement': "INSERT INTO notes VALUES (3, 'third')", 'outcome': 'refused'}
 ```
 
 Each row also has the time (`at`), the address it came from (`from`), the error (`message`), how

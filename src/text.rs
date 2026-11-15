@@ -69,6 +69,26 @@ fn comment_end(s: &str) -> usize {
     s.len()
 }
 
+/// Where the `)` that closes the `(` `s` starts with stands, past what's inside quotes and comments: `(a, ')') TO …`'s
+/// is the one before ` TO`. None when it isn't closed.
+pub fn closing(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut i, mut depth) = (0, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' if depth == 1 => return Some(i),
+            b')' => depth = depth.checked_sub(1)?,
+            q @ (b'\'' | b'"') => i += 1 + b[i + 1..].iter().position(|&c| c == q)?, // (a doubled quote is two strings in a row)
+            b'-' if b.get(i + 1) == Some(&b'-') => i += b[i..].iter().position(|&c| c == b'\n')?,
+            b'/' if b.get(i + 1) == Some(&b'*') => i += comment_end(&s[i..]) - 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The first `n` words of `sql` past its leading comments, upper-cased, with a `;` at its end taken off: the words
 /// `control` reads, so a word is whole (`merged` is not `MERGE`).
 pub fn first_words(sql: &str, n: usize) -> Vec<String> {

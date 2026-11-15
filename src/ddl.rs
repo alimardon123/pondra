@@ -653,13 +653,13 @@ async fn carry_out(lake: &Lake, d: Ddl, by: &crate::auth::Principal) -> Result<V
                 }
                 bail!("{name} has branches ({}): drop them first; a dropped one reads {name}'s files until its time is up", named.join("; "));
             }
-            if target.is_none() && if_exists && !crate::env::is_set("PONDRA_SERVER_URL") {
+            if target.is_none() && if_exists && !lake.node.settings.is_set("PONDRA_SERVER_URL") {
                 return Ok(j!({"database": name, "dropped": false, "notice": format!("database \"{name}\" does not exist, skipping")}));
             }
             // (kept to be undropped, its folder as it was, under a mark: `undrop::LAKE_MARK`. A branch's pins in its
             // bases stay as long, so their files do: its base's sweep lets them go once its folder is gone)
             let by = crate::auth::name();
-            let dropped = match (crate::env::get("PONDRA_SERVER_URL"), &bases, &target) {
+            let dropped = match (lake.node.settings.get("PONDRA_SERVER_URL").map(str::to_string), &bases, &target) {
                 (Some(server), ..) => {
                     let query = format!("if_exists={if_exists}&purge={purge}&by={}", url::form_urlencoded::byte_serialize(by.as_bytes()).collect::<String>());
                     databases_call(&lake.node, &server, true, format!("/databases/{name}?{query}")).await?
@@ -831,7 +831,7 @@ async fn databases_call(node: &crate::node_state::NodeState, server: &str, delet
 async fn undrop_database(lake: &Lake, name: &str, by: &crate::auth::Principal) -> Result<Value> {
     ensure!(by.scope.whole(), crate::codes::coded("42501", format!("permission denied: UNDROP DATABASE {name} needs an admin")));
     database_name(name)?;
-    let dir = match crate::env::get("PONDRA_SERVER_URL") {
+    let dir = match lake.node.settings.get("PONDRA_SERVER_URL").map(str::to_string) {
         Some(server) => {
             let answer = databases_call(&lake.node, &server, false, format!("/databases/{name}/undrop")).await?;
             full(answer["dir"].as_str().context("the server's answer names no folder")?)?
@@ -2542,7 +2542,7 @@ mod tests {
         let made = lake.cat.get::<crate::views::View>(&crate::views::view_key("v")).await?.expect("v");
         let fill = made.fill.clone().map(|f| crate::views::Fill { upto: Some(0), ..f }); // (as the sequencer sets it: `views::bound`)
         lake.cat.commit(vec![(crate::views::view_key("v"), json(&crate::views::View { fill, ..made }))], &[]).await?;
-        let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![] }])));
+        let mover = crate::rights::Scope::granted(std::sync::Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec![], rows: None }])));
         let at_a_door = crate::auth::Principal { name: "mover".into(), role: crate::auth::Role::Read, scope: mover.clone(), door: "test", from: None, operator: false, epoch: 0, until: None, reads: false };
         let stmt = crate::write::parse("ALTER TABLE t ALTER COLUMN b FIRST").expect("an ALTER");
         let refused = crate::auth::WHO.scope(at_a_door.clone(), async { crate::rights::may_run(crate::auth::Role::Read, &stmt) }).await.expect_err("a SELECT-only mover is refused at a door");

@@ -1378,7 +1378,8 @@
    "privilege Utf8",
    "on_kind Utf8",
    "on_name Utf8",
-   "columns Utf8"
+   "columns Utf8",
+   "rows Utf8"
   ],
   "pondra.history": [
    "at Timestamp(\u00b5s, \"UTC\")",
@@ -1526,6 +1527,8 @@
    "member_of Utf8",
    "max_queries Int64",
    "statement_timeout Utf8",
+   "read_only Boolean",
+   "max_rows Int64",
    "created Timestamp(\u00b5s, \"UTC\")"
   ],
   "pondra.variables": [

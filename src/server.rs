@@ -1203,6 +1203,9 @@ async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams
     if let Some(h) = crate::statement::notices(&said.heard).and_then(|t| axum::http::HeaderValue::from_str(&t).ok()) {
         r.headers_mut().insert("x-pondra-notices", h);
     }
+    if let Some(n) = crate::answer::cut_heard(&said.heard) {
+        r.headers_mut().insert("x-pondra-cut", n.into()); // (`MAX_ROWS`: the rows the answer was cut at)
+    }
     r
 }
 

@@ -26,11 +26,11 @@ const FILE_BYTES: usize = 128 << 20; // (a file this big is closed, and another 
 pub async fn insert(lake: &Lake, table: &str, name: &str, names: Option<Vec<String>>, query: &str, job: &str, scope: &crate::rights::Scope) -> Result<Value> {
     let spec = crate::ext_names::spec(table).context("not another engine's table")?;
     crate::ext::check(lake, &spec, scope).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
+    crate::table_formats::may(name, &spec.format, crate::table_formats::Ability::Insert)?; // (refused in its format's words)
     let rows = Rows::Insert { name: name.to_string(), names, query: query.to_string() };
     match spec.format.as_str() {
         "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), rows, job, false, scope).await,
-        "iceberg" => iceberg(lake, &spec, rows, job, false, scope).await,
-        f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
+        _ => iceberg(lake, &spec, rows, job, false, scope).await,
     }
 }
 
@@ -65,11 +65,11 @@ impl Rows {
 pub async fn columns(lake: &Lake, target: &str, scope: &crate::rights::Scope) -> Result<Vec<String>> {
     let spec = crate::ext_names::spec(target).context("not another engine's table")?;
     crate::ext::check(lake, &spec, scope).await?; // (its columns are read by whoever may write it, as its rows are: `insert`)
+    crate::table_formats::may(target, &spec.format, crate::table_formats::Ability::Insert)?;
     let url = spec.urls[0].trim_end_matches('/');
     Ok(match spec.format.as_str() {
         "delta" => read_delta::schema(url, &read_delta::replay(&crate::ext::Asking { lake, scope }, url, None).await?.metadata)?.0.into_iter().map(|(_, logical, _)| logical).collect(),
-        "iceberg" => crate::read_iceberg::schema_of(&crate::read_iceberg::current(lake, url, &spec.options, scope).await?.1)?.1.into_iter().map(|(n, ..)| n).collect(),
-        f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
+        _ => crate::read_iceberg::schema_of(&crate::read_iceberg::current(lake, url, &spec.options, scope).await?.1)?.1.into_iter().map(|(n, ..)| n).collect(),
     })
 }
 
@@ -757,14 +757,10 @@ fn murmur3(data: &[u8]) -> u32 {
     h ^ (h >> 16)
 }
 
-/// A bound in Iceberg's single-value form (hex, as `avro.rs` writes bytes), or None.
+/// A bound in Iceberg's single-value form (`bounds::encode`; hex, as `avro.rs` writes bytes), or None: the types whose
+/// bounds are published.
 pub(crate) fn bound_bytes(v: &ScalarValue) -> Option<String> {
-    let b = match v {
-        ScalarValue::Int32(Some(x)) | ScalarValue::Date32(Some(x)) => x.to_le_bytes().to_vec(),
-        ScalarValue::Int64(Some(x)) | ScalarValue::TimestampMicrosecond(Some(x), _) => x.to_le_bytes().to_vec(),
-        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.as_bytes().to_vec(),
-        ScalarValue::Boolean(Some(x)) => vec![*x as u8],
-        _ => return None,
-    };
-    Some(crate::text::hex(&b))
+    use ScalarValue as S;
+    let published = matches!(v, S::Int32(_) | S::Date32(_) | S::Int64(_) | S::TimestampMicrosecond(..) | S::Utf8(_) | S::Utf8View(_) | S::LargeUtf8(_) | S::Boolean(_));
+    Some(crate::text::hex(&crate::bounds::encode(v).filter(|_| published)?))
 }

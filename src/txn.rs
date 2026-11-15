@@ -37,7 +37,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 /// A table's changes in a transaction: rows it adds (new rows, whose `_row_id` is negative until the commit stamps
@@ -596,6 +596,18 @@ fn default_level() -> Result<Level> {
     }
 }
 
+/// Does the session being served read only now: its transaction was begun READ ONLY, or none is open and
+/// `default_transaction_read_only` is on? What moves anything without a write's words (`nextval`, `setval` in a SELECT:
+/// `seq::may_move`) asks it, as `gate` asks a statement's words (11-10 audit M3).
+pub fn reads_only(lake: &Lake) -> bool {
+    let open = crate::temp::current().and_then(|s| {
+        let at = crate::temp::sessions(lake)?;
+        let book = at.book.lock().unwrap();
+        book.txns.get(&s).filter(|t| t.state == State::Open).map(|t| t.read_only)
+    });
+    open.unwrap_or_else(default_read_only)
+}
+
 /// The session's default access mode (`default_transaction_read_only`).
 fn default_read_only() -> bool {
     crate::set::shown("default_transaction_read_only").is_some_and(|v| matches!(v.to_lowercase().as_str(), "on" | "true" | "1"))
@@ -982,7 +994,10 @@ fn inserted_row(meta: &TableMeta, proposed: &RecordBatch) -> Result<RecordBatch>
 /// versions meet the table's NOT NULL and DEFAULT (invariant 130).
 async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u64, scope: &crate::rights::Scope) -> Result<Changed> {
     let rules = stored.rules()?;
-    if let Stmt::Merge(m) = stmt {
+    // (one key's read without planning: not for a writer a filter on the table's rows holds, whose rows are planned so the
+    // filter reads them)
+    let whole = !scope.filtered(l.name);
+    if let (Stmt::Merge(m), true) = (stmt, whole) {
         if let Some(p) = m.point_upsert(l.name, stored, scope) {
             if let Some(c) = upsert_point(l, stored, &rules, m, &p, snapshot).await? {
                 return Ok(c); // (its new rows come shaped: `upsert_point`)
@@ -990,7 +1005,7 @@ async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u
         }
     }
     let hit = match stmt {
-        Stmt::Update(_, set, Some(cond)) => match point_key(l.name, stored, set, cond) {
+        Stmt::Update(_, set, Some(cond)) if whole => match point_key(l.name, stored, set, cond) {
             Some(key) => point(l, &key, set, snapshot).await?,
             None => None,
         },
@@ -1049,6 +1064,16 @@ pub async fn refuse_change(lake: &Lake, name: &str, meta: &TableMeta, stmt: &Stm
     Ok(())
 }
 
+/// A merge table adds an inserted row to its key's rows as they are read (`TableMeta::merge`): a writer a filter on the
+/// table's rows holds (a grant's, step 6 piece 5b) could add to the rows of a key it may not read, so its INSERT is
+/// refused. Asked by a transaction's INSERT (`statement`) and by one outside a transaction (`write::on_node_listed`).
+pub fn merges_unseen(name: &str, meta: &TableMeta, scope: &crate::rights::Scope) -> Result<()> {
+    if !meta.merge.is_empty() && scope.rows(&crate::rights::Privilege::Select, name).is_some() {
+        return Err(crate::codes::coded("42501", format!("permission denied: {name} is a merge table, whose rows add up by key as they're read, and a filter on its rows in a grant shows this user some of them only: a row it inserts could add to a key's it can't read")));
+    }
+    Ok(())
+}
+
 /// A statement's kept writes of a transaction: an INSERT's rows, an UPDATE's or DELETE's changes, all under the transaction's
 /// own locks. Outside a transaction (none open) they are None: the statement goes to the leader.
 pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool, scope: &crate::rights::Scope) -> Result<Option<Value>> {
@@ -1080,6 +1105,9 @@ pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool, scope: &
     let stored = stored_table(lake, &name).await?;
     let meta = stored.logical_ref();
     refuse_change(lake, &name, &meta, stmt).await?;
+    if insert.is_some() {
+        merges_unseen(&name, &meta, scope)?;
+    }
     // (an enforced UNIQUE takes no row locks: its COMMIT's check refuses a row changed since it was read. A MERGE and an
     // INSERT … ON CONFLICT lock their rows as an UPDATE does: a counter's upsert waits for the one holding it, as Postgres's does)
     let locking = rc && !crate::constraints::checked(&stored);

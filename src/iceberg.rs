@@ -464,7 +464,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
     // (a renamed column by both names: Pondra's files keep the stored one, other writers write SQL's)
     let known = |c: &crate::column::Column| if c.name == c.stored { json!([c.stored]) } else { json!([c.name, c.stored]) };
-    let mut names: Vec<Value> = list.all().iter().map(|c| match c.dtype.ends_with("[]") {
+    let mut names: Vec<Value> = list.all().iter().map(|c| match crate::answer::list_item(&c.dtype).is_some() {
         true => json!({"field-id": c.id, "names": known(c), "fields": [{"field-id": n + c.id, "names": ["item", "element"]}]}),
         false => json!({"field-id": c.id, "names": known(c)}),
     }).collect();
@@ -531,8 +531,8 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
     };
     let n = list.all().len() as u32;
     // A list column (an embedding, say) needs an id for its elements too: they follow the columns'.
-    let kind = |id: u32, t: &str| match t.strip_suffix("[]") {
-        Some(item) => Some(json!({"type": "list", "element-id": n + id, "element": iceberg(item)?, "element-required": false})),
+    let kind = |id: u32, t: &str| match crate::answer::list_item(t) {
+        Some(item) => Some(json!({"type": "list", "element-id": n + id, "element": iceberg(&item)?, "element-required": false})),
         None => Some(Value::String(iceberg(t)?)),
     };
     // (listed in SQL's order: a field is known by its id, wherever it is listed; a key's are required, as identifier fields)
@@ -819,9 +819,11 @@ pub(crate) async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Va
 pub(crate) async fn prepare_as(lake: &Lake, name: &str, current: &Value, asked: &Value, as_written: bool) -> Result<Option<Commit>, Refusal> {
     let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(name)).await.ok().flatten().ok_or_else(|| bad(format!("no table {name}")))?;
     let mut c = parse(lake, name, &current["metadata"], asked).await?;
-    // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11)
+    // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11. A replace's
+    // staged table, which no user may write, is asked as the table it replaces: `iceberg_rest::replaced`)
     let (replaces, deletes) = (!meta.key.is_empty() && !c.incoming.is_empty(), !c.removed.is_empty() || !c.deletes.is_empty() || !c.equality.is_empty());
-    crate::rights::changing(replaces, deletes).try_for_each(|action| crate::rights::may_here(action, crate::rights::Object::Table(name))).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
+    let asked_of = crate::sys::staged_for(name).unwrap_or(name);
+    crate::rights::changing(replaces, deletes).try_for_each(|action| crate::rights::may_here(action, crate::rights::Object::Table(asked_of))).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
     if done(lake, &c.job()).await.map_err(|e| bad(crate::ext::said(&e)))? {
         return Ok(None);
     }

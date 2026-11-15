@@ -1,0 +1,7 @@
++4400
+
+Step 8, PRs 7a and 7b (#772): languages are a section of the registry, and a Spark session's statements are read with
+Spark's grammar as they arrive, on the page as in every form (`languages.rs`, `statement::in_language`, `set::language_change`,
+`spark_divide`, DISCARD's parts). On the train with main through #785 (budget 9,323,000): its wasm 59,176,734, 14.3 KB over
+main's 59,162,440 as #785's run measured it, and its brotli 9,323,352, 3.4 KB over main's 9,319,935. This raise keeps 4 KB of
+room above the module, the README's 3 KB and 1 KB for the layout's moves between runs.

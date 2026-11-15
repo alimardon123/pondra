@@ -1,0 +1,46 @@
+# VECTOR(n), pgvector's type, is DuckDB's FLOAT[n]: one type of n dimensions, FixedSizeList(Float32, n), shown as VECTOR(n)
+# (and another fixed-size list as T[n]); a list of another length is refused in pgvector's words (22000), as is a size it
+# doesn't take (22023). A lake keeps the size from format 8 (`format::FIXED`), where a new lake starts; Iceberg and Delta
+# keep it as a list (`answer::list_item`).
+statement ok
+CREATE TABLE emb (id INT, v VECTOR(3), f FLOAT[2], d DOUBLE[2])
+
+statement ok
+INSERT INTO emb VALUES (1, [1, 2, 3], [0.5, 1.5], [1, 2]), (2, [4, 5, 6], [2, 3], [3, 4])
+
+query TTT
+SELECT arrow_typeof(v), arrow_typeof(f), arrow_typeof(d) FROM emb WHERE id = 1
+----
+FixedSizeList(3 x Float32) FixedSizeList(2 x Float32) FixedSizeList(2 x Float64)
+
+query I
+SELECT id FROM emb WHERE v = [4.0, 5.0, 6.0]
+----
+2
+
+query I
+SELECT id FROM emb ORDER BY cosine_distance(v, [4.0, 5.0, 6.1]) LIMIT 1
+----
+2
+
+statement error 22000 expected 3 dimensions, not 2
+INSERT INTO emb VALUES (3, [1, 2], [1, 2], [1, 2])
+
+statement error 22023 dimensions for type vector cannot exceed 16000
+CREATE TABLE big (v VECTOR(16001))
+
+statement error 22023 dimensions for type vector must be at least 1
+CREATE TABLE small (v VECTOR(0))
+
+query T
+SELECT replace(definition, chr(10), ' ') FROM pondra.objects WHERE name = 'emb'
+----
+CREATE TABLE emb ( id INT, v VECTOR(3), f VECTOR(2), d DOUBLE[2] )
+
+query T
+SELECT arrow_typeof(CAST([1, 2, 3] AS VECTOR(3)))
+----
+FixedSizeList(3 x Float32)
+
+statement ok
+DROP TABLE emb

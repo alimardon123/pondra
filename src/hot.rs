@@ -31,12 +31,13 @@
 //! for a filter on the time; a top-N reads the batches in its key's order, so its bound is tight
 //! after the first few, either way round.
 use crate::store::{DataFile, Lake, Lineage, TableMeta};
+use datafusion::datasource::file_format::options::ReadOptions;
+use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
+use datafusion::prelude::ParquetReadOptions;
 use anyhow::Result;
 use datafusion::arrow::array::{new_null_array, Array, ArrayData, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchOptions, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::datasource::file_format::options::ReadOptions;
-use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::{arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder}, ProjectionMask};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -48,7 +49,6 @@ use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicate
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::{empty::EmptyExec, execution_plan::replace_children_if_necessary, union::UnionExec, ExecutionPlan};
 use datafusion::physical_plan::projection::{all_alias_free_columns, new_projections_for_columns};
-use datafusion::prelude::ParquetReadOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use datafusion::common::instant::Instant;
@@ -812,9 +812,22 @@ impl TableProvider for HotFiles {
             None => self.schema.as_ref().clone(),
         });
         let deletes = self.meta.key.is_empty(); // (a keyed table's positions are older versions its own reads pass over)
+        // A keyed table's files are this scan's whole list: nothing prunes it before the merge on read (`query::upsert_view`),
+        // which a filter on any column but the key would get wrong. A filter this scan is given is its own, though, so a file
+        // whose ranges rule one out holds no row the scan would keep, whatever column it names: it goes unopened. (An append
+        // table's list comes pruned by the same ranges: `manifest::pruned`.)
+        let files: Vec<&DataFile> = match deletes || filters.is_empty() {
+            true => self.files.iter().collect(),
+            false => {
+                let keep = crate::manifest::keep(&self.files.iter().map(|f| f as &dyn crate::bounds::Ranged).collect::<Vec<_>>(), filters, &self.schema);
+                let kept: Vec<&DataFile> = self.files.iter().zip(keep).filter_map(|(f, k)| k.then_some(f)).collect();
+                crate::metrics::add(&self.lake.node.metrics.files_skipped, (self.files.len() - kept.len()) as u64);
+                kept
+            }
+        };
         let (mut held, mut cold) = (vec![], vec![]);
         let hot = self.lake.hot(); // (once a scan, not once a file)
-        for f in &self.files {
+        for f in files {
             // A scan of no columns reads no data: a plain file is its rows, from the catalog (no lookup, no load).
             if schema.fields().is_empty() && plain_file(f, deletes) {
                 held.push(Held::rows_only(f.rows));
@@ -827,13 +840,22 @@ impl TableProvider for HotFiles {
         }
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
         let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| plain_file(f, deletes));
+        // (a file written before its entry kept its columns' sizes is planned from its footer, as before: without them a
+        // plan would size its text by its rows alone, and pick other sides for its joins)
+        let sized = |f: &DataFile| self.schema.fields().iter().all(|c| c.data_type().primitive_width().is_some() || f.sizes.contains_key(c.name()));
+        let (planned, footed): (Vec<&DataFile>, Vec<&DataFile>) = plain.iter().copied().partition(|f| sized(f));
         // The loads this scan starts wait on this sender: the files of its plan carry it (`gated`), so they start when the
         // last copy of those files goes, with the query's plan. Here the scan lets go of its own copy.
         let (go, gate) = tokio::sync::oneshot::channel::<()>();
         let gate: LoadGate = futures::FutureExt::shared(gate);
         let holder = Arc::new(Gate(go));
-        if !plain.is_empty() {
-            let urls = plain.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
+        if !planned.is_empty() {
+            // (planned from their entries: no footer is read to plan, and the opener reads each one it decodes)
+            let table = crate::scan::own(|p| self.lake.full(p), &planned, &self.schema).map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+            plans.push(gated(told(table.scan(state, projection, filters, limit).await?, &self.known)?, &holder)?);
+        }
+        if !footed.is_empty() {
+            let urls = footed.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
             let options = ParquetReadOptions::default().to_listing_options(state.config(), state.default_table_options());
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
             let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());

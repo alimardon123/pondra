@@ -10,6 +10,7 @@
 //! the lake; USAGE on a secret. A superuser may do everything, as the admin token does. The three
 //! tokens stay, as the first admin and for scripts (`auth.rs`).
 use crate::auth::{Principal, Role};
+use crate::rights::Privilege;
 use crate::words::{Words, W};
 use crate::store::{json, Lake};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -54,16 +55,40 @@ pub struct User {
     pub limits: Limits,
 }
 
-/// A user's quota, on each node: at most `max_queries` of its statements at once (the rest wait
-/// their turn, 30 s at most), each at most `timeout_secs` (`MAX_QUERIES 4`,
-/// `STATEMENT_TIMEOUT '5 minutes'`; 0 is none). Without its own: `PONDRA_USER_QUERIES`,
-/// `PONDRA_USER_TIMEOUT` (seconds). A superuser has none.
+/// A role's options, its guardrails (step 6 piece 6: an agent's are a role's): its quota on each node, at most
+/// `max_queries` of its statements at once (the rest wait their turn, 30 s at most), each at most `timeout_secs`
+/// (`MAX_QUERIES 4`, `STATEMENT_TIMEOUT '5 minutes'`; 0 is none), and `read_only` (`READ ONLY`: it reads, and writes
+/// nothing to the lake, whatever it is granted), and `max_rows` (`MAX_ROWS 1000`: an answer it is sent has at most that
+/// many rows, cut and said so: `App::run_query`). Without its own: `PONDRA_USER_QUERIES`, `PONDRA_USER_TIMEOUT` (seconds).
+/// A principal is held to the tightest of its own, its roles' and public's (`tightest`); a superuser to none. None is
+/// unset, so a user with none sees no change.
 #[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Debug)]
 pub struct Limits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_queries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+}
+
+impl Limits {
+    /// These and `other` together, the tightest of each: the smaller number, and READ ONLY if either is. A role's numbers
+    /// bind each member on its own: MAX_QUERIES counts a member's statements, never its role's together.
+    pub fn tightest(self, other: &Limits) -> Limits {
+        fn least<T: Ord + Copy + Default>(a: Option<T>, b: Option<T>) -> Option<T> { a.into_iter().chain(b).filter(|n| *n != T::default()).min() } // (0: none)
+        Limits {
+            max_queries: least(self.max_queries, other.max_queries),
+            timeout_secs: least(self.timeout_secs, other.timeout_secs),
+            read_only: (self.read_only == Some(true) || other.read_only == Some(true)).then_some(true),
+            max_rows: least(self.max_rows, other.max_rows),
+        }
+    }
+
+    /// Is it READ ONLY?
+    pub fn read_only(&self) -> bool { self.read_only == Some(true) }
 }
 
 /// A password as SCRAM-SHA-256 keeps it (RFC 5802, 7677): what checks it, never what makes it.
@@ -86,15 +111,19 @@ pub struct Token {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Grant {
-    pub privilege: String, // select, insert, update, delete, usage, clone, apply
+    pub privilege: Privilege, // (kept as its word: select, insert, update, delete, usage, clone, apply, a kind's own)
     pub on: On,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>, // (SELECT on these only)
+    /// Its rows only: those where this condition holds (SQL over the table's columns, `row_filter::check`ed when it is set).
+    /// None, every row. Set with `GRANT SELECT ON t TO r WHERE condition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<String>,
 }
 
 impl Grant {
     /// CLONE and APPLY are the database's own (`ON DATABASE`, ADR-058), not every table's.
-    pub fn of_database(&self) -> bool { matches!(self.privilege.as_str(), "clone" | "apply") }
+    pub fn of_database(&self) -> bool { matches!(self.privilege, Privilege::Clone | Privilege::Apply) }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -122,8 +151,9 @@ pub enum Change {
     Create { name: String, login: bool, if_not_exists: bool, verifier: Option<Verifier>, superuser: bool, #[serde(default)] limits: Limits },
     Alter { name: String, verifier: Option<Verifier>, superuser: Option<bool>, #[serde(default)] limits: Limits, #[serde(default)] login: Option<bool> },
     Drop { name: String, if_exists: bool },
-    Grant { privileges: Vec<String>, on: On, columns: Vec<String>, to: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String> },
-    Revoke { privileges: Vec<String>, on: On, columns: Vec<String>, from: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String> },
+    // (`rows`: `… WHERE condition`, a filter on the rows, as `row_filter::kept` prints it)
+    Grant { privileges: Vec<Privilege>, on: On, columns: Vec<String>, to: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] rows: Option<String> },
+    Revoke { privileges: Vec<Privilege>, on: On, columns: Vec<String>, from: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] rows: Option<String> },
     GrantRole { roles: Vec<String>, to: Vec<String> },
     RevokeRole { roles: Vec<String>, from: Vec<String> },
     // (`hash`: a token made by whoever asked, `pondra token`, which sends only its hash: the token
@@ -135,7 +165,6 @@ pub enum Change {
     DropProvider { name: String, if_exists: bool },
 }
 
-const PRIVILEGES: [&str; 7] = ["select", "insert", "update", "delete", "usage", "clone", "apply"]; // (CLONE: a database's or a schema's, ADR-058; APPLY: a database's)
 
 // ---------------------------------------------------------------- statements
 
@@ -143,21 +172,44 @@ const PRIVILEGES: [&str; 7] = ["select", "insert", "update", "delete", "usage", 
 /// and TOKEN are the statements section's entries, `read`; GRANT is read here until step 6 reads it once.)
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     let words = Words::of(sql)?;
-    matches!(words.peek_word()?.as_str(), "grant" | "revoke").then(|| said(words))
+    if !matches!(words.peek_word()?.as_str(), "grant" | "revoke") {
+        return None;
+    }
+    // (`… WHERE condition`: a grant's filter on its rows. The words before it are the grant's)
+    let (words, rows) = match rows_of(sql) {
+        Some((head, rows)) => (Words::of(head)?, Some(rows)),
+        None => (words, None),
+    };
+    Some(said(words, rows))
 }
 
 /// CREATE, ALTER and DROP USER, ROLE and TOKEN, by their words: the statements section's entries' reader.
-pub(crate) fn read(w: &mut Words) -> Result<crate::write::Stmt> { Ok(said(std::mem::take(w))) }
+pub(crate) fn read(w: &mut Words) -> Result<crate::write::Stmt> { Ok(said(std::mem::take(w), None)) }
 
-fn said(words: Words) -> crate::write::Stmt {
+fn said(words: Words, rows: Option<&str>) -> crate::write::Stmt {
     use crate::write::Stmt;
-    match parse(words) {
+    match parse(words, rows) {
         Ok(change) => Stmt::Ddl(vec![crate::ddl::Ddl::Users(change)]),
         Err(e) => Stmt::of_error(&e, e.to_string()), // (a coded refusal keeps its code: `0LP01` for a privilege its kind lacks)
     }
 }
 
-fn parse(mut w: Words) -> Result<Change> {
+/// A GRANT's or a REVOKE's `WHERE condition`: the text before it, and the condition (to the end, without a `;` or a
+/// comment after it). The first `WHERE` unquoted is it: the grant's own words have none. None for any other statement.
+pub(crate) fn rows_of(sql: &str) -> Option<(&str, &str)> {
+    use datafusion::sql::sqlparser::{keywords::Keyword, tokenizer::Token};
+    let tokens = crate::text::tokens(sql)?;
+    let solid = tokens.solid();
+    let head = |s: &crate::text::Solid| matches!(s.token, Token::Word(w) if matches!(w.keyword, Keyword::GRANT | Keyword::REVOKE) && w.quote_style.is_none());
+    if !solid.first().is_some_and(head) {
+        return None;
+    }
+    let at = solid.iter().position(|s| matches!(s.token, Token::Word(w) if w.keyword == Keyword::WHERE && w.quote_style.is_none()))?;
+    let end = solid.iter().rev().find(|s| !matches!(s.token, Token::SemiColon)).map_or(sql.len(), |s| s.end);
+    Some((&sql[..solid[at].start], sql.get(solid[at].end..end).unwrap_or_default().trim()))
+}
+
+fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
     let verb = w.next().map(|x| x.word()).unwrap_or_default();
     if verb != "grant" && verb != "revoke" && w.is("token") {
         return token(&mut w, verb == "create");
@@ -172,7 +224,16 @@ fn parse(mut w: Words) -> Result<Change> {
             let name = plain(&w.name()?)?;
             w.is("with");
             let (mut verifier, mut superuser, mut login2, mut limits) = (None, None, None, Limits::default());
+            let mut said: Vec<&str> = vec![]; // (each option once: a second is a mistake, not a change of mind)
             while !w.0.is_empty() {
+                let option = ["password", "superuser", "nosuperuser", "login", "nologin", "max_queries", "statement_timeout", "read", "max_rows"].into_iter().find(|o| w.peek_word().as_deref() == Some(*o));
+                if let Some(o) = option {
+                    let same = |x: &str| x == o || [("superuser", "nosuperuser"), ("login", "nologin")].iter().any(|(a, b)| (x == *a && o == *b) || (x == *b && o == *a));
+                    if said.iter().any(|x| same(x)) {
+                        return Err(crate::codes::coded("42601", format!("{} is given twice: each option once", o.to_uppercase())));
+                    }
+                    said.push(o);
+                }
                 if w.is("password") {
                     let p = w.string()?;
                     ensure!(p.chars().count() >= 8, "a password has at least 8 characters");
@@ -192,6 +253,22 @@ fn parse(mut w: Words) -> Result<Change> {
                         Some(W::Num(n)) => n.parse().map_err(|_| anyhow!("MAX_QUERIES is a whole number: 4 (0: no limit)"))?,
                         _ => bail!("MAX_QUERIES is a whole number: 4 (0: no limit)"),
                     });
+                } else if w.is("max_rows") {
+                    w.sym('=');
+                    limits.max_rows = Some(match w.next() {
+                        Some(W::Num(n)) => n.parse().map_err(|_| crate::codes::coded("22023", "MAX_ROWS is a whole number: 1000 (0: no limit)"))?,
+                        _ => return Err(crate::codes::coded("22023", "MAX_ROWS is a whole number: 1000 (0: no limit)")),
+                    });
+                } else if w.is("read") {
+                    limits.read_only = Some(if w.is("only") {
+                        true
+                    } else if w.is("write") {
+                        false
+                    } else {
+                        bail!("READ ONLY (it reads, and writes nothing to the lake, whatever it is granted) or READ WRITE {}", w.near())
+                    });
+                } else if w.is("max_model_calls") {
+                    return Err(crate::codes::coded("0A000", "MAX_MODEL_CALLS comes with ai_agent, in 1.1: a role's model calls aren't counted yet"));
                 } else if w.is("statement_timeout") {
                     w.sym('=');
                     limits.timeout_secs = Some(match w.next() {
@@ -203,7 +280,7 @@ fn parse(mut w: Words) -> Result<Change> {
                         _ => bail!("STATEMENT_TIMEOUT '5 minutes' (or seconds, hours; 0: none)"),
                     });
                 } else {
-                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN, NOLOGIN, MAX_QUERIES n or STATEMENT_TIMEOUT '…' {}", w.near());
+                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN, NOLOGIN, MAX_QUERIES n, STATEMENT_TIMEOUT '…', MAX_ROWS n, READ ONLY or READ WRITE {}", w.near());
                 }
             }
             Ok(match verb.as_str() {
@@ -211,7 +288,7 @@ fn parse(mut w: Words) -> Result<Change> {
                 _ => {
                     // (a usage error, 42601, as Postgres's syntax errors are: 11-08 audit M12)
                     if verifier.is_none() && superuser.is_none() && login2.is_none() && limits == Limits::default() {
-                        return Err(crate::codes::coded("42601", format!("ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN | MAX_QUERIES n | STATEMENT_TIMEOUT '…'")));
+                        return Err(crate::codes::coded("42601", format!("ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN | MAX_QUERIES n | STATEMENT_TIMEOUT '…' | MAX_ROWS n | READ ONLY | READ WRITE")));
                     }
                     Change::Alter { name, verifier, superuser, limits, login: login2 }
                 }
@@ -224,7 +301,7 @@ fn parse(mut w: Words) -> Result<Change> {
             w.done()?;
             Ok(Change::Drop { name, if_exists })
         }
-        "grant" | "revoke" => grant(&mut w, verb == "grant"),
+        "grant" | "revoke" => grant(&mut w, verb == "grant", rows),
         _ => bail!("not a statement about users"),
     }
 }
@@ -261,8 +338,11 @@ fn role_word(w: &mut Words) {
 }
 
 /// `GRANT privileges [(columns)] ON [TABLE] t | SCHEMA s | ALL TABLES IN SCHEMA s | ALL TABLES |
-/// SECRET s TO grantees`, `GRANT roles TO users`, and REVOKE's of each, `FROM`.
-fn grant(w: &mut Words, grant: bool) -> Result<Change> {
+/// SECRET s TO grantees [WHERE condition]`, `GRANT roles TO users`, and REVOKE's of each, `FROM`. `rows`: the condition
+/// after `WHERE` (`filter`), a filter on a table's rows, SELECT's (step 6 piece 5: the writes' come with piece 5c).
+fn grant(w: &mut Words, grant: bool, rows: Option<&str>) -> Result<Change> {
+    let a_tables = || crate::codes::coded("0A000", "a filter on rows is a table's: GRANT SELECT ON t TO r WHERE …");
+    let rows = rows.map(crate::row_filter::kept).transpose()?;
     let mut privileges = vec![];
     let mut columns = vec![];
     let mut database = None; // (ON DATABASE: CLONE's alone, and the statement's own database)
@@ -289,24 +369,27 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
         let users = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
         w.done()?;
         let roles = list.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
+        if rows.is_some() {
+            return Err(a_tables());
+        }
         return Ok(if grant { Change::GrantRole { roles, to: users } } else { Change::RevokeRole { roles, from: users } });
     }
     let kind = w.peek_word().and_then(|k| granted_kind(&k)); // (`ON CONNECTION shop`: its kind's privileges, below)
     for p in list {
         match p.as_str() {
-            "all" if kind.is_some() => privileges.extend(kind.iter().flat_map(|k| k.privileges.iter().map(|p| p.to_lowercase()))),
-            p if kind.is_some() => privileges.push(p.to_string()),
-            "all" => privileges.extend(["select", "insert", "update", "delete"].map(String::from)),
-            p if PRIVILEGES.contains(&p) => privileges.push(p.to_string()),
+            "all" if kind.is_some() => privileges.extend(kind.iter().flat_map(|k| k.privileges.iter().map(|p| Privilege::of(p)))),
+            p if kind.is_some() => privileges.push(Privilege::of(p)),
+            "all" => privileges.extend(Privilege::TABLE),
+            p if !matches!(Privilege::of(p), Privilege::Of(_)) => privileges.push(Privilege::of(p)), // (CLONE: a database's or a schema's, ADR-058; APPLY: a database's)
             p => bail!("{p}: the privileges are SELECT, INSERT, UPDATE, DELETE, ALL (on tables), USAGE (on secrets), CLONE (on a database or a schema) and APPLY (on a database)"),
         }
     }
     let on = if let Some(k) = kind {
         w.next(); // (its kind's word)
         let name = w.name()?;
-        let given: Vec<String> = k.privileges.iter().map(|p| p.to_lowercase()).collect();
+        let given: Vec<Privilege> = k.privileges.iter().map(|p| Privilege::of(p)).collect();
         if let Some(p) = privileges.iter().find(|p| !given.contains(p)) {
-            return Err(crate::codes::coded("0LP01", format!("{}: a {}'s privileges are {}", p.to_uppercase(), k.name, k.privileges.join(" and "))));
+            return Err(crate::codes::coded("0LP01", format!("{p}: a {}'s privileges are {}", k.name, k.privileges.join(" and "))));
         }
         ensure!(columns.is_empty(), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
         let to = if grant { "to" } else { "from" };
@@ -315,7 +398,10 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
         let who = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
         w.done()?;
         let on = On::Object { kind: k.name.to_string(), name };
-        return Ok(if grant { Change::Grant { privileges, on, columns, to: who, database } } else { Change::Revoke { privileges, on, columns, from: who, database } });
+        if rows.is_some() {
+            return Err(a_tables());
+        }
+        return Ok(if grant { Change::Grant { privileges, on, columns, to: who, database, rows } } else { Change::Revoke { privileges, on, columns, from: who, database, rows } });
     } else if w.is("schema") {
         On::Schema(w.name()?)
     } else if w.is("secret") {
@@ -335,30 +421,40 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
         w.is("table");
         On::Table(w.name()?)
     };
-    ensure!(columns.is_empty() || privileges == ["select"] && matches!(on, On::Table(_)), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
+    ensure!(columns.is_empty() || privileges == [Privilege::Select] && matches!(on, On::Table(_)), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
     let usage = matches!(on, On::Secret(_));
-    ensure!(privileges.iter().all(|p| (p == "usage") == usage), "{}", if usage { "a secret's privilege is USAGE" } else { "USAGE is a secret's" });
-    ensure!(!privileges.iter().any(|p| p == "clone") || database.is_some() || matches!(on, On::Schema(_)), "CLONE is a database's or a schema's: GRANT CLONE ON DATABASE prod | SCHEMA sales TO r");
-    ensure!(!privileges.iter().any(|p| p == "apply") || database.is_some(), "APPLY is a database's: GRANT APPLY ON DATABASE prod TO ci");
-    ensure!(database.is_none() || privileges.iter().all(|p| p == "clone" || p == "apply"), "ON DATABASE is for CLONE and APPLY alone: a database's tables are ON ALL TABLES");
+    ensure!(privileges.iter().all(|p| (*p == Privilege::Usage) == usage), "{}", if usage { "a secret's privilege is USAGE" } else { "USAGE is a secret's" });
+    ensure!(!privileges.contains(&Privilege::Clone) || database.is_some() || matches!(on, On::Schema(_)), "CLONE is a database's or a schema's: GRANT CLONE ON DATABASE prod | SCHEMA sales TO r");
+    ensure!(!privileges.contains(&Privilege::Apply) || database.is_some(), "APPLY is a database's: GRANT APPLY ON DATABASE prod TO ci");
+    ensure!(database.is_none() || privileges.iter().all(|p| matches!(p, Privilege::Clone | Privilege::Apply)), "ON DATABASE is for CLONE and APPLY alone: a database's tables are ON ALL TABLES");
     w.expect(to)?;
     role_word(w);
     let who = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
     w.done()?;
-    Ok(if grant { Change::Grant { privileges, on, columns, to: who, database } } else { Change::Revoke { privileges, on, columns, from: who, database } })
+    if rows.is_some() {
+        if database.is_some() || !matches!(on, On::Table(_)) {
+            return Err(a_tables());
+        }
+        // (SELECT's reads, UPDATE's and DELETE's writes read through theirs, and INSERT's rows are checked by it: `change::rows_of`,
+        // `write::rows_of`. ALL is the four)
+        if privileges.iter().any(|p| !p.of_tables()) {
+            return Err(crate::codes::coded("0A000", "a filter on rows is a table's privileges', SELECT, INSERT, UPDATE and DELETE: GRANT INSERT ON t TO r WHERE …"));
+        }
+    }
+    Ok(if grant { Change::Grant { privileges, on, columns, to: who, database, rows } } else { Change::Revoke { privileges, on, columns, from: who, database, rows } })
 }
 
 /// What a grant's `ON DATABASE d` is on. This database's own (as it always was), or CLONE on a
 /// database attached here: a user may branch it through its attachment (ADR-058). Anything else is
 /// run on the database it names.
-fn on_database(lake: &Lake, on: On, database: Option<&str>, privileges: &[String]) -> Result<On> {
+fn on_database(lake: &Lake, on: On, database: Option<&str>, privileges: &[Privilege]) -> Result<On> {
     let here = crate::ddl::lake_name(lake);
     let Some(d) = database else { return Ok(on) };
     if d == here {
         return Ok(On::Lake);
     }
     let attached = lake.attached.read().unwrap().iter().any(|(n, _)| n == d);
-    ensure!(attached && privileges.iter().all(|p| p == "clone"), "this is the database {here}: GRANT … ON DATABASE {d} is run on {d} (CLONE also on a database attached here)");
+    ensure!(attached && privileges.iter().all(|p| *p == Privilege::Clone), "this is the database {here}: GRANT … ON DATABASE {d} is run on {d} (CLONE also on a database attached here)");
     Ok(On::Database(d.to_string()))
 }
 
@@ -394,6 +490,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 return Ok(j!({"user": name, "unchanged": true}));
             }
             ensure!(name != "public", "public is every user: GRANT … TO public");
+            let limits = Limits { read_only: limits.read_only.filter(|r| *r), max_rows: limits.max_rows.filter(|n| *n > 0), ..limits }; // (READ WRITE, MAX_ROWS 0: as none)
             let u = User { login, verifier, superuser, created_ms: crate::log::now_ms(), limits, ..Default::default() };
             lake.cat.commit(vec![put(&name, &u)], &[]).await?;
             j!({ if login { "user" } else { "role" }: name })
@@ -411,6 +508,12 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             }
             if let Some(s) = limits.timeout_secs {
                 u.limits.timeout_secs = Some(s).filter(|s| *s > 0);
+            }
+            if let Some(r) = limits.read_only {
+                u.limits.read_only = Some(r).filter(|r| *r); // (READ WRITE: unset, as a user that never had it)
+            }
+            if let Some(n) = limits.max_rows {
+                u.limits.max_rows = Some(n).filter(|n| *n > 0);
             }
             if let Some(s) = superuser {
                 u.superuser = s;
@@ -436,18 +539,24 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             lake.cat.commit(puts, &[user_key(&name)]).await?;
             j!({"user": name, "dropped": true})
         }
-        Change::Grant { privileges, on, columns, to, database } => {
+        Change::Grant { privileges, on, columns, to, database, rows } => {
             let on = on_database(lake, on, database.as_deref(), &privileges)?;
             if matches!(on, On::Database(_)) {
                 crate::format::require(lake, ACROSS, "a grant on another database").await?;
             }
             let on = resolved(lake, on).await?;
+            let rows = match (&on, rows) {
+                (On::Table(n), Some(text)) => Some(crate::row_filter::check(&lake.session_with(1), n, &*columns_of(lake, n).await?, &text)?),
+                (_, rows) => rows, // (refused where it is parsed: `grant`)
+            };
             let mut puts = vec![];
             for n in &to {
                 let mut u = grantee(lake, n).await?;
                 for p in &privileges {
-                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if p == "select" { columns.clone() } else { vec![] } };
-                    u.grants.retain(|x| !(x.privilege == g.privilege && x.on == g.on)); // (the newest grant of it stands: columns replaced)
+                    let g = Grant { privilege: p.clone(), on: on.clone(), columns: if *p == Privilege::Select { columns.clone() } else { vec![] }, rows: rows.clone() };
+                    // (the newest grant of it with this filter stands, its columns replaced; one with another filter, or
+                    // none, is its own grant: the rows of each are read)
+                    u.grants.retain(|x| !(x.privilege == g.privilege && x.on == g.on && x.rows == g.rows));
                     u.grants.push(g);
                 }
                 puts.push(put(n, &u));
@@ -455,15 +564,16 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             lake.cat.commit(puts, &[]).await?;
             j!({"granted": privileges, "to": to})
         }
-        Change::Revoke { privileges, on, columns, from, database } => {
+        Change::Revoke { privileges, on, columns, from, database, rows } => {
             let on = on_database(lake, on, database.as_deref(), &privileges)?;
             let on = resolved(lake, on).await?;
             let mut puts = vec![];
             for n in &from {
                 let mut u = grantee(lake, n).await?;
                 for p in &privileges {
-                    // (some columns: out of a grant of some columns; none named: the grant goes)
-                    u.grants.retain_mut(|x| match x.privilege == *p && x.on == on {
+                    // (some columns: out of a grant of some columns; none named: the grant goes. `WHERE c`: only the grant
+                    // whose filter is `c`, as kept; none: every grant of it, whatever its filter)
+                    u.grants.retain_mut(|x| match x.privilege == *p && x.on == on && (rows.is_none() || x.rows == rows) {
                         false => true,
                         true if columns.is_empty() || x.columns.is_empty() => !columns.is_empty(),
                         true => {
@@ -484,7 +594,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             }
             let mut puts = vec![];
             for n in &to {
-                let mut u = must(n, get(n).await?)?;
+                let mut u = grantee(lake, n).await?; // (public: made when first granted to, a role as a privilege)
                 for r in &roles {
                     ensure!(r != n && !member(lake, r, n, 0).await?, "{r} would then be a member of itself");
                     if !u.roles.contains(r) {
@@ -597,6 +707,16 @@ async fn member(lake: &Lake, who: &str, role: &str, depth: usize) -> Result<bool
 /// Is there a table or view `n` in `lake`?
 async fn there(lake: &Lake, n: &str) -> Result<bool> {
     Ok(lake.cat.get::<Value>(&crate::store::table_key(n)).await?.is_some() || lake.cat.get::<Value>(&crate::ddl::query_key(n)).await?.is_some())
+}
+
+/// The columns of table `n` (as `resolved` names it, here or in a database attached here) a filter on its rows may read:
+/// a table's, as SQL names them. A view's rows are its query's: refused.
+async fn columns_of(lake: &Lake, n: &str) -> Result<datafusion::arrow::datatypes::SchemaRef> {
+    let (other, local) = crate::ddl::resolve(lake, n).await?;
+    let Some(meta) = other.as_deref().unwrap_or(lake).table_meta_if(&local).await? else {
+        return Err(crate::codes::coded("0A000", format!("{n} is a view: a filter on rows is a table's (GRANT SELECT ON t TO r WHERE …, t a table the view reads)")));
+    };
+    crate::answer::schema_of(meta.star().iter().map(|(c, t)| (c.as_str(), t.as_str())))
 }
 
 /// What a grant is on, named as the catalog names it, and there.
@@ -1119,15 +1239,12 @@ async fn token_principal(lake: &Lake, user: &str, until: Option<u64>) -> Option<
 
 // ---------------------------------------------------------------- who is asking, and what they may do
 
-/// The privileges a grant gives on a table (or view): holding any of them, a user knows the table is there.
-const TABLE_PRIVILEGES: [&str; 4] = ["select", "insert", "update", "delete"];
-
 /// What a user may do: every grant of its own, its roles' (and theirs') and public's.
 #[derive(Default, Debug)]
 pub struct Access {
     grants: Vec<Grant>,
     pub(crate) names: HashSet<String>, // (itself, its roles, public: whose grants they are; `rights::Scope::names`)
-    pub limits: Limits,     // (its own)
+    pub limits: Limits,     // (the tightest of its own, its roles' and public's: `Limits::tightest`)
     key: std::sync::OnceLock<String>, // (`key`: worked out once, at the first remembered answer)
 }
 
@@ -1137,10 +1254,10 @@ impl Access {
     pub fn granted(grants: Vec<Grant>) -> Access { Access { grants, ..Default::default() } }
     /// The columns of `table` (as the catalog names it) it may use for `privilege`: None, none;
     /// Some(None), every column; Some(Some(these)).
-    pub fn columns(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
+    pub fn columns(&self, privilege: &Privilege, table: &str) -> Option<Option<HashSet<String>>> {
         let schema = crate::text::split(table).0;
         let mut some: Option<HashSet<String>> = None;
-        for g in self.grants.iter().filter(|g| g.privilege == privilege) {
+        for g in self.grants.iter().filter(|g| g.privilege == *privilege) {
             match &g.on {
                 On::Lake => return Some(None),
                 On::Schema(s) if s == schema => return Some(None),
@@ -1151,11 +1268,41 @@ impl Access {
         }
         some.map(Some)
     }
-    pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
-    /// Whether it holds any privilege on `table`: SELECT, INSERT, UPDATE or DELETE, on it, its schema or the lake.
-    pub fn knows(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.columns(p, table).is_some()) }
+    pub fn may(&self, privilege: &Privilege, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    /// The filters on the rows of `table` it may use for `privilege` (`Grant.rows`), its grants' that give it: None, every
+    /// row (one of them has none, or no grant gives it, which `columns` refuses); Some(these), the rows where any holds, as
+    /// Postgres's permissive policies join. `named`: a table of another lake attached here, which only grants naming it
+    /// give (`named`). Rows and columns join apart, as Postgres's column grants and policies do: the columns one grant
+    /// gives are read in the rows any gives.
+    pub fn rows(&self, privilege: &Privilege, table: &str, named: bool) -> Option<Vec<&str>> {
+        let schema = crate::text::split(table).0;
+        let gives = |g: &Grant| match &g.on {
+            On::Table(t) => t == table,
+            On::Schema(s) => !named && s == schema,
+            On::Lake => !named,
+            _ => false,
+        };
+        let mut some: Option<Vec<&str>> = None;
+        for g in self.grants.iter().filter(|g| g.privilege == *privilege && gives(g)) {
+            match &g.rows {
+                None => return None,
+                Some(r) => some.get_or_insert_with(Vec::new).push(r.as_str()),
+            }
+        }
+        some.map(|mut these| {
+            these.sort_unstable();
+            these.dedup();
+            these
+        })
+    }
+    /// Every filter on rows its grants hold, any privilege's, any table's (`rights::Scope::key`: what is filled in for its
+    /// reader is in the key).
+    pub(crate) fn filters(&self) -> impl Iterator<Item = &str> { self.grants.iter().filter_map(|g| g.rows.as_deref()) }
+    /// Whether it holds any privilege on `table` (or view), SELECT, INSERT, UPDATE or DELETE, on it, its schema or the
+    /// lake: then it knows the table is there.
+    pub fn knows(&self, table: &str) -> bool { Privilege::TABLE.iter().any(|p| self.columns(p, table).is_some()) }
     /// The same, for a table of another lake attached here (`named`).
-    pub fn knows_named(&self, table: &str) -> bool { TABLE_PRIVILEGES.iter().any(|p| self.named(p, table).is_some()) }
+    pub fn knows_named(&self, table: &str) -> bool { Privilege::TABLE.iter().any(|p| self.named(p, table).is_some()) }
     /// What it holds, as one name (`rights::Scope::key`): its grants and its names, each in any order, hashed. Not its
     /// limits, which change no answer.
     pub fn key(&self) -> &str {
@@ -1170,9 +1317,9 @@ impl Access {
     }
     /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming
     /// it count; ON ALL TABLES and ON SCHEMA are this lake's.
-    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
+    pub fn named(&self, privilege: &Privilege, table: &str) -> Option<Option<HashSet<String>>> {
         let mut some: Option<HashSet<String>> = None;
-        for g in self.grants.iter().filter(|g| g.privilege == privilege && g.on == On::Table(table.to_string())) {
+        for g in self.grants.iter().filter(|g| g.privilege == *privilege && g.on == On::Table(table.to_string())) {
             if g.columns.is_empty() {
                 return Some(None);
             }
@@ -1180,17 +1327,17 @@ impl Access {
         }
         some.map(Some)
     }
-    pub fn secret(&self, name: &str) -> bool { self.grants.iter().any(|g| g.privilege == "usage" && g.on == On::Secret(name.to_string())) }
+    pub fn secret(&self, name: &str) -> bool { self.grants.iter().any(|g| g.privilege == Privilege::Usage && g.on == On::Secret(name.to_string())) }
     /// Whether it may use the object `name` of an extension's `kind` for `privilege` (`READ` on a connection), granted to it,
     /// a role of its or public.
-    pub fn may_use(&self, kind: &str, name: &str, privilege: &str) -> bool {
-        self.grants.iter().any(|g| g.privilege.eq_ignore_ascii_case(privilege) && matches!(&g.on, On::Object { kind: k, name: n } if k == kind && n == name))
+    pub fn may_use(&self, kind: &str, name: &str, privilege: &Privilege) -> bool {
+        self.grants.iter().any(|g| g.privilege == *privilege && matches!(&g.on, On::Object { kind: k, name: n } if k == kind && n == name))
     }
     /// The schemas this user may clone a branch of, or pin one for (ADR-058): None, no CLONE grant;
     /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
     pub fn clones(&self) -> Option<Vec<String>> {
         let mut some: Option<Vec<String>> = None;
-        for g in self.grants.iter().filter(|g| g.privilege == "clone") {
+        for g in self.grants.iter().filter(|g| g.privilege == Privilege::Clone) {
             match &g.on {
                 On::Lake => return Some(vec![]),
                 On::Schema(s) => some.get_or_insert_with(Vec::new).push(s.clone()),
@@ -1201,10 +1348,10 @@ impl Access {
     }
     /// Whether this user may clone `db`, a database attached here, through its attachment (GRANT CLONE
     /// ON DATABASE db, ADR-058): `branch::door`.
-    pub fn clones_of(&self, db: &str) -> bool { self.grants.iter().any(|g| g.privilege == "clone" && g.on == On::Database(db.to_string())) }
+    pub fn clones_of(&self, db: &str) -> bool { self.grants.iter().any(|g| g.privilege == Privilege::Clone && g.on == On::Database(db.to_string())) }
     /// Whether this user may apply to this database (GRANT APPLY ON DATABASE, ADR-058): `apply::ask`.
-    pub fn applies(&self) -> bool { self.grants.iter().any(|g| g.privilege == "apply" && g.on == On::Lake) }
-    fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
+    pub fn applies(&self) -> bool { self.grants.iter().any(|g| g.privilege == Privilege::Apply && g.on == On::Lake) }
+    fn writes(&self) -> bool { self.grants.iter().any(|g| matches!(g.privilege, Privilege::Insert | Privilege::Update | Privilege::Delete)) }
 }
 
 /// What this lake's sign-ins worked out goes at once (elsewhere, within `fresh`'s second): its users' access, whether anyone
@@ -1256,6 +1403,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
             let mut todo = vec![("public".to_string(), None, false), (user.to_string(), Some(me.clone()), false)];
             todo.extend(claimed.iter().map(|r| (r.clone(), None, true)));
             let mut superuser = me.superuser;
+            let mut limits = Limits::default(); // (the tightest of its own, its roles' and public's: `Limits::tightest`)
             while let Some((n, u, claim)) = todo.pop() {
                 if seen.contains(&n) {
                     continue;
@@ -1272,17 +1420,19 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
                 }
                 let Some(u) = u else { continue };
                 superuser |= u.superuser && n != "public";
+                limits = limits.tightest(&u.limits);
                 grants.extend(u.grants.iter().cloned());
                 todo.extend(u.roles.iter().map(|r| (r.clone(), None, false)));
             }
-            let access = Arc::new(Access { grants, names: seen, limits: me.limits, ..Default::default() });
+            let access = Arc::new(Access { grants, names: seen, limits, ..Default::default() });
             if let Some(s) = &signs {
                 s.access.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
             }
             (access, superuser)
         }
     };
-    let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
+    // (READ ONLY: a reader's role, whatever it is granted; a superuser takes no option from a role or public)
+    let role = if superuser { Role::Admin } else if access.writes() && !access.limits.read_only() { Role::Write } else { Role::Read };
     Ok(Principal { name: user.to_string(), role, scope: if superuser { crate::rights::Scope::everything() } else { crate::rights::Scope::granted(access) }, door: "node", from: None, operator: false, epoch, until: None, reads: false }.asking())
 }
 
@@ -1408,7 +1558,7 @@ pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::wri
     across(other, ns, scope).await?;
     let (table, privileges) = (format!("{ns}.{table}"), crate::rights::asks(stmt).1.into_iter().filter_map(crate::rights::Action::privilege).collect::<Vec<_>>());
     match privileges.iter().find(|p| scope.named(p, &table).is_none()) {
-        Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
+        Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p, p),
         None => Ok(()),
     }
 }
@@ -1519,6 +1669,8 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
         ("member_of", s(&|_, u| Some(u.roles.join(", ")).filter(|r| !r.is_empty()))),
         ("max_queries", Arc::new(all.iter().map(|(_, u)| u.limits.max_queries.map(|n| n as i64)).collect::<datafusion::arrow::array::Int64Array>()) as ArrayRef),
         ("statement_timeout", s(&|_, u| u.limits.timeout_secs.map(span))),
+        ("read_only", Arc::new(all.iter().map(|(_, u)| Some(u.limits.read_only())).collect::<BooleanArray>()) as ArrayRef), // (its own: a role's reaches its members)
+        ("max_rows", Arc::new(all.iter().map(|(_, u)| u.limits.max_rows.map(|n| n as i64)).collect::<datafusion::arrow::array::Int64Array>()) as ArrayRef),
         ("created", Arc::new(all.iter().map(|(_, u)| (u.created_ms > 0).then_some(u.created_ms as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
     ])?;
     let rows: Vec<(String, &Grant)> = all.iter().flat_map(|(k, u)| u.grants.iter().map(move |g| (k[2..].to_string(), g))).collect();
@@ -1526,10 +1678,11 @@ pub async fn tables(lake: &Lake, scope: &crate::rights::Scope) -> Result<Vec<(&'
     let g = |f: &dyn Fn(&String, &Grant) -> Option<String>| Arc::new(rows.iter().map(|(n, g)| f(n, g)).collect::<StringArray>()) as ArrayRef;
     let grants = RecordBatch::try_from_iter(vec![
         ("grantee", g(&|n, _| Some(n.clone()))),
-        ("privilege", g(&|_, g| Some(g.privilege.to_uppercase()))),
+        ("privilege", g(&|_, g| Some(g.privilege.to_string()))),
         ("on_kind", g(&|_, g| Some(match &g.on { On::Table(_) => "table", On::Schema(_) => "schema", On::Lake if g.of_database() => "database", On::Lake => "lake", On::Secret(_) => "secret", On::Database(_) => "database", On::Object { kind, .. } => kind }.into()))),
         ("on_name", g(&|_, g| match &g.on { On::Table(n) | On::Schema(n) | On::Secret(n) | On::Database(n) | On::Object { name: n, .. } => Some(n.clone()), On::Lake if g.of_database() => Some(here.clone()), On::Lake => None })),
         ("columns", g(&|_, g| Some(g.columns.join(", ")).filter(|c| !c.is_empty()))),
+        ("rows", g(&|_, g| g.rows.clone())), // (its filter on the rows, as kept: none, every row)
     ])?;
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     let mut out = vec![("users", mem(users)?), ("grants", mem(grants)?)];
@@ -1549,6 +1702,25 @@ mod tests {
 
     use super::*;
 
+    /// 11-10 audit H1: the node's own work (a task's tick, a view's refresh) is no one's who runs the nodes, so another
+    /// database that signs in on its own opens nothing to it; a token of the nodes' it opens, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_nodes_own_work_opens_no_database_that_signs_in_on_its_own() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-across-{}", uuid::Uuid::new_v4()));
+        let other = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let node = crate::auth::Principal::node().scope;
+        let token = crate::auth::Principal::token(Role::Admin).scope;
+        assert!(across(&other, "b", &node).await.is_ok(), "a database nothing locks opens to the node's own work");
+        let verifier = Some(Verifier::with("ann-password-1", b"0123456789abcdef", 4096)); // (a user who signs in: `any`)
+        apply(&other, Change::Create { name: "ann".into(), login: true, if_not_exists: false, verifier, superuser: false, limits: Limits::default() }).await?;
+        let e = across(&other, "b", &node).await.expect_err("b has a user: the node's own work is nobody there");
+        assert!(e.to_string().contains("b signs in on its own"), "{e}");
+        assert!(across(&other, "b", &token).await.is_ok(), "a token of the nodes' opens it");
+        assert!(!node.operator() && node.whole() && node.superuser(), "whole and an admin's, but not the operator's");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_lakes_keep_their_users_access_apart() -> Result<()> {
         let mut lakes = vec![];
@@ -1561,8 +1733,8 @@ mod tests {
         }
         // (a writes, b only reads: the same user, a different role in each lake)
         let (a, b) = (&lakes[0].0, &lakes[1].0);
-        apply(a, Change::Grant { privileges: vec!["insert".into()], on: On::Table("t".into()), columns: vec![], to: vec!["ann".into()], database: None }).await?;
-        apply(b, Change::Grant { privileges: vec!["select".into()], on: On::Table("t".into()), columns: vec![], to: vec!["ann".into()], database: None }).await?;
+        apply(a, Change::Grant { privileges: vec!["insert".into()], on: On::Table("t".into()), columns: vec![], to: vec!["ann".into()], database: None, rows: None }).await?;
+        apply(b, Change::Grant { privileges: vec!["select".into()], on: On::Table("t".into()), columns: vec![], to: vec!["ann".into()], database: None, rows: None }).await?;
         assert_eq!(principal(a, "ann").await?.role, Role::Write, "a's ann writes in a");
         assert_eq!(principal(b, "ann").await?.role, Role::Read, "b's ann reads in b, not a's grant");
         assert_eq!(sign_ins(a).expect("a's sign-ins").access.lock().unwrap().len(), 1, "a kept ann's access");
@@ -1639,6 +1811,162 @@ mod tests {
         assert!(none["error"].as_str().unwrap().contains("NOLOGIN"));
         assert_eq!(p("CREATE TABLE t (a INT)"), j!(null));
         assert_eq!(p("CREATE SECRET s (TYPE s3)"), j!(null));
+    }
+
+    #[test]
+    fn a_grant_takes_a_filter_on_rows_after_its_words() {
+        let p = |s: &str| match statement(s) {
+            Some(crate::write::Stmt::Ddl(d)) => match &d[0] {
+                crate::ddl::Ddl::Users(c) => serde_json::to_value(c).unwrap(),
+                _ => panic!(),
+            },
+            Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
+            Some(crate::write::Stmt::Refused(code, e)) => j!({"error": e, "code": code}),
+            _ => j!(null),
+        };
+        // (kept as its parse prints it: spacing, keyword case and unquoted names' case never make two filters differ)
+        assert_eq!(p("GRANT SELECT ON t TO ann WHERE Dept = 'eng'")["rows"], "dept = 'eng'");
+        assert_eq!(p("grant select on t to ann where  LOWER( dept )   =  'x'  and n>1 ;")["rows"], "lower(dept) = 'x' AND n > 1");
+        assert_eq!(p("GRANT SELECT ON t TO ann WHERE owner = CURRENT_USER -- hers")["rows"], "owner = current_user");
+        assert_eq!(p("GRANT SELECT ON t TO ann WHERE \"Dept\" = 'eng'")["rows"], "\"Dept\" = 'eng'");
+        assert_eq!(p("GRANT SELECT ON t TO ann WHERE n > - -1")["rows"], "n > -(-1)", "a minus before a minus prints as one (`--1` reads as a comment)");
+        let g = p("GRANT SELECT (id, amount) ON TABLE sales.orders TO ann, bob WHERE region = 'eu'");
+        assert_eq!((g["columns"].as_array().unwrap().len(), g["to"].as_array().unwrap().len(), g["rows"].clone()), (2, 2, j!("region = 'eu'")));
+        assert_eq!(p("REVOKE SELECT ON t FROM ann WHERE dept='eng'")["rows"], "dept = 'eng'");
+        assert_eq!(p("REVOKE SELECT ON t FROM ann").get("rows"), None, "no filter: every grant of it, kept as before");
+        assert_eq!(p("GRANT SELECT ON \"where\" TO ann").get("rows"), None, "a name quoted is no WHERE");
+        // (on one table, SELECT's: the writes' filters come with their writes)
+        for on in ["SCHEMA s", "ALL TABLES IN SCHEMA s", "ALL TABLES"] {
+            assert_eq!(p(&format!("GRANT SELECT ON {on} TO ann WHERE a = 1"))["error"], "a filter on rows is a table's: GRANT SELECT ON t TO r WHERE …", "{on}");
+        }
+        assert_eq!(p("GRANT USAGE ON SECRET s TO ann WHERE a = 1")["code"], "0A000");
+        assert_eq!(p("GRANT analyst TO ann WHERE a = 1")["code"], "0A000");
+        assert_eq!(p("GRANT INSERT ON t TO ann WHERE a = 1")["rows"], "a = 1");
+        assert_eq!(p("GRANT ALL ON t TO ann WHERE a = 1")["privileges"], j!(["select", "insert", "update", "delete"]), "the four, each with it");
+        assert_eq!(p("GRANT UPDATE, DELETE ON t TO ann WHERE Dept = 'eng'")["rows"], "dept = 'eng'", "UPDATE's and DELETE's: their writes read through it");
+        assert_eq!(p("REVOKE DELETE ON t FROM ann WHERE dept = 'eng'")["rows"], "dept = 'eng'");
+        assert_eq!(p("GRANT SELECT ON t TO ann WHERE")["code"], "42601");
+        assert_eq!(p("GRANT SELECT ON t TO ann WHERE a = 1; DROP TABLE t")["code"], "42601", "one condition, and nothing after it");
+        // (Postgres's own filters on rows: refused, naming ours)
+        for sql in ["CREATE POLICY mine ON t FOR SELECT TO ann USING (owner = current_user)", "ALTER POLICY mine ON t RENAME TO hers", "DROP POLICY mine ON t", "ALTER TABLE t ENABLE ROW LEVEL SECURITY", "ALTER TABLE t FORCE ROW LEVEL SECURITY", "ALTER TABLE t DISABLE ROW LEVEL SECURITY"] {
+            match crate::write::parse(sql) {
+                Some(crate::write::Stmt::Refused(code, e)) => assert_eq!((code, e.as_str()), ("0A000", "a filter on rows is kept on the grant here: GRANT SELECT ON t TO r WHERE …"), "{sql}"),
+                _ => panic!("{sql}: not refused"),
+            }
+        }
+    }
+
+    /// A role's options (step 6 piece 6a): each once, READ ONLY or READ WRITE, MAX_MODEL_CALLS not yet; a member is held to
+    /// the tightest of its own, its roles' and public's; READ ONLY reads and writes nothing, whatever is granted, and READ
+    /// WRITE takes it back; a superuser takes none.
+    #[tokio::test]
+    async fn a_member_is_held_to_the_tightest_of_its_roles_options() -> Result<()> {
+        let said = |s: &str| match crate::write::parse(s) {
+            Some(crate::write::Stmt::Refused(code, e)) => format!("{code}: {e}"),
+            Some(crate::write::Stmt::Invalid(e)) => e,
+            Some(_) => "ok".into(),
+            None => "none".into(),
+        };
+        assert_eq!(said("CREATE ROLE agent READ ONLY MAX_QUERIES 2"), "ok");
+        assert_eq!(said("ALTER USER bot WITH READ WRITE"), "ok");
+        assert_eq!(said("ALTER USER bot MAX_QUERIES 2 READ ONLY MAX_QUERIES 3"), "42601: MAX_QUERIES is given twice: each option once");
+        assert_eq!(said("ALTER USER bot LOGIN NOLOGIN"), "42601: NOLOGIN is given twice: each option once");
+        assert_eq!(said("ALTER USER bot MAX_MODEL_CALLS 10"), "0A000: MAX_MODEL_CALLS comes with ai_agent, in 1.1: a role's model calls aren't counted yet");
+        assert_eq!(said("ALTER ROLE agent MAX_ROWS 'many'"), "22023: MAX_ROWS is a whole number: 1000 (0: no limit)");
+        assert!(said("ALTER USER bot READ MOSTLY").contains("READ ONLY (it reads, and writes nothing to the lake, whatever it is granted) or READ WRITE"));
+        crate::auth::as_node(async move {
+            let dir = std::env::temp_dir().join(format!("pondra-role-options-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"]]}"#).await?;
+            for sql in ["CREATE ROLE agent READ ONLY MAX_QUERIES 2 MAX_ROWS 100", "CREATE USER bot PASSWORD 'long enough' MAX_QUERIES 5 STATEMENT_TIMEOUT '1 minute' MAX_ROWS 500",
+                        "CREATE USER boss PASSWORD 'long enough' SUPERUSER", "GRANT agent TO bot", "GRANT agent TO boss", "GRANT SELECT, INSERT ON t TO bot",
+                        "CREATE ROLE slow STATEMENT_TIMEOUT '10 seconds'", "GRANT slow TO public"] {
+                let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(sql) else { panic!("{sql}") };
+                for d in ds {
+                    crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
+                }
+            }
+            let t = crate::rights::Object::Table("t");
+            let bot = principal(&lake, "bot").await?;
+            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(2), timeout_secs: Some(10), read_only: Some(true), max_rows: Some(100) }), "its role's 2 and 100 rows, public's role's 10 s");
+            assert_eq!(bot.role, Role::Read, "a reader, though granted INSERT");
+            assert!(crate::rights::may(&bot, crate::rights::Action::Select, t).is_ok());
+            assert_eq!(crate::rights::may(&bot, crate::rights::Action::Insert, t).err().map(|r| r.text).as_deref(),
+                Some("permission denied: bot is READ ONLY (an option of its own or of a role it holds), so it may not write"));
+            assert!(crate::rights::may(&bot, crate::rights::Action::Define, crate::rights::Object::Lake).is_err());
+            let boss = principal(&lake, "boss").await?;
+            assert!(boss.scope.limits().is_none() && crate::rights::may(&boss, crate::rights::Action::Insert, t).is_ok(), "a superuser takes no option from a role");
+            let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse("ALTER ROLE agent READ WRITE MAX_QUERIES 0 MAX_ROWS 0") else { panic!() };
+            for d in ds {
+                crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
+            }
+            let bot = principal(&lake, "bot").await?;
+            assert_eq!(bot.scope.limits(), Some(Limits { max_queries: Some(5), timeout_secs: Some(10), read_only: None, max_rows: Some(500) }), "READ WRITE and 0 take the role's back: its own 5 and 500 rows");
+            assert!(bot.role == Role::Write && crate::rights::may(&bot, crate::rights::Action::Insert, t).is_ok());
+            anyhow::Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_grant_checks_its_filter_on_rows_and_revoke_takes_back_that_one() -> Result<()> {
+        crate::auth::as_node(async move {
+            let dir = std::env::temp_dir().join(format!("pondra-grant-rows-{}", uuid::Uuid::new_v4()));
+            let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"], ["dept", "Utf8"], ["owner", "Utf8"]]}"#).await?;
+            let run = |sql: &'static str| {
+                let lake = lake.clone();
+                async move {
+                    match crate::write::parse(sql) {
+                        Some(crate::write::Stmt::Ddl(ds)) => {
+                            for d in ds {
+                                crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
+                            }
+                            Ok(())
+                        }
+                        Some(crate::write::Stmt::Refused(code, e)) => Err(crate::codes::coded(code, e)),
+                        Some(crate::write::Stmt::Invalid(e)) => Err(anyhow!(e)),
+                        _ => panic!("{sql}: not a write"),
+                    }
+                }
+            };
+            let said = |r: Result<()>| r.err().map(|e| format!("{}: {}", crate::codes::of(&e), crate::ext::said(&e))).unwrap_or_default();
+            let held = || {
+                let lake = lake.clone();
+                async move {
+                    let u: User = lake.cat.get(&user_key("ann")).await?.expect("ann");
+                    anyhow::Ok(u.grants.iter().map(|g| (g.privilege.clone(), g.columns.join(","), g.rows.clone().unwrap_or_default())).collect::<Vec<_>>())
+                }
+            };
+            run("CREATE USER ann PASSWORD 'long enough'").await?;
+            run("CREATE VIEW v AS SELECT k FROM t").await?;
+            // (checked against the table's columns when it is granted)
+            assert_eq!(said(run("GRANT SELECT ON t TO ann WHERE salary > 3").await), "42703: t has no column salary");
+            assert_eq!(said(run("GRANT SELECT ON t TO ann WHERE random() > 0.5").await).get(..5), Some("42P17"));
+            assert_eq!(said(run("GRANT SELECT ON t TO ann WHERE k + 1").await).get(..5), Some("42804"));
+            assert_eq!(said(run("GRANT SELECT ON v TO ann WHERE k = 1").await), "0A000: v is a view: a filter on rows is a table's (GRANT SELECT ON t TO r WHERE …, t a table the view reads)");
+            assert!(held().await?.is_empty(), "nothing granted by a refused grant");
+            // (several filters stand side by side; the same one again replaces its columns; one without stays its own)
+            run("GRANT SELECT ON t TO ann WHERE dept = 'eng'").await?;
+            run("GRANT SELECT (k) ON t TO ann WHERE owner = current_user").await?;
+            run("GRANT SELECT (k, dept) ON t TO ann WHERE owner = CURRENT_USER").await?;
+            run("GRANT SELECT ON t TO ann").await?;
+            assert_eq!(
+                held().await?,
+                vec![("select".into(), "".into(), "dept = 'eng'".into()), ("select".into(), "k,dept".into(), "owner = current_user".into()), ("select".into(), "".into(), "".into())]
+            );
+            // (REVOKE … WHERE c: the grant whose filter is c's only; without WHERE, every grant of it)
+            run("REVOKE SELECT ON t FROM ann WHERE Dept = 'eng'").await?;
+            run("REVOKE SELECT ON t FROM ann WHERE dept = 'hr'").await?; // (none such: nothing changes, as a privilege not held)
+            assert_eq!(held().await?, vec![("select".into(), "k,dept".into(), "owner = current_user".into()), ("select".into(), "".into(), "".into())]);
+            let shown = tables(&lake, &crate::auth::Principal::node().scope).await?;
+            let grants = &shown.iter().find(|(n, _)| *n == "grants").expect("pondra.grants").1;
+            assert_eq!(grants.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(), ["grantee", "privilege", "on_kind", "on_name", "columns", "rows"]);
+            run("REVOKE SELECT ON t FROM ann").await?;
+            assert!(held().await?.is_empty());
+            anyhow::Ok(())
+        })
+        .await
     }
 
     #[test]

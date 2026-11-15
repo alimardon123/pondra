@@ -37,7 +37,7 @@ sys.path.insert(0, HERE)
 import harness, slt_check
 
 FORMS = ("server", "cluster", "inprocess", "memory", "page")
-LISTS = 6  # the lake format a new lake starts at in every form: its tables' column lists (`format::LISTS`)
+FIRST = 8  # the lake format a new lake starts at in every form: its files' typed ranges, with its tables' column lists (`format::BOUNDS`)
 SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 # DataFusion's own words for what it lacks: a refusal in them isn't yet one the form names (ADR-072 §6)
 DATAFUSION = re.compile(r"This feature is not implemented|not supported|Unsupported|SQL error|syntax error: |Schema error|Error during planning|Inconsistent data length|Placeholder")  # (`syntax error: …`: the parser's own words, `codes::parser_said`)
@@ -210,7 +210,7 @@ def run_file(name, form, path, refusal):
 
 
 def new_lake_format(name, form):
-    """A new lake starts at format 6 (its tables' column lists) in every form that answers /stats, as a server's does:
+    """A new lake starts at format 8 (its files' typed ranges) in every form that answers /stats, as a server's does:
     the failure, or None. (A page answers no /stats; it makes its lake as a node does, `format::raise`.)"""
     form.open()
     try:
@@ -221,10 +221,10 @@ def new_lake_format(name, form):
         for _ in range(50):  # (a server's leader marks the lake as it starts, beside serving)
             status, _, said = form.request("GET", "/stats", {}, None)
             fmt = json.loads(said).get("format") if status < 300 else f"{status} {said[:200]!r}"
-            if fmt == LISTS:
+            if fmt == FIRST:
                 return None
             time.sleep(0.1)
-        return f"a new lake is format {fmt}, not {LISTS} (its tables' column lists)"
+        return f"a new lake is format {fmt}, not {FIRST} (its files' typed ranges)"
     finally:
         form.close()
 

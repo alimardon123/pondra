@@ -1294,7 +1294,7 @@ async fn newest_parts(lake: &Lake, table: &str, time: &str) -> Result<BTreeMap<S
         let s = meta.schema()?;
         let ranges = crate::manifest::ranges(&crate::manifest::list(lake, &meta).await?, &meta.files, &s);
         if let Some((_, hi)) = ranges.get(&stored) {
-            if let ScalarValue::TimestampMicrosecond(Some(v), _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
+            if let ScalarValue::TimestampMicrosecond(Some(v), _) = hi.cast_to(&us)? {
                 parts.entry(part.to_string()).and_modify(|n| *n = (*n).max(v)).or_insert(v);
             }
         }

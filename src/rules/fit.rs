@@ -176,7 +176,7 @@ pub fn plan(base: &SessionContext, schema: &SchemaRef, check: &str) -> Result<(A
     let expr = base.parse_sql_expr(check, &schema).and_then(crate::optimize::whole_literals)?;
     let changing = expr.exists(|e| Ok(matches!(e, Expr::ScalarFunction(f) if f.func.signature().volatility != Volatility::Immutable)))?;
     let options = Arc::new(datafusion::config::ConfigOptions::clone(base.state_ref().read().config_options()));
-    let expr = crate::divide::alone(expr, &schema, &options)?; // (a DECIMAL quotient's places, as a query's: before the types are coerced)
+    let expr = crate::divide::alone(expr, &schema)?; // (a DECIMAL quotient's places, as a query's: before the types are coerced)
     let now = ExprSimplifier::new(SimplifyContext::builder().with_schema(schema.clone()).with_config_options(options).with_current_time().build());
     let expr = now.simplify(now.coerce(expr, &schema)?)?;
     // (as a query's WHERE has it after the simplifier: a float IN list's zero is an `=`, which takes -0.0 too, 11-06 audit M5)

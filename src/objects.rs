@@ -324,7 +324,7 @@ fn relations<'a>(lake: &'a Lake, scope: &'a Scope) -> BoxFuture<'a, Result<Vec<O
             // (a column a user may not read is not shown by name either: a definition names every column, so a
             // user granted only some of them gets none)
             let catalog = if o.lake == here { local.clone() } else { format!("{}.{local}", o.lake) };
-            let partial = (if o.lake == here { scope.columns(&catalog) } else { scope.named("select", &catalog) }) != Some(None); // (another lake's: the grants naming it)
+            let partial = (if o.lake == here { scope.columns(&catalog) } else { scope.columns_named(&catalog) }) != Some(None); // (another lake's: the grants naming it)
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
                 "view" => o.sql.as_ref().map(|s| {
@@ -623,7 +623,9 @@ pub(crate) fn sql_type(t: &str) -> String {
             }
             D::Decimal128(p, s) | D::Decimal256(p, s) => format!("DECIMAL({p}, {s})"),
             D::Interval(_) => "INTERVAL".into(),
-            D::List(f) | D::LargeList(f) | D::FixedSizeList(f, _) => format!("{}[]", of(f.data_type())),
+            D::FixedSizeList(f, n) if *f.data_type() == D::Float32 => format!("VECTOR({n})"), // (FLOAT[n]: one spelling, pgvector's)
+            D::FixedSizeList(f, n) => format!("{}[{n}]", of(f.data_type())),
+            D::List(f) | D::LargeList(f) => format!("{}[]", of(f.data_type())),
             d => d.to_string(),
         }
     }

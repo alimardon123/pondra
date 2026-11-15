@@ -57,7 +57,10 @@ pub(crate) static CALL_TEXT: LazyLock<regex::Regex> =
 pub static SEMANTIC: crate::registry::BuiltIn = crate::registry::BuiltIn {
     name: "semantic",
     requires: &["engine"],
-    register: |r| passes().into_iter().for_each(|p| r.section_mut::<crate::passes::Passes>().add(p)),
+    register: |r| {
+        passes().into_iter().for_each(|p| r.section_mut::<crate::passes::Passes>().add(p));
+        r.section_mut::<crate::front::Trees>().add(tree_pass());
+    },
 };
 
 /// The passes measures add: `expr AS MEASURE name`, a hook of the fallback dialect (`dialect.rs`), so only a text
@@ -941,6 +944,25 @@ impl VisitorMut for Leftover<'_> {
         }
         ControlFlow::Continue(())
     }
+}
+
+/// The front's tree pass (`front::Trees`): the measures a statement reads, at its own grain (ADR-065 §3), before the
+/// expander's pass expands what they put in (a view's FROM, its macros).
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "measures.rewrite", order: 20, looks: &[], run: tree } }
+
+fn tree<'a>(_: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], facts: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> {
+    Box::pin(async move {
+        if !facts.measured {
+            return Ok(false);
+        }
+        let me = format!("{}.", facts.name);
+        let view = |n: &ObjectName| candidates(&crate::text::object(n), &me).iter().find_map(|c| facts.measure_views.get(c).cloned());
+        let done = rewrite_with(stmts, &view, &|n| facts.routines.own.contains_key(n))?;
+        if done {
+            facts.expand();
+        }
+        Ok(done)
+    })
 }
 
 /// Rewrites the statements in place and returns whether anything changed. `view` finds a view with measures by the name a query

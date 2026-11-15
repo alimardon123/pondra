@@ -278,7 +278,7 @@ async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
     if dead.is_empty() {
         return raw(lake, ctx, name, meta, upto, scope).await;
     }
-    let (touched, clean): (Vec<DataFile>, Vec<DataFile>) = meta.files.iter().cloned().partition(|f| crate::sys::holds(&dead, &f.stats));
+    let (touched, clean): (Vec<DataFile>, Vec<DataFile>) = meta.files.iter().cloned().partition(|f| crate::sys::holds(&dead, f));
     let meta = with_sys(meta);
     let clean = raw(lake, ctx, name, &{ let mut entry = meta.clone(); entry.files = clean; entry }, Some(meta.tiered), scope).await?; // (the log goes with the touched files)
     let touched = raw(lake, ctx, name, &{ let mut entry = meta; entry.files = touched; entry }, upto, scope).await?;
@@ -483,7 +483,8 @@ fn guarded(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, 
         }
         return None;
     }
-    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None, shown: false, asked: asked.clone() }))
+    let rows = scope.rows(&crate::rights::Privilege::Select, name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None, shown: false, asked: asked.clone(), rows }))
 }
 
 /// An attached lake's table `name` as `scope` may read it: not at all when that
@@ -492,7 +493,7 @@ fn across(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, l
     let columns = match locked {
         Some(_) => None,
         None if scope.whole() => return Some(t),
-        None => scope.named("select", name),
+        None => scope.columns_named(name),
     };
     if columns.is_none() && (listing || locked.is_none() && !scope.knows_named(name)) {
         if !listing {
@@ -500,7 +501,8 @@ fn across(scope: &crate::rights::Scope, name: &str, t: Arc<dyn TableProvider>, l
         }
         return None; // (as `guarded`: a table it doesn't know is there isn't, for it)
     }
-    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone(), shown: false, asked: asked.clone() }))
+    let rows = scope.rows_named(&crate::rights::Privilege::Select, name).map(|sql| crate::row_scan::Rows { sql, told: scope.shows_code() });
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone(), shown: false, asked: asked.clone(), rows }))
 }
 
 /// A table as a user granted some of it reads it (`users.rs`): planned as the table is, so that a statement naming a
@@ -517,6 +519,7 @@ struct Guarded {
     why: Option<String>,
     shown: bool,
     asked: Arc<str>,
+    rows: Option<crate::row_scan::Rows>, // (its grant's filter on its rows: step 6 piece 5b, `row_scan`)
 }
 
 /// Does `sql` name `column` itself: a word of it, not inside a string?
@@ -547,10 +550,14 @@ impl TableProvider for Guarded {
     fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> { None } // (a view's plan would read around the check)
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         // (inexact: each filter stays above the scan too, so its columns are in what is scanned; and one that is never
-        // true comes to the scan, which then reads nothing)
+        // true comes to the scan, which then reads nothing. Under a filter on its rows, only one that can't fail on a row
+        // the filter hides comes to the scan at all: `row_scan::leakproof`.)
+        use datafusion::logical_expr::TableProviderFilterPushDown::{Exact, Inexact, Unsupported};
+        let schema = self.inner.schema();
         Ok(self.inner.supports_filters_pushdown(filters)?.into_iter().zip(filters).map(|(p, f)| match p {
-            datafusion::logical_expr::TableProviderFilterPushDown::Exact => datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
-            _ if never(f) => datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+            _ if never(f) => Inexact,
+            _ if self.rows.is_some() && !crate::row_scan::leakproof(f, &schema) => Unsupported,
+            Exact => Inexact,
             p => p,
         }).collect())
     }
@@ -562,7 +569,10 @@ impl TableProvider for Guarded {
             let schema = match &projection { Some(p) => Arc::new(all.project(p)?), None => all };
             return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema)));
         }
-        self.inner.scan(state, projection.as_ref(), filters, limit).await
+        match &self.rows {
+            None => self.inner.scan(state, projection.as_ref(), filters, limit).await,
+            Some(rows) => crate::row_scan::scan(state, &self.inner, &self.name, rows, projection, filters, limit).await,
+        }
     }
 }
 
@@ -755,7 +765,7 @@ async fn view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMet
 pub struct Facts {
     pub schema: SchemaRef,
     pub manifests: Vec<crate::manifest::Manifest>,
-    pub ranges: crate::manifest::Stats,
+    pub ranges: crate::manifest::Values,
     pub count: datafusion::common::Statistics,
     pub known: Arc<std::collections::HashMap<String, crate::hot::Known>>,
 }
@@ -788,7 +798,7 @@ const FACTS_BYTES: usize = 64 << 20;
 /// What a version's facts count against `FACTS_BYTES`: each manifest by its path and its statistics (as JSON), and 128 bytes
 /// for the record itself. A list of ten thousand manifests counts its ten thousand records, not only the first few.
 fn facts_bytes(facts: &Facts) -> usize {
-    facts.manifests.iter().map(|m| 128 + m.path.len() + crate::store::json(&m.stats).len()).sum()
+    facts.manifests.iter().map(|m| 128 + m.path.len() + crate::store::json(&m.stats).len() + crate::store::json(&m.bounds).len()).sum()
 }
 
 impl FactsMemo {
@@ -859,7 +869,7 @@ pub async fn facts_once(lake: &Lake, meta: &TableMeta, sys: bool) -> Result<Fact
 /// A table's statistics for planning (`Pruned::sized`): its rows and bytes (a slice's `share`, else the entry's: its
 /// sealed manifests' totals and its files'), and each column's range and distinct values (`sketch.rs`, no more than its
 /// range or its rows could hold).
-fn count(meta: &TableMeta, schema: &SchemaRef, ranges: &crate::manifest::Stats, share: Option<(u64, u64)>) -> datafusion::common::Statistics {
+fn count(meta: &TableMeta, schema: &SchemaRef, ranges: &crate::manifest::Values, share: Option<(u64, u64)>) -> datafusion::common::Statistics {
     use datafusion::common::stats::Precision;
     let (rows, bytes) = share.unwrap_or_else(|| {
         let sealed = meta.sealed.clone().unwrap_or_default();
@@ -869,8 +879,7 @@ fn count(meta: &TableMeta, schema: &SchemaRef, ranges: &crate::manifest::Stats, 
     let mut stats = datafusion::common::Statistics::new_unknown(schema);
     (stats.num_rows, stats.total_byte_size) = (Precision::Inexact(rows as usize), Precision::Inexact(bytes as usize));
     for (i, f) in schema.fields().iter().enumerate() {
-        let parse = |v: &String| datafusion::common::ScalarValue::try_from_string(v.clone(), f.data_type()).ok();
-        let range = ranges.get(f.name()).and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?)));
+        let range = ranges.get(f.name()).cloned();
         // Distinct values: what the table's sketch saw (`sketch.rs`), no more than its range could hold, nor than its rows.
         let sketched = meta.sketch.get(f.name()).and_then(|s| crate::sketch::estimate(s));
         if let Some(n) = crate::sketch::distinct(sketched, range.as_ref().map(|(lo, hi)| (lo, hi)), rows) {
@@ -1138,6 +1147,18 @@ pub async fn when_handed() {
     }
 }
 
+/// `plan` with a LIMIT of `cap` + 1 above it (`MAX_ROWS`: `App::run_query`), so the engine stops at the row that says the
+/// answer is cut. A plan that isn't a query's (a statement's, a write's) is as it is.
+pub fn capped(plan: datafusion::logical_expr::LogicalPlan, cap: Option<u64>) -> Result<datafusion::logical_expr::LogicalPlan> {
+    use datafusion::logical_expr::LogicalPlan as P;
+    match cap {
+        Some(n) if !matches!(plan, P::Dml(_) | P::Ddl(_) | P::Statement(_) | P::Copy(_) | P::Explain(_) | P::Analyze(_) | P::DescribeTable(_)) => {
+            Ok(datafusion::logical_expr::LogicalPlanBuilder::from(plan).limit(0, Some(usize::try_from(n).unwrap_or(usize::MAX - 1) + 1))?.build()?)
+        }
+        _ => Ok(plan),
+    }
+}
+
 /// The size from which a query's answer goes to its door in pieces (`PONDRA_STREAM_MB`, 8 MB of Arrow), read
 /// once. 0 sends every answer in pieces (the tests compare the two ways).
 pub fn stream_bytes() -> usize {
@@ -1171,7 +1192,7 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
         // what `big` measures, so a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
         let batch = match &send { Some(format) => crate::answer::as_sent(batch, format.as_deref()), None => batch };
         if held.try_grow(counted.count_batch(&batch)).is_err() {
-            return Err(too_big(room_of(&pool)));
+            return Err(too_big(&pool));
         }
         out.push(batch);
         if let Some(format) = &send {
@@ -1193,19 +1214,21 @@ pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Optio
     Some(held)
 }
 
-/// The memory a statement's answer may take at most now: its database's room in the node's line (`ledger::LakePool`), at
-/// most the node's memory for queries.
-pub(crate) fn room_of(pool: &Arc<dyn MemoryPool>) -> usize {
+/// The memory a statement's answer may take at most now, and its node's memory for queries: its database's room in the
+/// node's line (`ledger::LakePool`), at most that line, the node's own, not the process's (11-10 audit L2: a folder's
+/// databases are nodes in one process). A pool on no node's line: the process's.
+fn room_of(pool: &Arc<dyn MemoryPool>) -> (usize, usize) {
+    let line = crate::ledger::line_of(pool).unwrap_or_else(memory_limit);
     match pool.memory_limit() {
-        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => n.min(memory_limit()),
-        _ => memory_limit(),
+        datafusion::execution::memory_pool::MemoryLimit::Finite(n) => (n.min(line), line),
+        _ => (line, line),
     }
 }
 
-/// The refusal of an answer bigger than the query memory (53200), with the way out. `room`: what the statement's database
-/// has of it now (`room_of`), less than the node's while the node's other databases' queries hold some (11-06 audit M10).
-pub(crate) fn too_big(room: usize) -> anyhow::Error {
-    let line = memory_limit();
+/// The refusal of an answer bigger than the query memory (53200), with the way out. What the statement's database has of
+/// it now (`room_of`) is less than the node's while the node's other databases' queries hold some (11-06 audit M10).
+pub(crate) fn too_big(pool: &Arc<dyn MemoryPool>) -> anyhow::Error {
+    let (room, line) = room_of(pool);
     let what = match room < line {
         true => format!("the memory this database has for queries now ({} MB of the node's {} MB: its other databases' queries hold the rest)", room >> 20, line >> 20),
         false => format!("this node's memory for queries ({} MB)", line >> 20),
@@ -1332,7 +1355,7 @@ async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<
                 None => break, // (none is ready: what is goes now)
             }
         }
-        held.try_grow(size).map_err(|_| too_big(room_of(pool)))?;
+        held.try_grow(size).map_err(|_| too_big(pool))?;
         for piece in crate::answer::pieces(ready) {
             rows += piece.num_rows() as u64;
             step_to(enc, tx, Some(&piece)).await?;
@@ -1632,7 +1655,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
                 Some(t) => {
                     ctx.register_table(table_ref(name), t)?;
                 }
-                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None, shown: false, asked: asked.clone() }) as Arc<dyn TableProvider>)),
+                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None, shown: false, asked: asked.clone(), rows: None }) as Arc<dyn TableProvider>)),
             }
         }
     }
@@ -1671,9 +1694,12 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         let entries = other.cat.scan_raw("t/", "t0").await?;
         other.cat.settle().await?; // (as this lake's own, above)
         let upto = Some(other.visible()); // (one end for its tables too, as this lake's above)
+        // (its views the statement names, their names read in it: the tables they read are named then, below)
+        let theirs = their_views(&other, &ns, &text, listing, scope).await?;
+        let read = theirs.iter().fold(text.clone(), |t, (_, s)| format!("{t} {s}"));
         for (key, raw) in entries {
             let name = &key[2..];
-            if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
+            if crate::sys::hidden(name) || !(listing || mentions(&read, name)) {
                 continue;
             }
             let meta = other.cat.parsed(&key, &raw)?;
@@ -1685,7 +1711,22 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             }
             catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
         }
-        ctx.register_catalog(ns, catalog);
+        ctx.register_catalog(ns.clone(), catalog.clone());
+        for (name, sql) in theirs {
+            // (planned over its tables, now registered; refused as its tables are, by the grants naming it)
+            let df = match self::sql(&ctx, &crate::sys::planned(&sql)?).await {
+                Ok(df) => df,
+                Err(_) if listing => continue, // (a listing shows what it can, as of this lake's own views)
+                Err(e) => return Err(e.context(format!("{ns}.{name}"))),
+            };
+            let view: Arc<dyn TableProvider> = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql))));
+            let Some(view) = across(scope, &format!("{ns}.{name}"), view, listing, &locked, &asked) else { continue };
+            let (s, t) = split(&name);
+            if old && s == PUBLIC {
+                default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;
+            }
+            catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
+        }
     }
     if (crate::runs::mentioned(&text) || !crate::lists::mentioned(&text).is_empty()) && default.schema("pondra").is_none() {
         // (`pondra.runs`, `pondra.routines`, `pondra.tasks`, the lists; a lake's own schema called pondra is one made before 0.80, which wins as it did: 0.80 refuses a new one, 42939)
@@ -1903,6 +1944,24 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool, scope: &crate::
     }
 }
 
+/// The stored views of `other`, attached as `ns`, that `text` names (every one, for a listing), by their names in it, each
+/// as the query it reads there: its macros expanded as its own lake's views are (`stored_views`), its tables named in
+/// `ns` and the views of `other` it reads inlined (`redirect.rs`). So `ns.sales.v` reads as `sales.v` does in `other`.
+async fn their_views(other: &Lake, ns: &str, text: &str, listing: bool, scope: &crate::rights::Scope) -> Result<Vec<(String, String)>> {
+    let host = crate::host::Asking::of(other, scope);
+    let mut out = vec![];
+    for (key, raw) in other.cat.scan_raw("q/", "q0").await? {
+        let name = &key[2..];
+        if !(listing || crate::text::mentions(text, name)) {
+            continue;
+        }
+        let v: crate::ddl::StoredView = serde_json::from_slice(&raw)?;
+        let sql = crate::routines::expand_stored(other, &v.sql, scope).await?;
+        out.push((name.to_string(), crate::redirect::redirect(&host, sql, ns.to_string(), 0).await?));
+    }
+    Ok(out)
+}
+
 /// Stored views over the tables `ctx` has now — again, if they are there already: a node's shares
 /// of its tables replace them (`spmd.rs`), and the views must read those. One view may use
 /// another: until none is left. A view its user may not see (`guarded`) is there for the views over it to be planned
@@ -1923,7 +1982,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
                         Some(v) => ctx.register_table(table_ref(&name), v)?,
                         None => {
                             planned_only.push(table_ref(&name));
-                            ctx.register_table(table_ref(&name), Arc::new(Guarded { inner: view, name: name.clone(), columns: None, why: None, shown: false, asked: asked.clone() }))?
+                            ctx.register_table(table_ref(&name), Arc::new(Guarded { inner: view, name: name.clone(), columns: None, why: None, shown: false, asked: asked.clone(), rows: None }))?
                         }
                     };
                 }
@@ -2024,6 +2083,29 @@ impl Lake {
 
 #[cfg(test)]
 mod tests {
+
+    /// A capped plan (`MAX_ROWS`) gives one row more than its cap, so its answer is known to be cut; a cap past its rows
+    /// gives them all, and a statement's plan takes none.
+    #[tokio::test]
+    async fn a_capped_plan_stops_one_row_past_its_cap() -> anyhow::Result<()> {
+        use super::*;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let rows = |cap: Option<u64>, sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let state = ctx.state();
+                let plan = capped(state.create_logical_plan(sql).await?, cap)?;
+                let batches = datafusion::prelude::DataFrame::new(state, plan).collect().await?;
+                anyhow::Ok(batches.iter().map(|b| b.num_rows()).sum::<usize>())
+            }
+        };
+        assert_eq!(rows(Some(3), "SELECT v FROM generate_series(1, 100) AS g(v) ORDER BY v DESC").await?, 4);
+        assert_eq!(rows(Some(500), "SELECT v FROM generate_series(1, 100) AS g(v)").await?, 100);
+        assert_eq!(rows(None, "SELECT v FROM generate_series(1, 100) AS g(v)").await?, 100);
+        let set = ctx.state().create_logical_plan("SET datafusion.execution.batch_size = 100").await?;
+        assert!(matches!(capped(set, Some(3))?, datafusion::logical_expr::LogicalPlan::Statement(_)), "a statement's plan as it is");
+        Ok(())
+    }
 
     /// A view's partial DECIMAL sums add up in the type its table keeps, however many files and log rows it has: its sum
     /// keeps that type, and its average (`pondra_avg_of`) the query's places (11-08 audit M2; the train's `sums` found a
@@ -2154,7 +2236,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("pondra-probe-{}", uuid::Uuid::new_v4()));
             let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
             crate::write::create_table(&lake, "t", r#"{"columns": [["k", "Int64"], ["v", "Int64"]]}"#).await?;
-            let ann = Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec!["v".into()] }])));
+            let ann = Scope::granted(Arc::new(Access::granted(vec![Grant { privilege: "select".into(), on: On::Table("t".into()), columns: vec!["v".into()], rows: None }])));
             let scans = |p: &LogicalPlan| p.exists(|n| Ok(matches!(n, LogicalPlan::TableScan(_)))).unwrap();
             let probes = ["SELECT * FROM t LIMIT 0", "SELECT * FROM t WHERE 1 = 0", "SELECT k FROM t WHERE false", "SELECT * FROM t a JOIN t b ON FALSE",
                 "SELECT * FROM t JOIN (SELECT 1 AS x WHERE false) e ON true", "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM t u LIMIT 0)"];
@@ -2194,6 +2276,124 @@ mod tests {
         })
         .await
     }
+    /// A table read under its reader's grant's filter on its rows (step 6 piece 5b, `row_scan`): the rows it keeps only, cut
+    /// by a limit after it, counted and bounded from them; nothing the query asks of a row it hides is worked out, so no
+    /// condition fails on one (L1's tests: a division by its zero, under a top-N of 16 columns too, and a cast of its text),
+    /// though the table is read through a view of its files that works out the conditions given it (a renamed column's),
+    /// or with Parquet's row filters on; the filter's columns are read for a reader granted others; EXPLAIN ANALYZE shows
+    /// no count of hidden rows. A leakproof filter and one that isn't (offered to the files, or not) alike. A reader granted
+    /// the table with no filter plans as before. (Each of the first two fails if the query's conditions or its limit are
+    /// given to the scan under the filter.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_filter_on_rows_shows_its_rows_only_and_nothing_fails_on_one_it_hides() -> anyhow::Result<()> {
+        crate::auth::as_node(async move {
+            use super::*;
+            use crate::rights::Scope;
+            use crate::users::{Access, Grant, On};
+            use datafusion::arrow::record_batch::RecordBatch;
+            async fn answer(lake: &crate::store::Lake, sql: &str, scope: &Scope) -> anyhow::Result<Vec<RecordBatch>> {
+                let ctx = session_for(lake, sql, "", None, scope).await?;
+                Ok(crate::engine::sql(&ctx, sql).await?.collect().await?)
+            }
+            // (with Parquet's filters worked out row by row as the files are read, a reader's setting: `ext::PARQUET_TUNING`)
+            async fn pushed(lake: &crate::store::Lake, sql: &str, scope: &Scope) -> anyhow::Result<Vec<RecordBatch>> {
+                let ctx = session_for(lake, sql, "", None, scope).await?;
+                {
+                    let state = ctx.state_ref();
+                    let mut state = state.write();
+                    let parquet = &mut state.config_mut().options_mut().execution.parquet;
+                    (parquet.pushdown_filters, parquet.reorder_filters) = (true, true);
+                }
+                Ok(crate::engine::sql(&ctx, sql).await?.collect().await?)
+            }
+            async fn text(lake: &crate::store::Lake, sql: &str, scope: &Scope) -> anyhow::Result<String> {
+                Ok(datafusion::arrow::util::pretty::pretty_format_batches(&answer(lake, sql, scope).await?)?.to_string())
+            }
+            let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
+            let dir = std::env::temp_dir().join(format!("pondra-rows-{}", uuid::Uuid::new_v4()));
+            let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+            let wide: String = (5..16).map(|i| format!(r#", ["c{i}", "Int64"]"#)).collect();
+            let columns = format!(r#"[["k", "Int64"], ["x", "Int64"], ["s", "Utf8"], ["dept", "Utf8"], ["name", "Utf8"]{wide}]"#);
+            crate::write::create_table(&lake, "t", &format!(r#"{{"columns": {columns}}}"#)).await?;
+            let seq = crate::log::Sequencer::start(lake.clone(), None).await?;
+            // (100 rows the filter hides come first, each with x = 5 and s = 'abc'; then the 20 it shows, x = k, s = k's digits)
+            let rest: String = (5..16).map(|i| format!(", {i} AS c{i}")).collect();
+            let hidden = |then: &str, shown: &str| format!("CASE WHEN value < 100 THEN {then} ELSE {shown} END");
+            let fill = format!("SELECT value AS k, {} AS x, {} AS s, {} AS dept, 'n' || value AS name{rest} FROM range(120)", hidden("5", "value"), hidden("'abc'", "CAST(value AS VARCHAR)"), hidden("'hr'", "'eng'"));
+            let files = crate::write::write_files(&lake, &lake.session(), "t", &fill, "fill", None).await?.expect("not yet recorded");
+            crate::write::record(&lake, files, &seq).await?;
+            // (a column renamed: the table is read through a view of its files (`named`), which works out the conditions
+            // given its scan itself, on every row it reads)
+            let Some(crate::write::Stmt::Ddl(renamed)) = crate::write::parse("ALTER TABLE t RENAME COLUMN c15 TO c_last") else { panic!("an ALTER TABLE") };
+            for d in renamed {
+                crate::ddl::apply(&lake, d, &crate::auth::Principal::node()).await?;
+            }
+            let grant = |columns: &[&str], rows: Option<&str>| {
+                let g = Grant { privilege: "select".into(), on: On::Table("t".into()), columns: columns.iter().map(|c| c.to_string()).collect(), rows: rows.map(String::from) };
+                Scope::granted(Arc::new(Access::granted(vec![g])))
+            };
+            let ann = grant(&[], Some("dept = 'eng'"));
+            let lowered = grant(&[], Some("lower(dept) = 'eng'")); // (a filter that isn't leakproof: not offered to the files)
+            let ks = |b: &[RecordBatch]| -> Vec<i64> { b.iter().flat_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap().values().to_vec()).collect() };
+            assert_eq!(ks(&answer(&lake, "SELECT k FROM t ORDER BY k", &ann).await?), (100..120).collect::<Vec<i64>>(), "its rows only");
+            for scope in [&ann, &lowered] {
+                for sql in ["SELECT * FROM t WHERE 100 / (x - 5) >= 0", "SELECT * FROM t WHERE k >= 0 AND 100 / (x - 5) >= 0", "SELECT * FROM t WHERE 100 / (x - 5) >= 0 ORDER BY k LIMIT 10"] {
+                    for rows in [answer(&lake, sql, scope).await, pushed(&lake, sql, scope).await] {
+                        assert!(rows.is_ok(), "{sql} is worked out on no hidden row: {rows:?}");
+                        assert_eq!(count(&rows?), if sql.contains("LIMIT") { 10 } else { 20 }, "{sql}");
+                    }
+                }
+                let limited = answer(&lake, "SELECT k FROM t LIMIT 10", scope).await?;
+                assert_eq!(count(&limited), 10, "the limit is after the filter");
+                assert!(ks(&limited).iter().all(|k| *k >= 100), "{limited:?}");
+                for cast in [answer(&lake, "SELECT k FROM t WHERE s = 105", scope).await, pushed(&lake, "SELECT k FROM t WHERE s = 105", scope).await] {
+                    assert!(cast.as_ref().is_ok_and(|b| ks(b) == [105]), "a cast of a hidden row's text is never worked out: {cast:?}");
+                }
+            }
+            assert_eq!(text(&lake, "SELECT count(*) AS n, min(k) AS lo, max(k) AS hi FROM t", &ann).await?.lines().nth(3).unwrap().split_whitespace().collect::<Vec<_>>(), ["|", "20", "|", "100", "|", "119", "|"], "counted from its rows, never the files'");
+            // (a reader granted `name` only, by a filter on `dept`: the filter reads `dept`, the reader may not)
+            let named = grant(&["name"], Some("dept = 'eng'"));
+            assert_eq!(count(&answer(&lake, "SELECT name FROM t", &named).await?), 20);
+            let dept = answer(&lake, "SELECT dept FROM t", &named).await;
+            assert!(dept.is_err_and(|e| format!("{e:#}").contains("permission denied")), "it still may not read dept");
+            // (EXPLAIN ANALYZE: the filtered scan's rows and time, nothing of the files' rows, bytes or row groups)
+            for sql in ["EXPLAIN ANALYZE SELECT k FROM t WHERE k >= 0", "EXPLAIN VERBOSE SELECT k FROM t WHERE k >= 0"] {
+                let told = text(&lake, sql, &ann).await?;
+                assert!(told.contains("GuardedExec: t, row filter of your grant"), "{sql}: {told}");
+                for hidden in ["DataSourceExec", "rows=120", "(120)", "bytes_scanned", "row_groups", "dept = 'eng'"] {
+                    assert!(!told.contains(hidden), "{sql} shows {hidden}: {told}");
+                }
+            }
+            // (a condition that can fail on a row stays above the filtered scan; one that can't goes into it too)
+            let physical = |sql: &str, scope: &Scope| {
+                let (lake, sql, scope) = (lake.clone(), sql.to_string(), scope.clone());
+                async move {
+                    let ctx = session_for(&lake, &sql, "", None, &scope).await?;
+                    let plan = crate::engine::sql(&ctx, &sql).await?.create_physical_plan().await?;
+                    let shown = datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string();
+                    anyhow::Ok(shown)
+                }
+            };
+            let above = physical("SELECT k FROM t WHERE 100 / (x - 5) >= 0", &ann).await?;
+            assert!(above.contains("FilterExec") && above.contains("GuardedExec"), "{above}");
+            // (a filter that no longer plans shows no row; one on no row's columns that is never true reads nothing)
+            assert_eq!(count(&answer(&lake, "SELECT k FROM t", &grant(&[], Some("salary > 3"))).await?), 0);
+            assert!(physical("SELECT k FROM t", &grant(&[], Some("1 = 0"))).await?.contains("EmptyExec"));
+            assert_eq!(count(&answer(&lake, "SELECT k FROM t", &grant(&[], Some("1 = 1"))).await?), 120);
+            // (a reader granted it with no filter, and the node: the files' scan, as before)
+            for scope in [grant(&[], None), crate::auth::Principal::node().scope] {
+                assert_eq!(count(&answer(&lake, "SELECT k FROM t", &scope).await?), 120);
+                let plan = physical("SELECT k FROM t WHERE 100 / (x - 5) >= 0 OR k > 3", &scope).await?;
+                assert!(!plan.contains("GuardedExec") && plan.contains("DataSourceExec"), "{plan}");
+            }
+            drop(seq);
+            lake.cat.close().await?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
+    }
+
     use super::{exhausted, frugally, keep, peak_pool, retrying, tails, task_with_peak, Facts, FactsMemo, Tail, Tails, TAILS};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
@@ -2261,7 +2461,7 @@ mod tests {
 
     /// A manifest whose path is `path` bytes long (its size is what `facts_bytes` counts).
     fn manifest(path: usize) -> crate::manifest::Manifest {
-        crate::manifest::Manifest { path: "m".repeat(path), files: 1, rows: 1, bytes: 1, stats: Default::default(), nulls: None }
+        crate::manifest::Manifest { path: "m".repeat(path), files: 1, rows: 1, bytes: 1, ..Default::default() }
     }
 
     /// The planning facts memo holds at most `FACTS_BYTES` of manifests and `FACTS_ENTRIES` versions: a big table's

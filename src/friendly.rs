@@ -57,7 +57,7 @@ pub(crate) fn passes() -> Vec<crate::passes::Pass> {
         "object_construct", "isnull", "charindex", "convert", "try_convert", "getdate", "sysdatetime", "eomonth", "datepart", "curdate", "unix_timestamp", "unix_seconds", "timestamp_seconds",
         "str_to_date", "date_format", "timestampdiff", "countif", "date", "date_trunc", "timestamp_trunc", "datetime_trunc", "timestamp_diff", "datetime_diff", "format_date", "format_timestamp",
         "format_datetime", "parse_date", "parse_timestamp", "parse_datetime", "transform", "format", "top", "int64", "float64", "number", "byteint", "within", "safe", "materialized",
-        "timestamp_ntz", "time",
+        "timestamp_ntz", "time", "vector",
     ];
     forms.extend(tables);
     vec![
@@ -131,7 +131,7 @@ fn wants_forms(sql: &str) -> bool {
     // DECLARE: `year`, `long` or `money` as a column's name sends a query through no parse)
     static TYPES: LazyLock<Regex> = LazyLock::new(|| {
         let names: Vec<&str> = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).collect();
-        let t = format!(r"(?:{}|timestamp_ntz|time\s+with\s+time\s+zone)", names.join("|"));
+        let t = format!(r"(?:{}|timestamp_ntz|time\s+with\s+time\s+zone|vector)", names.join("|")); // (and pgvector's VECTOR(n): `vector`)
         Regex::new(&format!(r"(?i)(?:\bas\s+|::\s*){t}\b|\b{t}\s*'|(?:^|;)\s*(?:--[^\n]*\n\s*)*(?:create|alter|declare)\b[^;]*\b{t}\b")).expect("a regex")
     });
     // (another database's function Pondra refuses by name: the names `dialect_fns::OURS` lists, as calls)
@@ -732,9 +732,14 @@ struct Level {
     entered: usize,
 }
 
+/// The front's tree pass (`front::Trees`): DuckDB's and Snowflake's forms (`rewrite`), last.
+pub(crate) fn tree_pass() -> crate::front::TreePass { crate::front::TreePass { name: "friendly.rewrite", order: 60, looks: &["friendly.forms", "friendly.marked", "friendly.aliases"], run: tree } }
+
+fn tree<'a>(front: &'a (dyn crate::front::Front + 'static), stmts: &'a mut [Statement], _: &'a crate::front::Facts<'_>) -> futures::future::BoxFuture<'a, Result<bool>> { Box::pin(rewrite(front, stmts)) }
+
 /// `stmts` with every friendly form in them rewritten, asking the host what they need to know;
 /// whether any was.
-pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
+pub async fn rewrite<H: crate::front::Host + ?Sized>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let before = stmts.to_vec();
     for s in stmts.iter_mut() {
         default_values(host, s).await?;
@@ -781,13 +786,13 @@ tokio::task_local! {
 /// The answer to an ask, from a query run as the caller (itself expanded: it may hold friendly
 /// SQL too). Asks inside asks stop 8 deep: a probe that asked itself again overflowed the stack
 /// and took the node down.
-async fn answer<H: crate::front::Host>(host: &H, ask: Ask) -> Result<Vec<Column>> {
+async fn answer<H: crate::front::Host + ?Sized>(host: &H, ask: Ask) -> Result<Vec<Column>> {
     let depth = ASKING.try_with(|d| *d).unwrap_or(0);
     ensure!(depth < 8, "a query that needs its own columns to know its own columns (asked 8 deep)");
     ASKING.scope(depth + 1, answered(host, ask)).await
 }
 
-async fn answered<H: crate::front::Host>(host: &H, ask: Ask) -> Result<Vec<Column>> {
+async fn answered<H: crate::front::Host + ?Sized>(host: &H, ask: Ask) -> Result<Vec<Column>> {
     let (sql, values) = match ask {
         Ask::Values(q) => (q, true),
         Ask::Columns(q) => (q, false),
@@ -1198,6 +1203,7 @@ fn spell(t: &mut DataType) -> Result<()> {
         DataType::Bit(_) => named("bit")?,
         DataType::BitVarying(_) => named("varbit")?,
         DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => named("timetz")?,
+        DataType::Custom(name, args) if name.to_string().eq_ignore_ascii_case("vector") => Some(vector(args)?),
         DataType::Custom(name, args) if args.is_empty() => named(&name.to_string())?,
         _ => None,
     };
@@ -1205,6 +1211,23 @@ fn spell(t: &mut DataType) -> Result<()> {
         *t = s;
     }
     Ok(())
+}
+
+/// pgvector's `VECTOR(n)`: `REAL[n]`, DuckDB's `FLOAT[n]`, one type (a lake at format 8 keeps its size: `answer::fixed_name`),
+/// n from 1 to 16000 as pgvector takes, refused in its words (22023); `VECTOR` alone is `REAL[]`, of any length.
+fn vector(args: &[String]) -> Result<DataType> {
+    let real = |n| DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(DataType::Real), n));
+    let refused = |m: String| Err(crate::codes::coded("22023", m));
+    match args {
+        [] => Ok(real(None)),
+        [n] => match n.trim().parse::<u64>() {
+            Ok(0) => refused("dimensions for type vector must be at least 1".into()),
+            Ok(n) if n > 16000 => refused("dimensions for type vector cannot exceed 16000".into()),
+            Ok(n) => Ok(real(Some(n))),
+            Err(_) => refused(format!("VECTOR({n}): its dimensions are a whole number, 1 to 16000")),
+        },
+        _ => refused(format!("VECTOR({}): one number, its dimensions (1 to 16000)", args.join(", "))),
+    }
 }
 
 /// A type as a routine's parameter or its RETURNS writes it (routines.rs keeps types as text), spelled as a column's
@@ -1372,7 +1395,7 @@ fn backslash_pattern(pattern: &str, esc: Option<char>) -> Result<String> {
 /// `INSERT INTO t DEFAULT VALUES` as `INSERT INTO t VALUES (DEFAULT, …)`, one DEFAULT per column, so
 /// defaults and identity columns fill the row as they do for any INSERT. Only a table the host has; a
 /// temporary table's INSERT is its own path (`temp.rs`), so it is left as it is.
-async fn default_values<H: crate::front::Host>(host: &H, s: &mut Statement) -> Result<bool> {
+async fn default_values<H: crate::front::Host + ?Sized>(host: &H, s: &mut Statement) -> Result<bool> {
     let Statement::Insert(ins) = s else { return Ok(false) };
     if ins.source.is_some() || !ins.assignments.is_empty() {
         return Ok(false);
@@ -2320,7 +2343,7 @@ fn with_aliases(s: &mut Select, cols: &[Column]) -> Result<()> {
 /// DuckDB's `SUMMARIZE t` (or `SUMMARIZE SELECT …`): a row per column (its type, least and
 /// greatest value, distinct values about, mean, standard deviation, quartiles, count and share
 /// of NULLs), from one pass over the rows.
-pub async fn summarize<H: crate::front::Host>(host: &H, sql: &str) -> Result<Option<String>> {
+pub async fn summarize<H: crate::front::Host + ?Sized>(host: &H, sql: &str) -> Result<Option<String>> {
     static SUMMARIZE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*summarize\s+(.+?)\s*;?\s*$").expect("a regex"));
     let Some(m) = SUMMARIZE.captures(sql) else { return Ok(None) };
     let what = m[1].trim();

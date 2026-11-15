@@ -246,6 +246,7 @@ pub const CORE: &[Setting] = &[
     test("PONDRA_KEEP_PARQUET", Text, No),
     node("PONDRA_KMS_COMMAND", Text, No),
     test("PONDRA_LATE_ROWS", Text, No),
+    node("PONDRA_LANGUAGE", Text, No),
     node("PONDRA_LAUNCHER", Path, No),
     node("PONDRA_LEARN", Bool, No),
     node("PONDRA_LEARN_MS", Ms, Is("100")),
@@ -329,7 +330,6 @@ pub const CORE: &[Setting] = &[
     command("PONDRA_PASSWORD", Secret, No),
     command("PONDRA_TOKEN", Secret, No),
     command("PONDRA_TRIES", Int, Is("0")),
-    starter("PONDRA_CLIENT_KEY", Secret, No),
     starter("PONDRA_NODE_KEY", Secret, No),
     starter("PONDRA_OWNER_KEY", Secret, No),
     starter("PONDRA_REACH", Secret, No),
@@ -338,6 +338,8 @@ pub const CORE: &[Setting] = &[
     test("PONDRA_CRASH", Text, No),
     test("PONDRA_DROP_BEATS", Path, No),
     test("PONDRA_NO_DIRECT", Switch, No),
+    test("PONDRA_SIM_SEED", Int, No),
+    test("PONDRA_SIM_SEEDS", Int, Is("2")),
     test("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS", Ms, No),
     test("PONDRA_TEST_FILL_PAUSE_MS", Ms, No),
     test("PONDRA_TEST_FORMAT", Int, No),
@@ -441,6 +443,19 @@ impl Values {
 
     /// A setting in GB (fractions too) as bytes of 2^30, as every memory setting is read (`env::gib`).
     pub fn gib(&self, var: &str) -> Option<usize> { self.parse::<f64>(var).map(crate::env::gb_bytes) }
+
+    /// With a setting of the node's own that its host gives it (a lakes server's address, for its database's node).
+    pub fn with(mut self, var: &'static str, value: impl Into<String>) -> Values {
+        debug_assert!(find(var).is_some_and(|s| s.scope == Scope::Node), "{var} isn't a node's setting in settings.rs");
+        self.0.insert(var, value.into());
+        self
+    }
+
+    /// Without a setting of the process's that isn't the node's (`--idle-exit`, for a node its host stops once idle).
+    pub fn without(mut self, var: &str) -> Values {
+        self.0.remove(var);
+        self
+    }
 
     /// These values, for a test's node.
     #[cfg(test)]

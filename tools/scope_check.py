@@ -7,8 +7,9 @@ passes the asker's scope to planning as an argument, so each of these places is 
 (outside `#[cfg(test)] mod`s, comments and strings), by file:
 
   reads  a read of the task's caller: `rights::scope()` or `auth::current()` outside auth.rs and rights.rs, and a call of
-         rights.rs's two that read it for theirs, `may_here(` (may the request being served…) and `rights::said` (its
-         planning error as it is told it), outside rights.rs (11-09 audit M4)
+         rights.rs's that read it for theirs, `may_here(` (may the request being served…), `rights::said` (its planning
+         error as it is told it), `may_as(`, `may_run(` and `as_role(` (its rights with a statement's role), outside
+         rights.rs (11-09 audit M4, 11-10 audit L14)
   node   a place that runs work as the node's own: `as_node(`, `spawn_node(` or `spawns::Node` (a task of the node's
          own, `spawns::Tasks`), or that plans or lists as the node's own, `Principal::node()` (a view's run, the lake's
          own definitions a column's move rewrites, a count over every row), outside auth.rs and spawns.rs, which define
@@ -33,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from layers import strip_comments  # noqa: E402
 
 KINDS = {
-    "reads": (re.compile(r"\b(?:rights::scope|auth::current|rights::said)\b|\bmay_here\("), {"auth.rs", "rights.rs"}),  # (a call, or the function passed as a value)
+    "reads": (re.compile(r"\b(?:rights::scope|auth::current|rights::said)\b|\b(?:may_here|may_as|may_run|as_role)\("), {"auth.rs", "rights.rs"}),  # (a call, or the function passed as a value)
     "node": (re.compile(r"\b(?:as_node|spawn_node)\(|\bspawns::Node\b|\bPrincipal::node\(\)"), {"auth.rs", "spawns.rs"}),
     "whole": (re.compile(r"\bScope::everything\(\)"), {"rights.rs"}),
 }

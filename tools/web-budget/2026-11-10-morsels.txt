@@ -1,0 +1,6 @@
++3_800
+
+Scan morsels and the shared-join ratio (#786: `morsels.rs`, `SharedBuilds::splits`), rules every form's planner runs
+(TPC-DS SF10 65.8 → 60.0 s on 4 cores): 1,769 B over main's 9,315,721 at 69396cd (9,317,490 with this pull request
+alone on main, measured on CI, train run 42751376734). Plus 2,031 B to bring the room above main back to 3 KB, which
+the merges since the last line had left at 0.98 KB.

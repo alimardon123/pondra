@@ -120,6 +120,7 @@ CREATE DATABASE unit CLONE prod WITH NO DATA;              -- definitions only, 
 ALTER DATABASE ali_orders REFRESH raw.orders;              -- that table and what follows it, as prod has them now
 DROP DATABASE ali_orders;                                  -- only what the branch wrote goes
 SELECT * FROM pondra.databases;                            -- base, branched at, bytes written, bytes held (SHOW DATABASES reads it)
+SELECT * FROM ali_orders.gold.revenue;                    -- the branch's view, as it reads there
 SELECT * FROM pondra.diff('prod.gold.revenue', 'ali_orders.gold.revenue');   -- rows added, removed, changed
 ```
 
@@ -143,8 +144,27 @@ SELECT * FROM pondra.diff('prod.gold.revenue', 'ali_orders.gold.revenue');   -- 
 - **A clone shows nobody more than they could read.** It copies only tables its maker may read whole
   (a table they see only some columns or rows of is left out, and named), keeps the base's grants, and
   makes its maker its owner. Copying is `CLONE`, a new privilege on a database.
+- **A database's views read where they are.** From prod, `ali_orders.gold.revenue` reads as the view does in
+  ali_orders, over its rows: the tables it names are ali_orders', and the views of ali_orders it reads are read so
+  too (F1).
 - **Comparing is cheap.** Rows a branch shares with its base have the same `_row_id` and `_version`
-  (ADR-020), so `pondra.diff` reads only the rows either side changed since the branch was made.
+  (ADR-020), so `pondra.diff` reads only the rows either side changed since the branch was made. An
+  update's two rows name the columns whose values differ (`_changed VARCHAR[]`, NULL on an insert or a
+  delete). Either side may also be a view's name or a query, `pondra.diff('prod.gold.revenue',
+  (SELECT … FROM ali_orders.raw.orders …))`: such sides match whole, as multisets (a row one side holds
+  more copies of is an insert or a delete for each copy more). Sides with a key match by it, and then
+  have update rows too: `key => 'id'` names it, or a side declares it (a table's PRIMARY KEY, a view's
+  PRIMARY KEY … NOT ENFORCED). Keys match NULL to NULL; a side holding one key on two rows is refused
+  (21000, naming it), and two sides declaring different keys too (42P10: `key =>` picks). The two sides
+  must have the same columns (42804 names the first that differs); the answer has the second's, in its
+  order (Trellis T1). `data => 'db'` runs both sides' definitions over `db`'s tables, in one statement, so
+  only the code moves rows: `pondra.diff('prod.gold.revenue', 'ali_orders.gold.revenue', data => 'prod')`
+  is what ali's change to the view does over prod's rows. A definition's own tables are read from `db`'s,
+  and the views it reads are inlined and read the same way; two tables are refused (0A000: a table has no
+  definition to run). `pondra.diff_steps(a, b [, data => 'db'])` says which step moved them: one row for
+  each `WITH` step of either side, matched by name, and one for the query itself, `(final)`, with each
+  side's count of the step's rows and a mark: `same`, `changed`, `new`, `removed`, or `reads changed` (its
+  text is the same, and it reads a step that isn't) (T2).
 
 ### 4. Plan and deploy: the project made true in a database
 

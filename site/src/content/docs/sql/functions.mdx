@@ -55,12 +55,13 @@ pondra  spark  f   s
 2.0     2      -3  SQL
 ```
 
-To make the plain names Spark's for a whole session, set the dialect. `SET datafusion.sql_parser.dialect = 'spark'`
-(or `'databricks'`) changes `floor`, `substring` and `EXTRACT` in that session. Here the day of the
-week counts Sunday as 1, not 0:
+To make the plain names Spark's for a whole session, make Spark SQL its language. `SET language = 'spark'`
+(or `SET datafusion.sql_parser.dialect = 'spark'`, as a Spark client may send it) makes `floor`, `substring`,
+`EXTRACT` and `/` Spark's in that session: its statements are read as `spark_sql('…')` reads its query. Here the day
+of the week counts Sunday as 1, not 0:
 
 ```sql
-SET datafusion.sql_parser.dialect = 'spark';
+SET language = 'spark';
 SELECT floor(2.5) AS f, substring('Spark SQL', -3) AS tail, extract(dow FROM DATE '2020-01-05') AS sunday;
 ```
 

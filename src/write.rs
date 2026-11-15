@@ -125,8 +125,10 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
     let (retention, columns, ttl) = async {
         let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
-        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`).
-        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::type_name(&crate::answer::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
+        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`), and a fixed-size
+        // list keeps its size only where the lake does (format 8: `answer::fixed_name`).
+        let fixed = crate::format::fixed(lake).await?;
+        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::fixed_name(&crate::answer::dtype(t)?, fixed)))).collect::<Result<Vec<_>>>()?;
         let ttl = ttl.map(|t| -> Result<(String, u64)> {
             let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
             ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "TTL: a timestamp or date column of a keyed table");
@@ -502,6 +504,9 @@ pub fn unless(if_not_exists: bool, name: &str, kind: &str, d: crate::ddl::Ddl) -
     }
 }
 
+/// What Postgres's policies (`CREATE POLICY`, `ALTER TABLE … ROW LEVEL SECURITY`) are told: a filter on rows is a grant's.
+const ON_THE_GRANT: &str = "a filter on rows is kept on the grant here: GRANT SELECT ON t TO r WHERE …";
+
 /// A write statement, or None for a query.
 pub fn parse(sql: &str) -> Option<Stmt> {
     use datafusion::sql::sqlparser::parser::Parser;
@@ -678,6 +683,13 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             });
             Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
+        // (Postgres's filters on rows, its policies, are kept on the grant here: `GRANT … WHERE`, step 6 piece 5. A table no
+        // grant filters is read whole by whoever may read it, so there is no switch to turn on)
+        Statement::CreatePolicy(_) | Statement::AlterPolicy(_) | Statement::DropPolicy(_) => Stmt::Refused("0A000", ON_THE_GRANT.into()),
+        Statement::AlterTable(a) if a.operations.iter().any(|o| {
+            use ast::AlterTableOperation as O;
+            matches!(o, O::EnableRowLevelSecurity | O::DisableRowLevelSecurity | O::ForceRowLevelSecurity | O::NoForceRowLevelSecurity)
+        }) => Stmt::Refused("0A000", ON_THE_GRANT.into()),
         Statement::AlterTable(a) => match &a.operations[..] {
             [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::rules::alter::fills_existing(c) => Stmt::Invalid(crate::rules::alter::owes_rows(&a.name.to_string(), &c.name.to_string())),
             [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, column_position, .. }] => match crate::rules::alter::beside_type(c) {
@@ -872,7 +884,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
         }
         (None, None) => declared().await?,
     };
-    let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+    let fixed = crate::format::fixed(from).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
+    let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::fixed_name(f.data_type(), fixed))).collect();
     // (what the statement declares, read from its AST alone: `rules/create.rs`, refused in the order a node always has)
     let d = crate::rules::create::declared(c)?;
     if d.keyed() && !columns.iter().any(|(c, _)| c == "_deleted") {
@@ -971,10 +984,11 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
                 Ok(t) => crate::rules::create::sql_type(t)?,
                 Err(_) => None,
             };
+            let fixed = crate::format::fixed(lake).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.to_columns();
-            columns.push((column.to_string(), crate::answer::type_name(ctx.table("t").await?.schema().field(0).data_type())));
+            columns.push((column.to_string(), crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed)));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
                 spec["enums"] = j!({column: e});
@@ -1230,13 +1244,24 @@ async fn shaped(home: &Lake, t: &Arc<crate::rules::Table>, name: &str, all: Opti
 /// of `lake` as of `upto` (`files`: this machine's files too). `home` is the table's own lake: the one a DEFAULT's `nextval`
 /// takes its values from.
 #[allow(clippy::too_many_arguments)]
+///
+/// A writer a grant's filter on the table's rows for INSERT holds writes rows it holds only: each shaped row must meet it, or
+/// the INSERT is refused, 42501 (`row_filter::holds`, step 6 piece 5c-2: Postgres's WITH CHECK). An upsert's proposed rows
+/// are checked so, whether or not they are inserted, as Postgres checks them. A table of another lake keeps that lake's
+/// rules (`on_node_listed` refuses a filter here on one).
 pub async fn rows_of(lake: &Lake, home: &Lake, t: &Arc<crate::rules::Table>, name: &str, sql: &str, upto: Option<u64>, files: bool, how: crate::rules::How, scope: &crate::rights::Scope) -> Result<crate::rules::Shaped> {
-    if let Some(all) = crate::literals::literal_rows(sql, &t.schema) {
-        return shaped(home, t, name, Some(all), how).await;
+    let rows = match crate::literals::literal_rows(sql, &t.schema) {
+        Some(all) => shaped(home, t, name, Some(all), how).await?,
+        None => {
+            let ctx = crate::query::session_for(lake, sql, "", upto, scope).await?;
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
+            shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await?
+        }
+    };
+    if let Some(f) = scope.rows(&crate::rights::Privilege::Insert, name).filter(|_| std::ptr::eq(lake, home)) {
+        crate::row_filter::holds(&lake.session_with(1), name, std::slice::from_ref(rows.rows()), &f, "INSERT").await?;
     }
-    let ctx = crate::query::session_for(lake, sql, "", upto, scope).await?;
-    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
-    shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await
+    Ok(rows)
 }
 
 /// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
@@ -1392,7 +1417,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         None => Ok(rows),
     });
     // (files of up to 4M rows, as a merge writes them: `maintain` leaves them alone)
-    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], true, partition.as_deref()));
+    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], partition.as_deref()));
     Ok((columns, futures::future::try_join_all(writes).await?.concat()))
 }
 
@@ -1562,6 +1587,17 @@ where
         undo_made(run, name, job).await;
     }
     out
+}
+
+/// What a statement that isn't an INSERT asks of another engine's table (`table_formats::Ability`).
+fn asks(stmt: &Stmt) -> crate::table_formats::Ability {
+    use crate::table_formats::Ability;
+    match stmt {
+        Stmt::Update(..) => Ability::Update,
+        Stmt::Delete(..) => Ability::Delete,
+        Stmt::Merge(..) => Ability::Merge,
+        _ => Ability::Insert,
+    }
 }
 
 /// Drops the table a statement made under `name` after it failed or stopped: purged, as `made_drop` says (never another
@@ -1833,14 +1869,18 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let (names, query) = match &stmt {
             Stmt::Insert(_, query) => (None, query),
             Stmt::InsertInto(_, names, query) => (Some(names.clone()), query),
-            _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
+            _ => return Err(crate::table_formats::may(&stmt.table(), &crate::ext_names::spec(&target).map(|s| s.format).unwrap_or_default(), asks(&stmt)).err().unwrap_or_else(|| anyhow::anyhow!("{}: another engine's table", stmt.table()))),
         };
         return crate::write_outside::insert(lake, &target, &stmt.table(), names, query, &job, &by.scope).await;
     }
     // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
     // "no table" with a quoted path)
     if let Some(spec) = crate::ext_names::spec(&stmt.table()) {
-        bail!("{}: files or another engine's table; Pondra INSERTs into a Delta or Iceberg table (UPDATE, DELETE and MERGE: not yet)", spec.urls.join(", "));
+        let named = spec.urls.join(", ");
+        return Err(match crate::table_formats::named(&spec.format) {
+            Some(f) => crate::table_formats::refused(&named, f, asks(&stmt)),
+            None => anyhow::anyhow!("{named}: files; {} changes a table (another engine's, {}, as its format says), and files are written anew with COPY … TO", asks(&stmt).said(), crate::table_formats::names()),
+        });
     }
     // UPDATE and DELETE of an append table, and MERGE: the leader's (of the table's lake), from
     // one snapshot (`change.rs`). Another leader is sent what it can't read (ADR-028).
@@ -1866,6 +1906,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     // A table of an attached lake: the work runs here, that lake's leader records it.
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
+        if crate::rights::asks(&stmt).1.iter().filter_map(|a| a.privilege()).any(|p| by.scope.rows_named(&p, &crate::auth::catalog_name(&stmt.table())).is_some()) {
+            return Err(crate::codes::coded("0A000", format!("{} is another database's: its rows are written there, so a filter on them in a grant here isn't checked: write them with a grant there", stmt.table())));
+        }
         crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt, &by.scope).await?; // (that lake's own sign-in)
         let req = prepare(lake, &other, &table, &stmt, &job, files, &by.scope).await?;
         let mark = req.as_ref().and_then(|r| request_mark(r, &job));
@@ -1895,6 +1938,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     let stored = lake.cat.meta(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
     let meta = stored.as_ref().map(|m| m.logical_ref()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
+    if let (Some(m), Stmt::Insert(..)) = (&meta, &stmt) {
+        crate::txn::merges_unseen(&table, m, &by.scope)?;
+    }
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one
@@ -1906,8 +1952,11 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job, &by.scope))).await;
     }
+    // (an INSERT a filter on the rows its writer may insert holds: its rows are worked out here, so each is checked, `rows_of`:
+    // never written as files, kept as a file's row groups, or spread over the nodes unread)
+    let held = matches!(stmt, Stmt::Insert(..)) && by.scope.rows(&crate::rights::Privilege::Insert, &table).is_some();
     let sql = match (&meta, &stmt) {
-        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => {
+        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() || held => {
             // A resend whose job's mark is still kept is answered as the duplicate it is, before its statement runs again (the
             // leader's log would answer the same, once the rows were worked out: `Ack::duplicate`).
             if named && matches!(stmt, Stmt::Insert(..)) && sent(lake, &job).await? {
@@ -2465,7 +2514,7 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool, 
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(node, &t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
-                    Some(Err(e)) if !crate::dial::unreached(&e) => return Err(e),
+                    Some(Err(e)) if !crate::dial::unreached(node, &e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
                 if let Some(v) = crate::inbox::send(&store, r, None, Some(&t), Some(&node.claims)).await? {
@@ -2603,7 +2652,7 @@ async fn across(dir: &str, r: &crate::reaches::Reach, req: Option<Request>, node
         None => {
             let store = open_store(dir, Some(&node.reaches))?.1; // (with its read-only key: `r`, the node's for it)
             match latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(&t.addr),
+                Some(t) if !t.addr.is_empty() && alive(&store, &t, Some(&node.claims)).await => crate::dial::url(node, &t.addr),
                 _ => bail!("nobody leads {dir}"),
             }
         }
@@ -2813,6 +2862,33 @@ mod section {
         ] {
             assert_eq!(shown(&super::parse(sql)), format!("invalid {said}"), "{sql}");
         }
+    }
+
+    /// The repository's statements of the families the statements section reads by their words (SECRET, FUNCTION, MACRO,
+    /// TASK, COPY, ATTACH, EXTERNAL TABLE, and their DROP, ALTER and EXECUTE), each one text, as they read when the corpus
+    /// was kept: what each says, its refusal's form or SQLSTATE (11-10 audit L9: #761's differential test, kept as a
+    /// fixture). `PONDRA_KEEP_CORPUS=1` keeps it again from the repository's texts, after a change meant to move them.
+    #[test]
+    fn every_text_of_the_corpus_reads_as_kept() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/statements/corpus.json");
+        if std::env::var_os("PONDRA_KEEP_CORPUS").is_some() {
+            let placeholder = regex::Regex::new(r"\{[\w:?#]*\}").expect("a regex"); // (a format string's `{}`: no SQL)
+            let family = regex::Regex::new(r"(?is)^\s*(?:(?:create|drop|alter|execute|show)\b[^;]{0,60}?\b(?:secret|function|macro|task|external\s+table)\b|copy\b|attach\b|detach\b)").expect("a regex");
+            let kept: std::collections::BTreeMap<String, String> = crate::passes::tests::texts("|backup|restore|export|import|undrop")
+                .into_iter()
+                .filter(|t| !placeholder.is_match(t) && family.is_match(t) && crate::routines::split(t).len() == 1)
+                .map(|t| {
+                    let said = shown(&super::parse(&t));
+                    (t, said)
+                })
+                .collect();
+            std::fs::create_dir_all(path.parent().expect("a folder")).expect("the folder");
+            std::fs::write(&path, serde_json::to_string_pretty(&kept).expect("JSON") + "\n").expect("the corpus written");
+        }
+        let kept: std::collections::BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(&path).expect("the corpus")).expect("its JSON");
+        let differ: Vec<_> = kept.iter().filter_map(|(sql, was)| Some((sql, was, shown(&super::parse(sql)))).filter(|(_, was, now)| was != &now)).collect();
+        assert!(differ.is_empty(), "{} of {} texts read otherwise than kept (text, kept, now): {differ:#?}", differ.len(), kept.len());
+        assert!(kept.len() > 100, "the corpus holds {} texts", kept.len());
     }
 }
 

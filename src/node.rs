@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use crate::members::Members;
 
 #[cfg(feature = "doors")] mod run;
+#[cfg(feature = "doors")] pub(crate) mod kept;
 #[cfg(feature = "doors")] pub use run::{Node, Options};
+#[cfg(feature = "doors")] pub use kept::State;
 #[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
 pub use crate::lifecycle::{Guest, Restarting};
@@ -64,11 +66,16 @@ fn stop(why: String, host: Option<&Host>) {
 /// A node's host: what it is told when the node's own work fails or must start again (`Event`), and where the node's
 /// lake moves go (`memory::set_location`). A library's supervisor and `pondra serve` each make one (`Host::new`) and give
 /// it to every node they start (`Options::host`): it outlives each node, as the host does. A node with none (a guest, a
-/// command's own, a test's) stops its process on a failure, and can't move its lake.
+/// command's own, a test's) stops its process on a failure, and can't move its lake. A folder of lakes' server keeps
+/// each of its databases' nodes in its own process (`Host::beside`).
 #[derive(Clone)]
 pub struct Host {
     events: mpsc::UnboundedSender<Event>,
     moves: mpsc::UnboundedSender<crate::lifecycle::Move>,
+    /// Does the host keep the node in its process beside others, and reach it there (each database of `pondra serve
+    /// <folder>`, `dbserver.rs`)? Then the node binds no port of its own (`Options::database`), a restart is in place, as a
+    /// library's is, and the process isn't the node's: the host and its other nodes go on.
+    beside: bool,
 }
 
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a library's and `pondra serve`'s, the doors half's)
@@ -84,8 +91,21 @@ impl Host {
     pub fn new() -> (Host, Told) {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (moves, moves_rx) = mpsc::unbounded_channel();
-        (Host { events, moves }, Told { events: events_rx, moves: moves_rx })
+        (Host { events, moves, beside: false }, Told { events: events_rx, moves: moves_rx })
     }
+
+    /// A host that keeps its node in its process beside others (`beside`), and its end of what the node tells it. Its
+    /// node's lake can't move: a database is its folder's (its end of the moves is let go of at once).
+    #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a lakes server's: the doors half's)
+    pub(crate) fn beside() -> (Host, Told) {
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (moves, _) = mpsc::unbounded_channel();
+        let (_, moves_rx) = mpsc::unbounded_channel();
+        (Host { events, moves, beside: true }, Told { events: events_rx, moves: moves_rx })
+    }
+
+    /// Does it keep its node in its process beside others (`Host::beside`)?
+    pub(crate) fn keeps_beside(&self) -> bool { self.beside }
 
     /// Tells the host `e` (a library's close, which is the host's own).
     #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's close sends it)
@@ -121,12 +141,12 @@ pub struct Native {
 
 /// A node's state as the code below the hosts sees it, with this host's lifecycle: a guest's when `guest`.
 /// It has no host: a failure ends the process (in a library's, it is only said), and its lake can't move.
-pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(guest, crate::settings::Values::now(), None) }
+pub fn native(guest: bool) -> Arc<crate::node_state::NodeState> { native_with(guest, crate::settings::Values::now(), None, &Default::default()) }
 
 /// `native`, the node starting with `settings` (`Options::settings`) under `host` (`Options::host`).
-pub(crate) fn native_with(guest: bool, settings: crate::settings::Values, host: Option<Host>) -> Arc<crate::node_state::NodeState> {
+pub(crate) fn native_with(guest: bool, settings: crate::settings::Values, host: Option<Host>, given: &crate::node_state::Given) -> Arc<crate::node_state::NodeState> {
     let claims = Arc::<crate::node_state::Claims>::default();
-    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone() }), settings, claims)
+    crate::node_state::NodeState::claiming(Arc::new(Native { guest, settings: settings.clone(), host, claims: claims.clone() }), settings, claims, given)
 }
 
 impl crate::lifecycle::Lifecycle for Native {
@@ -139,7 +159,7 @@ impl crate::lifecycle::Lifecycle for Native {
         }
     }
     fn one_off(&self) -> bool { self.guest }
-    fn owns_process(&self) -> bool { !hosted() }
+    fn owns_process(&self) -> bool { !hosted() && !self.host.as_ref().is_some_and(Host::keeps_beside) }
     fn program(&self) -> anyhow::Result<PathBuf> { exe() }
     fn lead_elsewhere<'a>(&'a self, dir: &'a str, reaches: &'a crate::reaches::Reaches) -> futures::future::BoxFuture<'a, anyhow::Result<()>> { Box::pin(lead_once(dir, &self.settings, reaches)) }
     fn movable(&self) -> bool { self.host.as_ref().is_some_and(Host::movable) }
@@ -215,9 +235,9 @@ fn restart_with(guest: bool, claims: &crate::node_state::Claims, why: &str, carr
             held.values().for_each(|(_, f)| crate::terms::say(f, &format!("restarting {}", crate::log::now_ms())));
         }
     }
-    if hosted() {
+    if hosted() || host.is_some_and(Host::keeps_beside) {
         if let Some(h) = host {
-            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
+            h.tell(Event::Restart(why.to_string())); // (in place: a library's host keeps its process, a lakes server its other databases)
         }
         std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
     }
@@ -727,17 +747,18 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lif
                 joined.set_slug(slug);
             }
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
-            let (http, auth) = (app.lake.node.net.client(crate::net::Policy::ENDPOINT), auth.to_string()); // (the join's sign-in alone: no token of ours)
+            let (from, auth) = (app.lake.node.clone(), auth.to_string()); // (the join's sign-in alone, no token of ours: `dial::Joined`)
             let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
             let (said, refreshed) = (ended.clone(), ended.clone());
-            let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
-                let (http, url, auth, said) = (http.clone(), format!("{node}/cluster/log"), auth.clone(), said.clone());
+            let open = move || -> futures::future::BoxFuture<'static, Result<crate::dial::Reply, crate::members::Open>> {
+                let (from, node, auth, said) = (from.clone(), node.clone(), auth.clone(), said.clone());
                 Box::pin(async move {
-                    match crate::fetch::send(http.get(url).header(reqwest::header::AUTHORIZATION, auth)).await {
-                        Ok(r) if r.status().is_success() => Ok(r),
+                    let page = crate::dial::Joined { node: &node, auth: &auth };
+                    match crate::dial::Dial::call(&page, &from, &node, crate::dial::Call::get("/cluster/log")).await {
+                        Ok(r) if r.ok() => Ok(r),
                         // (the sign-in ended: the stream is not followed again)
-                        Ok(r) if matches!(r.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
-                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status());
+                        Ok(r) if matches!(r.status, 401 | 403) => {
+                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status);
                             said.store(true, SeqCst);
                             Err(crate::members::Open::Stop)
                         }
@@ -980,6 +1001,158 @@ mod tests {
             assert_eq!(a.folder.as_deref(), Some("a__2"), "the renamed table keeps folder a: the new one takes the next");
             assert_eq!(free_folder(&lake, "a").await.unwrap().as_deref(), Some("a__3"), "a, kept for the dropped a2, and a__2 are used");
             assert_eq!(free_folder(&lake, "d").await.unwrap(), None);
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A table's files are planned from their catalog entries (step 5 piece 14b): no footer is read to plan a query over
+    /// them, and an aggregate their exact ranges answer reads no file at all. Here the files are gone from the store
+    /// after tiering: a plan of a filter still comes, and `min` and `max` of an integer column still answer. (A file
+    /// written before its entry kept its text columns' sizes is planned from its footer, as before.)
+    #[tokio::test]
+    async fn a_tables_files_are_planned_without_reading_a_footer() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            for sql in ["CREATE TABLE f (id BIGINT, v DOUBLE, s TEXT)", "INSERT INTO f SELECT value, value * 0.5, 's' || value FROM range(1, 1001)"] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            }
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("f")).await.unwrap().unwrap();
+            assert!(!meta.files.is_empty() && meta.files.iter().all(|f| f.sizes.get("s").is_some_and(|b| *b > 0)), "each file keeps its text's size");
+            for f in &meta.files {
+                lake.delete(&f.path).await;
+            }
+            let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
+            q("EXPLAIN SELECT id FROM f WHERE id > 500").await.expect("planned from the entries, no footer read");
+            let b = q("SELECT min(id), max(id) FROM f").await.expect("answered from the entries' exact ranges");
+            assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (1, 1000));
+            assert!(q("SELECT max(v) FROM f").await.is_err(), "a float's range leaves NaN out: its files are read");
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A table's JSON column is marked as one where queries plan over it (`TableMeta::read_schema`, step 5 piece 14c,
+    /// E1): from its rows in memory and from its files, and through a view. Every write that
+    /// reads the table back (an UPDATE, a DELETE, an INSERT … SELECT from itself, a CREATE TABLE AS, a tiering round, a
+    /// union with text) takes the marked columns as before. (Here, with the node: an UPDATE needs the leader's sequencer.)
+    #[tokio::test]
+    async fn a_tables_json_column_is_marked_where_queries_plan_over_it() {
+        use datafusion::arrow::array::{Array, AsArray};
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            let run = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let stmt = crate::write::parse(sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                }
+            };
+            // (each answer's columns, first row, as text, and its rows: `arrow_metadata` reads a field's mark as planned)
+            let first = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let b = app.query(sql, Some("0"), &node.scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    let b = datafusion::arrow::compute::concat_batches(&b[0].schema(), &b).unwrap();
+                    let text = |c: &dyn Array| datafusion::arrow::compute::cast(c, &datafusion::arrow::datatypes::DataType::Utf8).unwrap();
+                    let row = b.columns().iter().map(|c| text(c.as_ref())).map(|c| c.as_string::<i32>().is_valid(0).then(|| c.as_string::<i32>().value(0).to_string())).collect::<Vec<_>>();
+                    (row, b.num_rows())
+                }
+            };
+            let s = |v: &str| Some(v.to_string());
+            let marked = "SELECT arrow_metadata(doc, 'pg_type'), arrow_metadata(js, 'pg_type'), arrow_metadata(t, 'pg_type') FROM j WHERE id = 1";
+            run("CREATE TABLE j (id BIGINT, doc JSONB, js JSON, t TEXT)").await;
+            run(r#"INSERT INTO j VALUES (1, '{"a": 1}', '{"b": 2}', 'x'), (2, '{"a": 2}', '[3]', 'y')"#).await;
+            let want = (vec![s("jsonb"), s("json"), None], 1);
+            assert_eq!(first(marked).await, want, "its rows in memory");
+            app.tier_all(0).await.unwrap();
+            assert_eq!(first(marked).await, want, "its rows in a file");
+            run(r#"UPDATE j SET doc = '{"a": 3}' WHERE id = 2"#).await;
+            run("DELETE FROM j WHERE id = 1").await;
+            run("INSERT INTO j SELECT id + 10, doc, js, t FROM j").await;
+            run("CREATE TABLE c AS SELECT * FROM j").await;
+            run("CREATE VIEW v AS SELECT id, doc FROM j").await;
+            app.tier_all(0).await.unwrap();
+            assert_eq!(first("SELECT doc FROM j ORDER BY id").await, (vec![s(r#"{"a": 3}"#)], 2));
+            assert_eq!(first("SELECT count(*) FROM c").await.0, vec![s("2")]);
+            assert_eq!(first("SELECT arrow_metadata(doc, 'pg_type') FROM v").await, (vec![s("jsonb")], 2), "through a view");
+            run("CREATE TABLE k (u UUID)").await;
+            run("INSERT INTO k VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')").await;
+            assert_eq!(first("SELECT arrow_metadata(u, 'pg_type') FROM k").await, (vec![s("uuid")], 1), "a uuid column, marked by its entry too");
+            assert_eq!(first("SELECT doc FROM j UNION ALL SELECT t FROM j").await.1, 4);
+            marks.abort();
+            crate::memory_lake::forget_memory(&lake.url);
+        })
+        .await
+    }
+
+    /// A keyed table's files keep their columns' ranges (step 5 piece 11a), and its reads skip a file they rule out,
+    /// unopened, for a filter on any column: each part of the merge on read is filtered alone (`query::upsert_view`). The
+    /// answers stay whole: an update's newest version, in a file a filter on another column skips, still shadows the old
+    /// one that filter finds. The lake moves to format 8 before the last round, so its files keep their ranges in both forms,
+    /// text and typed (`bounds::Ranged`), as a lake upgraded keeps them until its files are rewritten. (Here, with the node:
+    /// an UPDATE needs the leader's sequencer, and files its tiering.)
+    #[tokio::test]
+    async fn a_keyed_tables_reads_skip_the_files_their_ranges_rule_out() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let lake = app.lake.clone();
+            let node = crate::auth::Principal::node();
+            let run = |sql: String| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let stmt = crate::write::parse(&sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                }
+            };
+            run("CREATE TABLE k (id BIGINT, v BIGINT, PRIMARY KEY (id))".into()).await;
+            for (lo, hi) in [(1, 1000), (1001, 2000)] {
+                run(format!("INSERT INTO k SELECT value, value FROM range({lo}, {})", hi + 1)).await; // (v = id)
+                app.tier_all(0).await.unwrap();
+            }
+            crate::format::alone(&lake).await.unwrap(); // (format 8 from here: the update's file keeps its ranges typed)
+            run("UPDATE k SET v = -5 WHERE id = 5".into()).await;
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("k")).await.unwrap().unwrap();
+            assert_eq!(meta.files.len(), 3, "a file a round: {:?}", meta.files.iter().map(|f| (f.ord, &f.stats, &f.bounds)).collect::<Vec<_>>());
+            let ranges = |f: &crate::store::DataFile| (crate::bounds::Ranged::longs(f, "id"), crate::bounds::Ranged::longs(f, "v"));
+            let newest = meta.files.iter().max_by_key(|f| f.ord).unwrap();
+            assert_eq!(ranges(newest), (Some((5, 5)), Some((-5, -5))));
+            assert!(newest.stats.is_empty() && !newest.bounds.is_empty(), "written at format 8: its ranges typed");
+            assert!(meta.files.iter().filter(|f| f.ord != newest.ord).all(|f| f.bounds.is_empty() && !f.stats.is_empty()), "written before: as text");
+            assert!(meta.files.iter().all(|f| f.sketch.is_empty()), "a keyed file's sketches would count a key's old versions");
+            let count = |sql: &'static str| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let skipped = || app.lake.node.metrics.files_skipped.load(std::sync::atomic::Ordering::Relaxed);
+                    let before = skipped();
+                    let b = app.query(sql, Some("0"), &node.scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    (b[0].column(0).as_primitive::<Int64Type>().value(0), skipped() - before)
+                }
+            };
+            for (sql, rows, skips) in [
+                ("SELECT count(*) FROM k WHERE id = 1500", 1, true),     // (the two files of ids 1-1000 and of 5 unopened)
+                ("SELECT count(*) FROM k WHERE v = 5", 0, true),         // (id 5's old version, shadowed by a file it skips)
+                ("SELECT count(*) FROM k WHERE v = -5", 1, true),
+                ("SELECT count(*) FROM k WHERE v BETWEEN 1 AND 1000", 999, true),
+                ("SELECT count(*) FROM k", 2000, false),
+            ] {
+                let (n, skipped) = count(sql).await;
+                assert_eq!(n, rows, "{sql}");
+                assert_eq!(skipped > 0, skips, "{sql}: {skipped} files skipped");
+            }
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })

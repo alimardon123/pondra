@@ -322,16 +322,16 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     // The files that can hold an old row: by their `_row_id` and `_version` ranges.
     let mut dead = dead(lake, &gone, after, upto).await?;
     dead.sort_unstable();
-    let holds = |s: &crate::manifest::Stats| crate::sys::holds(&dead, s);
+    let holds = |r: &dyn crate::bounds::Ranged| crate::sys::holds(&dead, r);
     let (list, mut sealed, mut hit) = (crate::manifest::list(lake, &meta).await?, vec![], vec![]);
-    for (i, m) in list.iter().enumerate().filter(|(_, m)| holds(&m.stats)) {
-        let files: Vec<DataFile> = crate::manifest::files(lake, m).await?.into_iter().filter(|f| holds(&f.stats)).collect();
+    for (i, m) in list.iter().enumerate().filter(|(_, m)| holds(*m)) {
+        let files: Vec<DataFile> = crate::manifest::files(lake, m).await?.into_iter().filter(|f| holds(f)).collect();
         if !files.is_empty() {
             sealed.push(i);
             hit.extend(files);
         }
     }
-    hit.extend(meta.files.iter().filter(|f| holds(&f.stats)).cloned());
+    hit.extend(meta.files.iter().filter(|f| holds(*f)).cloned());
     if !hit.is_empty() {
         crate::manifest::unseal(lake, table, &mut meta, list, &sealed).await?; // (a sealed file's record changes: it comes back inline)
         // A job per partition (a delete file holds one, as Iceberg asks), of bounded size.
@@ -365,17 +365,18 @@ fn settle(meta: &mut TableMeta, dmeta: &mut TableMeta, now: u64, retain_ms: u64)
     let Some(i) = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms) else { return false };
     let settled = meta.purges[i].0 as i64;
     let kept = now.saturating_sub(meta.retention_secs.map_or(crate::ddl::KEEP_MS, |s| s * 1000)) as i64 * 1000;
-    let version = |s: &crate::manifest::Stats| s.get(crate::text::VERSION).and_then(|(_, hi)| hi.parse::<i64>().ok());
-    let newest = |s: &crate::manifest::Stats| match datafusion::common::ScalarValue::try_from_string(s.get(crate::text::UPDATED)?.1.clone(), &crate::sys::time()) {
-        Ok(datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us),
+    use crate::bounds::Ranged;
+    let version = |f: &DataFile| f.longs(crate::text::VERSION).map(|(_, hi)| hi);
+    let newest = |f: &DataFile| match f.end(crate::text::UPDATED, &crate::sys::time(), true) {
+        Some(datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us),
         _ => None,
     };
-    let done: Vec<DataFile> = dmeta.files.iter().filter(|f| version(&f.stats).is_some_and(|hi| hi <= settled) && newest(&f.stats).is_some_and(|us| us < kept)).cloned().collect();
+    let done: Vec<DataFile> = dmeta.files.iter().filter(|f| version(f).is_some_and(|hi| hi <= settled) && newest(f).is_some_and(|us| us < kept)).cloned().collect();
     if i == 0 && done.is_empty() {
         return false;
     }
     meta.purges.drain(..i);
-    if let (Some(v), Some(us)) = (done.iter().filter_map(|f| version(&f.stats)).max(), done.iter().filter_map(|f| newest(&f.stats)).max()) {
+    if let (Some(v), Some(us)) = (done.iter().filter_map(version).max(), done.iter().filter_map(newest).max()) {
         meta.past_from = Some(meta.past_from.unwrap_or_default().max((v as u64, us as u64 / 1000)));
     }
     replace(dmeta, &done, vec![]);
@@ -578,17 +579,22 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
     let meta = crate::sys::with_sys(&meta); // (files carry every row's system columns)
     // A job holds its rows and the Parquet file it is writing, so what a node runs at once is
     // bounded by the data behind them, not by their number: small merges go side by side, big
-    // ones take turns (however many the leader deals out — it waits for them all anyway).
+    // ones take turns (however many the leader deals out — it waits for them all anyway). Twice:
+    // a quarter of the node's memory for queries (its own PONDRA_MEMORY_GB where it has one), and
+    // of the process's, which every node in it shares (a folder's databases: 11-10 audit L2).
+    // Taken in that order by every job, so no two wait on each other.
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    let budget = (crate::store::memory_limit() / 4 >> 20).max(256);
-    let slots = SLOTS.get_or_init(|| tokio::sync::Semaphore::new(budget));
+    let quarter = |memory: usize| (memory / 4 >> 20).max(256);
+    let (node, process) = (quarter(crate::store::node_memory(&lake.node)), quarter(crate::store::memory_limit()));
+    let slots = [(lake.node.jobs.get_or_init(|| tokio::sync::Semaphore::new(node)), node), (SLOTS.get_or_init(|| tokio::sync::Semaphore::new(process)), process)];
     let mb = |files: &[DataFile]| (files.iter().map(|f| f.bytes).sum::<u64>() >> 20) as usize;
     let takes = match &kind {
         Kind::Merge { files } | Kind::Squash { files } | Kind::Positions { files, .. } => mb(files),
         Kind::Compact { .. } => mb(&meta.files),
         Kind::Fold { .. } => 32,
     };
-    let _slot = slots.acquire_many(takes.clamp(1, budget) as u32).await?;
+    let _node = slots[0].0.acquire_many(takes.clamp(1, slots[0].1) as u32).await?;
+    let _process = slots[1].0.acquire_many(takes.clamp(1, slots[1].1) as u32).await?;
     // (Clustered append tables get what keyed tables get for their key: small row groups, bloom filters.)
     // A keyed table's first file has nothing older to shadow: it drops delete markers (and expired
     // rows, and a view's emptied groups) like a full compaction, and is as complete as one. Only
@@ -672,7 +678,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
                 }
             };
             let (ord, part) = (files.iter().map(|f| f.ord).max().unwrap_or(0), files[0].part.clone());
-            let mut merged = write_stream(lake, &table, rows, 4_000_000, &keys, meta.key.is_empty(), None).await?;
+            let mut merged = write_stream(lake, &table, rows, 4_000_000, &keys, None).await?;
             merged.iter_mut().for_each(|f| (f.ord, f.part) = (ord, part.clone()));
             return Ok(merged);
         }
@@ -688,7 +694,7 @@ async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<Re
     };
     let mut files = vec![];
     for (part, batches) in parts {
-        if let Some(f) = write_file(lake, table, &batches, keys, meta.key.is_empty()).await? {
+        if let Some(f) = write_file(lake, table, &batches, keys).await? {
             files.push(DataFile { ord, whole, part, ..f });
         }
     }
@@ -1224,12 +1230,13 @@ pub(crate) fn codec() -> Compression {
 
 use crate::answer::storable;
 
-/// One Parquet file of these rows; with `stats`, it carries its columns' min/max (append tables).
-pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
+/// One Parquet file of these rows, which carries its columns' min and max: an append table's, and a keyed table's, whose
+/// reads skip a file by them (`hot::HotFiles`, `scan::Files`).
+pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String]) -> Result<Option<DataFile>> {
     let Some(first) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(None) };
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     let hot = lake.hot().columns(meta.as_ref().map_or(table, |m| m.folder(table)), &first.schema());
-    let mut file = Encoding::new(meta.as_ref(), first, keys, stats, hot)?;
+    let mut file = Encoding::new(meta.as_ref(), first, keys, hot)?;
     let batches = batches.to_vec();
     let file = blocking(move || {
         batches.iter().try_for_each(|b| file.write(b))?;
@@ -1264,7 +1271,8 @@ struct Encoding {
     ids: datafusion::arrow::datatypes::SchemaRef,
     rows: usize,
     sys: bool,
-    seen: Option<(crate::manifest::Seen, crate::sketch::Sketches)>, // (`stats`: append tables)
+    seen: crate::manifest::Seen, // (its columns' min and max: an append table's files and a keyed table's both)
+    sketches: Option<crate::sketch::Sketches>, // (an append table's: a keyed file's would count a key's old versions too)
     hot: Vec<(usize, FieldRef)>,
     kept: Vec<Vec<ArrayRef>>,
     kept_bytes: usize,
@@ -1273,19 +1281,20 @@ struct Encoding {
 impl Encoding {
     /// A file of rows like `first`'s (it isn't written yet). `hot` are the table's columns held here
     /// (`hot::Hot::columns`): a file whose rows lack one of them keeps none, and `load` reads it later.
-    fn new(meta: Option<&TableMeta>, first: &RecordBatch, keys: &[String], stats: bool, hot: Vec<FieldRef>) -> Result<Self> {
+    fn new(meta: Option<&TableMeta>, first: &RecordBatch, keys: &[String], hot: Vec<FieldRef>) -> Result<Self> {
         let ids = field_ids(meta, &storable(&first.slice(0, 0))?.schema());
-        let seen = stats.then(|| (crate::manifest::Seen::new(first.schema()), crate::sketch::Sketches::new(&first.schema())));
+        let seen = crate::manifest::Seen::new(first.schema());
+        let sketches = meta.is_none_or(|m| m.key.is_empty()).then(|| crate::sketch::Sketches::new(&first.schema()));
         let schema = first.schema();
         let at = |f: FieldRef| Some((schema.index_of(f.name()).ok()?, f));
         let hot: Vec<(usize, FieldRef)> = hot.into_iter().map(at).collect::<Option<_>>().unwrap_or_default();
         let kept = vec![vec![]; hot.len()];
-        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, hot, kept, kept_bytes: 0 })
+        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, sketches, hot, kept, kept_bytes: 0 })
     }
 
     fn write(&mut self, b: &RecordBatch) -> Result<()> {
-        if let Some((seen, sketches)) = &mut self.seen {
-            seen.add(b)?;
+        self.seen.add(b)?;
+        if let Some(sketches) = &mut self.sketches {
             sketches.add(b);
         }
         self.keep(b);
@@ -1314,17 +1323,15 @@ impl Encoding {
     /// Its size so far, encoded.
     fn bytes(&self) -> usize { self.w.bytes_written() + self.w.in_progress_size() }
 
-    /// The file's bytes, finished, and its entry but for where it goes.
-    fn finish(self) -> Result<(Vec<u8>, DataFile)> {
-        let Encoding { mut w, rows, sys, seen, .. } = self;
+    /// The file's bytes, finished, and its entry but for where it goes: its ranges typed in a lake of format 8 (`typed`).
+    fn finish(self, typed: bool) -> Result<(Vec<u8>, DataFile)> {
+        let Encoding { mut w, rows, sys, mut seen, sketches, .. } = self;
         let footer = w.finish()?; // (its statistics: the file's min and max, without a second pass)
         let buf = std::mem::take(w.inner_mut());
-        let (stats, nulls, sketch) = match seen {
-            Some((mut seen, sketches)) => (seen.stats(&footer), Some(seen.nulls()), sketches.done()),
-            None => Default::default(),
-        };
+        let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(&footer), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
         let bytes = buf.len() as u64;
-        Ok((buf, DataFile { rows: rows as u64, bytes, stats, nulls, sketch, sys, ..Default::default() }))
+        let sizes = crate::manifest::sizes(&footer);
+        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, sizes, nulls, sketch, sys, ..Default::default() }))
     }
 
     /// The file finished and put in the table's folder, and its hot columns held there (a table whose
@@ -1332,10 +1339,11 @@ impl Encoding {
     async fn put(mut self, lake: &Lake, table: &str, meta: Option<&TableMeta>) -> Result<DataFile> {
         let hot: Vec<FieldRef> = self.hot.iter().map(|(_, f)| f.clone()).collect();
         let kept = std::mem::take(&mut self.kept);
-        let (buf, file) = blocking(move || self.finish()).await?;
+        let typed = crate::format::typed(lake).await?;
+        let (buf, file) = blocking(move || self.finish(typed)).await?;
         let path = format!("data/{}/{}.parquet", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
         lake.put(&path, buf).await?;
-        maybe_crash("after_parquet_put", &*lake.node.life);
+        maybe_crash("after_parquet_put", &lake.node);
         if !hot.is_empty() {
             let cache = lake.hot();
             let (room, held) = (cache.room_for(lake), path.clone());
@@ -1349,6 +1357,7 @@ impl Encoding {
 /// among the stored ones (a renamed column keeps it), the rows' system columns 1,000,001 on.
 /// Readers that match a file's columns to the table's by id (Polars' `scan_iceberg`) need them.
 fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::SchemaRef) -> datafusion::arrow::datatypes::SchemaRef {
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY as ID;
     // (a table's: its column list's ids; a table an INSERT makes: its columns will be these, in this order)
     let list = meta.map(|m| m.column_list());
@@ -1360,11 +1369,24 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
         };
         own.or_else(|| crate::text::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i))
     };
+    // A list's elements have an id too, after every column's (`iceberg.rs`: `element-id`): a reader that matches a
+    // file's fields by id alone (DuckDB's `iceberg_scan`) reads a list whose elements have none as NULLs.
+    let columns = list.as_ref().map_or(made.len(), |l| l.all().len());
+    let element = |t: &DataType, id: usize| {
+        let with = |f: &FieldRef| std::sync::Arc::new(f.as_ref().clone().with_metadata([(ID.to_string(), id.to_string())].into()));
+        match t {
+            DataType::List(f) => DataType::List(with(f)),
+            DataType::LargeList(f) => DataType::LargeList(with(f)),
+            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(with(f), *n),
+            t => t.clone(),
+        }
+    };
     let fields: Vec<_> = schema.fields().iter().map(|f| match id(f.name()) {
         Some(i) => {
             let mut m = f.metadata().clone();
             m.insert(ID.to_string(), i.to_string());
-            std::sync::Arc::new(f.as_ref().clone().with_metadata(m))
+            let t = if i <= columns { element(f.data_type(), columns + i) } else { f.data_type().clone() };
+            std::sync::Arc::new(f.as_ref().clone().with_metadata(m).with_data_type(t))
         }
         None => f.clone(),
     }).collect();
@@ -1375,9 +1397,9 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
 /// SELECT, a merge), a batch at a time as the rows come. A partitioned table's rows are split a
 /// million at a time instead (each part held whole until it is written), so each file holds one
 /// partition's (invariant 26).
-pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String], stats: bool, partition: Option<&str>) -> Result<Vec<DataFile>> {
+pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String], partition: Option<&str>) -> Result<Vec<DataFile>> {
     if let Some(spec) = partition {
-        return write_parts_of(lake, table, stream, max_rows.min(1_000_000), keys, stats, spec).await;
+        return write_parts_of(lake, table, stream, max_rows.min(1_000_000), keys, spec).await;
     }
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     let (mut files, mut open) = (vec![], None::<Encoding>);
@@ -1414,7 +1436,7 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
             None => {
                 // (a file's hot columns are the table's held ones when it is opened)
                 let hot = lake.hot().columns(meta.as_ref().map_or(table, |m| m.folder(table)), &b.schema());
-                Encoding::new(meta.as_ref(), &b, keys, stats, hot)?
+                Encoding::new(meta.as_ref(), &b, keys, hot)?
             }
         };
         writing = Some(blocking(move || file.write(&b).map(|_| file)));
@@ -1426,7 +1448,7 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
 }
 
 /// `write_stream` for a partitioned table: `chunk` rows at a time, split by partition value.
-async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, chunk: usize, keys: &[String], stats: bool, spec: &str) -> Result<Vec<DataFile>> {
+async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, chunk: usize, keys: &[String], spec: &str) -> Result<Vec<DataFile>> {
     let (mut files, mut pending, mut n) = (vec![], vec![], 0);
     loop {
         let batch = stream.next().await.transpose()?;
@@ -1437,7 +1459,7 @@ async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatc
         }
         if n >= chunk || (end && n > 0) {
             for (part, batches) in split(spec, std::mem::take(&mut pending)).await? {
-                files.extend(write_file(lake, table, &batches, keys, stats).await?.map(|f| DataFile { part, ..f }));
+                files.extend(write_file(lake, table, &batches, keys).await?.map(|f| DataFile { part, ..f }));
             }
             n = 0;
         }
@@ -1487,18 +1509,25 @@ mod tests {
             RecordBatch::try_new(schema.clone(), columns).unwrap()
         };
         let batches: Vec<RecordBatch> = [0, 300_000, 600_000].into_iter().map(batch).collect();
-        let mut file = Encoding::new(None, &batches[0], &["i".to_string()], true, vec![]).unwrap();
+        let mut file = Encoding::new(None, &batches[0], &["i".to_string()], vec![]).unwrap();
         batches.iter().try_for_each(|b| file.write(b)).unwrap();
-        let (buf, entry) = file.finish().unwrap();
+        let typed = Encoding::new(None, &batches[0], &["i".to_string()], vec![]).unwrap();
+        let (_, typed) = batches.iter().try_fold(typed, |mut t, b| t.write(b).map(|_| t)).and_then(|t| t.finish(true)).unwrap();
+        let (buf, entry) = file.finish(false).unwrap();
         let groups = SerializedFileReader::new(bytes::Bytes::from(buf)).unwrap().metadata().num_row_groups();
         assert!(groups >= 3, "{groups} row groups");
         assert_eq!(entry.rows, 900_000);
+        assert!(entry.bounds.is_empty() && typed.stats.is_empty(), "text below format 8, typed at it");
         for (i, f) in schema.fields().iter().enumerate() {
             let cols: Vec<ArrayRef> = batches.iter().map(|b| b.column(i).clone()).collect();
             let rows = crate::sketch::min_max(&cols).and_then(|(lo, hi)| Some((crate::manifest::text(&lo)?, crate::manifest::text(&hi)?)));
             assert_eq!(entry.stats.get(f.name()), rows.as_ref(), "{}", f.name());
+            let parse = |s: &String| datafusion::common::ScalarValue::try_from_string(s.clone(), f.data_type()).unwrap();
+            let want = rows.as_ref().map(|(lo, hi)| (parse(lo), parse(hi)));
+            let got = crate::bounds::Ranged::range(&typed, f.name(), f.data_type());
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{}, typed", f.name()); // (as text: a NaN is not equal to itself)
         }
-        assert!(!entry.stats.contains_key("long"));
+        assert!(!entry.stats.contains_key("long") && !typed.bounds.contains_key("long"));
         assert_eq!(entry.nulls, Some(vec!["i".to_string()]));
     }
 
@@ -1724,7 +1753,7 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("pondra-streamed-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
-        let files = write_stream(&lake, "t", stream(false), 2500, &[], true, None).await?;
+        let files = write_stream(&lake, "t", stream(false), 2500, &[], None).await?;
         assert_eq!(files.iter().map(|f| f.rows).collect::<Vec<_>>(), [3000, 3000, 3000, 1000]);
         for (k, f) in files.iter().enumerate() {
             let (lo, hi) = (k as i64 * 3000, (k as i64 * 3000 + 2999).min(9999));
@@ -1733,7 +1762,7 @@ mod tests {
         let parquet = |d: &std::path::Path| walk(d).into_iter().filter(|p| p.extension().is_some_and(|e| e == "parquet")).count();
         let before = parquet(&dir);
         assert_eq!(before, 4);
-        let Err(err) = write_stream(&lake, "u", stream(true), 2500, &[], true, None).await else { panic!("the stream's error") };
+        let Err(err) = write_stream(&lake, "u", stream(true), 2500, &[], None).await else { panic!("the stream's error") };
         assert!(format!("{err:#}").contains("the query stopped"), "{err:#}");
         assert_eq!(parquet(&dir), before + 3, "the files filled before the error are put; the one under way is not");
         lake.cat.close().await?;

@@ -1085,10 +1085,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 136. **`DO` is an admin's, and its errors count lines from the code's first** (`routines::do_of`
    drops the newline after `$$`; a DO block's errors carry no routine name). `harness.py
    procedures`.
-137. **A folder of lakes' server holds no lake.** Each database is a `pondra serve` child
-   (`--advertise host:port/db/name`, `--attach-found <folder>`, `--stop-with-stdin`,
-   `PONDRA_SERVER_URL`); the server routes Postgres by the startup message and HTTP by
-   `/db/{name}`. `harness.py server` (local, `--s3`).
+137. **A folder of lakes' server holds no lake.** Each database is a node in the server's own process
+   (`node::Options::database`: advertised at `host:port/db/name`, attached to the folder's lakes, its
+   settings with `PONDRA_SERVER_URL`), kept by a supervisor of its own (`node::kept`), so its failure or
+   restart is its own and the other databases go on. It binds no port: the server routes Postgres by the
+   startup message, handing the connection to its door (`pg::Door`), and HTTP by `/db/{name}`, calling its
+   router. `harness.py server` (local, `--s3`).
 138. **The console asks only the node that served it** (no CDN or other hosts; its page, modules
    and style sheet are `include_str!`ed and its fonts `include_bytes!`ed from `brand/fonts/`;
    extensions are the node's own files). `console_check.py`: "every request went to the node", in
@@ -2646,8 +2648,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `Retry-After` at HTTP), the right password too, until its minute has fewer. Each refusal
    costs its 400 ms, as a wrong guess does. At most 10,000 pairs are held. Bearer tokens aren't
    counted. The Postgres, Flight and Kafka doors take the same two hooks. Behind `pondra serve --lakes` the address is the client's, which the server names in
-   `x-pondra-client` with a key it gives its databases' nodes (`PONDRA_CLIENT_KEY`). A node takes that
-   header only from this machine and with that key, so no other process here can name an address, and
+   `x-pondra-client` with its key (`tls::lakes_key`, which only its process holds: its databases' nodes are in it). A
+   node takes that header only from this machine and with that key, so no other process here can name an address, and
    the server replaces what a client sent. Without it, ten wrong passwords from anyone locked the user out for everyone. The same
    address decides what a page on this machine is (`Peer::from_here`: saving the console's settings, choosing a node's
    Python), so behind the server a page from another machine can't do either (S28). From an address of
@@ -3269,7 +3271,7 @@ python3 tools/harness.py sso_flow     # the browser's and pondra login's way in 
 python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
 python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
-python3 tools/per_node_check.py         # every static said to outlive a node; no task Node::stop can't end; settings only through env.rs
+python3 tools/per_node_check.py         # every static said to outlive a node; no task Node::stop can't end; settings only through env.rs; calls between members only through the node's dial
 python3 tools/size_check.py --bin <pondra> --platform linux-x64   # the shipped program within its budget (tools/size-budget.txt): its bytes and its gzip download; more raises the budget there, saying why
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
 cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again
@@ -3325,6 +3327,7 @@ python3 tools/harness.py measures       # measures in views: the query's own gra
 python3 tools/harness.py agents         # the agent benchmark without a model: each shop question's gold SQL on Pondra == DuckDB == Postgres as the scorer reads answers, the agent loop with a scripted model, and saved answers replayed (tools/agent_bench.py; a model run: agent-bench.yml)
 python3 tools/harness.py facts          # a view's PRIMARY KEY, UNIQUE and FOREIGN KEY NOT ENFORCED: parts, ALTER VIEW, SHOW CREATE again, OR REPLACE, Postgres's catalog, refusals
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
+python3 tools/random_views.py --rounds 300 # random writes under materialized views of each way they are kept (rows, by key, whole): each view == its query after every round (li1113/F3)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow

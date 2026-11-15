@@ -320,23 +320,25 @@ pub const PLAIN: &str = "this node takes TLS from other machines (https://, sslm
 /// What a password refused on a plain connection from another machine is told (`may_send_password`).
 pub const PASSWORD_PLAIN: &str = "a password crosses only TLS from another machine: use https://, or a token";
 
-/// The header `pondra serve --lakes` names its client's address in, on what it forwards to a database's
+/// The header `pondra serve --lakes` names its client's address in, on what it passes to a database's
 /// node: that node sees only the server, on this machine (`Peer::client`). It reads `<key> <address>`,
-/// with the key the server gave the node in `CLIENT_KEY`, so no other process here can name an address.
+/// with the server's key (`lakes_key`), which only the server's process holds, so no other process here can name an address.
 pub const CLIENT: &str = "x-pondra-client";
 
 /// The header `pondra serve --lakes` names the scheme and host its client reached it at in, and the
 /// database's path (`<key> https://host:port/db/name`), as `CLIENT` names the client (`Peer::origin`).
 pub const ORIGIN: &str = "x-pondra-origin";
 
-/// The key `pondra serve --lakes` gave this node for its `CLIENT` and `ORIGIN` headers (none: no such server).
-fn server_key() -> Option<&'static str> {
-    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| crate::env::get(CLIENT_KEY).filter(|k| k.len() >= 16)).as_deref()
-}
+/// The key of a folder of lakes' server in this process, for its `CLIENT` and `ORIGIN` headers (`lakes_key`): its
+/// databases' nodes are in the same process (`dbserver.rs`). Unset: no such server here, and nobody's headers are taken.
+static LAKES_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// The variable the lakes server gives each database's node the key of its `CLIENT` header in.
-pub const CLIENT_KEY: &str = "PONDRA_CLIENT_KEY";
+/// The key a folder of lakes' server signs its `CLIENT` and `ORIGIN` headers with: made once, by the server, for the
+/// process.
+pub fn lakes_key() -> &'static str { LAKES_KEY.get_or_init(|| uuid::Uuid::new_v4().simple().to_string()) }
+
+/// The key the nodes in this process take those headers with (none: no lakes server here).
+fn server_key() -> Option<&'static str> { LAKES_KEY.get().map(String::as_str) }
 
 /// The proxies whose word for their clients' addresses is taken (`proxies`).
 pub const TRUSTED_PROXIES: &str = "PONDRA_TRUSTED_PROXIES";

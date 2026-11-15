@@ -151,7 +151,11 @@ stop, and a 24-hour soak (C4). Where things stood:
   covers what a 0.80 node reads beyond the entries: a dropped table's record (`dt/`) and what one
   node hands another (a tier job, a filing, a query's tables). `upgrade_check.py rolling`. This is
   the rule for upgrades from 0.80, not the end state: the release that no longer upgrades a lake
-  from 0.80 writes every entry as its list and drops format 5's encoder.
+  from 0.80 writes every entry as its list and drops format 5's encoder. Likewise a file's ranges are
+  written as text until its lake is format 8 (`format::BOUNDS`), typed from then on (`bounds.rs`):
+  a node from before would drop the typed ones as it wrote the entry again, leaving the file with
+  none. Every reader reads both (`bounds::Ranged`), so a file written before keeps its text ranges
+  until it is rewritten.
 - **Every release's lake since 0.22 opens in this build and answers as it did**
   (`upgrade_check.py lakes`, `upgrade.yml` on every pull request).
 - **A node told to stop drains** (`drain.rs`): not ready, new requests turned away to be

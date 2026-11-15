@@ -67,13 +67,13 @@ pub fn planned(sql: &str) -> anyhow::Result<Cow<'_, str>> {
 /// A keyed table's `_deleted` too, which reads leave out unless a query names it
 /// (`query::named`): `SELECT *, _deleted FROM t` shows it once.
 pub fn hide(sql: &str) -> Cow<'_, str> {
-    use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
+    use datafusion::sql::sqlparser::ast::*;
     use std::ops::ControlFlow;
     let deleted = crate::query::names_deleted(sql);
     if !mentioned(sql) && !deleted {
         return Cow::Borrowed(sql);
     }
-    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Cow::Borrowed(sql) };
+    let Ok(mut stmts) = crate::parsed::generic(sql) else { return Cow::Borrowed(sql) }; // (the front's, or a look's: `parsed.rs`)
     struct Hide {
         ctes: Vec<String>,
         changed: bool,
@@ -103,7 +103,7 @@ pub fn hide(sql: &str) -> Cow<'_, str> {
     let mut v = Hide { ctes: vec![], changed: false, names };
     let _ = crate::walk::visit_mut(&mut stmts, &mut v);
     match v.changed {
-        true => Cow::Owned(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join("; ")),
+        true => Cow::Owned(crate::text::text_kept(stmts)), // (kept as its parse: the engine plans from it, `parsed::keep`)
         false => Cow::Borrowed(sql),
     }
 }
@@ -137,6 +137,20 @@ pub fn stale_staged(name: &str, made_ms: u64, now_ms: u64, ms: u64) -> bool {
 mod tests {
     use super::*;
 
+    /// What `planned` writes, `*` without the system columns or an ASOF JOIN as the LEFT JOIN that carries its marker, is
+    /// kept as its parse (`text::text_kept`): the engine plans from that tree and parses the text no more (step 8, 9c).
+    #[test]
+    fn a_planned_text_is_kept_as_its_parse() {
+        for sql in ["SELECT *, _row_id FROM t", "SELECT * FROM t WHERE _deleted", "SELECT * FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym"] {
+            let out = planned(sql).unwrap();
+            assert_ne!(out, sql, "rewritten");
+            let kept = crate::parsed::already(&out).unwrap_or_else(|| panic!("not kept: {out}"));
+            let stmts = kept.as_ref().as_ref().unwrap();
+            assert_eq!(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"), out, "kept as what it prints");
+        }
+        assert!(matches!(planned("SELECT * FROM t").unwrap(), Cow::Borrowed(_)), "nothing to do: as written");
+    }
+
     #[test]
     fn staged_names_are_per_job_and_read_back() {
         let a = staged("s.t", "job-1");
@@ -159,9 +173,8 @@ mod tests {
 
 /// Can a file (or manifest) with these column ranges hold one of the rows `dead` names — sorted
 /// (`_row_id`, `_version`) pairs? By its `_row_id` and `_version` ranges; yes if it has none.
-pub fn holds(dead: &[(i64, i64)], stats: &crate::manifest::Stats) -> bool {
-    let range = |c: &str| stats.get(c).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
-    match (range(ROW_ID), range(VERSION)) {
+pub fn holds(dead: &[(i64, i64)], ranged: &dyn crate::bounds::Ranged) -> bool {
+    match (ranged.longs(ROW_ID), ranged.longs(VERSION)) {
         (Some((lo, hi)), Some((vlo, vhi))) => dead[dead.partition_point(|d| d.0 < lo)..].iter().take_while(|d| d.0 <= hi).any(|d| (vlo..=vhi).contains(&d.1)),
         _ => true,
     }

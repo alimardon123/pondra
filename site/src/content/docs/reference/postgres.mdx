@@ -88,9 +88,10 @@ makes every statement its own commit.
 | `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT` | a transaction: its statements one commit |
 | `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | savepoints, as Postgres has them. The connection stays in its transaction, so psycopg's nested `conn.transaction()` works. See [Transactions](/pondra/guides/change-rows/#savepoints) |
 | `SET`, `RESET`, `SHOW` | the connection's [settings](/pondra/sql/statements/#settings-and-prepared-statements): DataFusion's `datafusion.*` options checked and used by its queries, Postgres's names kept and shown |
-| `PREPARE`, `EXECUTE`, `DEALLOCATE` | the connection's prepared statements (a `DEALLOCATE` of a name the protocol prepared: accepted) |
+| `PREPARE`, `EXECUTE`, `DEALLOCATE` | the connection's prepared statements (`DEALLOCATE name` and `DEALLOCATE ALL` drop the statements the protocol prepared too, as Postgres's) |
 | `DECLARE`, `FETCH`, `MOVE`, `CLOSE` | cursors: a query's rows a part at a time. See [Cursors](#cursors) |
-| `DISCARD` | accepted, and ignored |
+| `DISCARD ALL` | the connection starts again, as a pooler expects before it hands it on (PgBouncer's reset): its settings (its [language](/pondra/sql/statements/#settings-and-prepared-statements) too), prepared statements, variables, temporary tables, views and functions, sequences' `currval` and cursors go. Refused in a transaction (`25001`). Statements the protocol prepared (a Parse's) and their portals go too |
+| `DISCARD TEMP`, `DISCARD SEQUENCES`, `DISCARD PLANS` | as Postgres's: the temporary tables, views and functions go; each sequence's `currval` goes; nothing to drop, as each statement is planned as it runs |
 | `SHOW server_version`, `standard_conforming_strings`, `client_encoding` | a fixed answer, unless the connection set it. `SHOW transaction_isolation` says the level a transaction runs at |
 | `SHOW TABLES` | the lake's tables and views, and the `information_schema` views |
 | `DESCRIBE t` | its columns and types, with Arrow's type names |

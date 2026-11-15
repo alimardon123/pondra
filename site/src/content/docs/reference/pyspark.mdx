@@ -698,5 +698,8 @@ What Pondra doesn't do, or does differently. Each is a limit you can plan around
   natural log), not a base. `show(vertical=True)` prints the usual table. A function takes a number only as `F.lit(…)`: `F.sha2(col, 256)` raises an error, where PySpark takes the plain 256.
 - `alias` names a DataFrame in a join only. Outside one, `F.col("o.id")` and `df["id"]` in a
   `select` are errors. In a `where` or a join, `df["id"]` and `df.id` work.
+- In a session that reads Spark SQL (`SET language = 'spark'`), an `INSERT` of `2.7` into an `INT` column
+  stores 3: a table's column takes a value as Pondra's tables cast it, rounding, where Spark cuts it to 2. Write
+  `CAST(x AS INT)` in the `INSERT` to cut, as Spark does (`INSERT INTO t SELECT CAST(x AS INT) FROM …`).
 
 </Aside>

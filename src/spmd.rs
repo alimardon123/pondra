@@ -512,8 +512,10 @@ async fn planned(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result
 
 /// The slice's query, its tables standing for just their parts.
 async fn shared(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result<(SessionContext, datafusion::prelude::DataFrame)> {
-    // (as the node's own: a query spreads only when its caller sees everything, `App::here_only_for`)
-    let node = &crate::auth::Principal::node().scope;
+    // (as the node's own: a query spreads only when its caller sees everything, `App::here_only_for`; as whoever runs the
+    // nodes when it does, so a database attached here that signs in on its own is read as where it was asked: `users::across`)
+    let own = crate::auth::Principal::node().scope;
+    let node = if scope.operator() { scope } else { &own };
     let ctx = session_for(lake, &s.sql, "", None, node).await?;
     // The whole tables, log tails and changed rows (`{t}$deleted`) as the coordinator saw them:
     // this node must have seen the log that far.

@@ -507,7 +507,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         return Ok(format!("{head}{moment}"));
     }
     crate::dialect_stmts::hint_refused(sql)?; // (MySQL's `/*! … */`: binding prints the text back without it, 11-07 audit M2)
-    let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
+    let sql = &crate::languages::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let sql = &crate::past_names::syntax(sql); // (`t AT (VERSION => $v)`)
     let mut stmts = crate::parsed::read(sql)?; // (as the front reads it: `[x * $k FOR x IN l]`, `LAMBDA x: x * $k`)
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
@@ -1400,6 +1400,20 @@ mod tests {
             assert_eq!(got, want, "{sql}");
             assert!(crate::parsed::generic(&got).is_ok(), "{got}");
         }
+    }
+
+    /// A client's frame groups as the same query sent alone: the front regroups the request's own tree, and the
+    /// Expander each frame it inlines (11-14 audit H1).
+    #[tokio::test]
+    async fn a_frame_groups_as_the_query_sent_alone() {
+        let lake = Lake::open(&format!("memory://frames-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        let scope = crate::auth::Principal::node().scope;
+        let frame = "SELECT a IS DISTINCT FROM b OR c AS x FROM t";
+        let alone = expand(&lake, frame, &scope).await.unwrap();
+        assert!(alone.contains("(a IS DISTINCT FROM b) OR c"), "{alone}");
+        let views = HashMap::from([("f".to_string(), frame.to_string())]);
+        let via = prepare(&lake, "SELECT * FROM f", &HashMap::new(), &views, &scope).await.unwrap();
+        assert!(via.contains(&alone), "{via}");
     }
 
     /// The statements the tokenizer reads in `text`: each `;` token's text before it, when more than whitespace and

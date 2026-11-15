@@ -24,7 +24,7 @@ use crate::node_state::NodeState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -964,8 +964,22 @@ impl TableMeta {
     /// The stored columns' Arrow schema (`columns`), each nullable: a file's, as the table writes it.
     pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema_of(self.columns()) }
 
-    /// `schema` as a scan reads it, text as Utf8View (`query::read_schema`).
-    pub fn read_schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::read_schema_of(self.columns()) }
+    /// `schema` as a scan reads it, text as Utf8View (`query::read_schema`), a column of a column type's (`Col::held`: uuid,
+    /// json, jsonb) marked as one (`column_types::mark`), so what plans over it knows its type as the column's own
+    /// (`x['k']`, `->` on JSON), not traced from the text.
+    pub fn read_schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let schema = crate::answer::read_schema_of(self.columns())?;
+        fn typed(c: &Col) -> Option<&'static crate::column_types::ColumnType> { c.held.as_deref().and_then(crate::column_types::named) }
+        if !self.list().columns.iter().any(|c| typed(c).is_some()) {
+            return Ok(schema);
+        }
+        let fields: Vec<Field> = schema.fields().iter().zip(&self.list().columns).map(|(f, c)| match typed(c) {
+            Some(t) => crate::column_types::mark(f.as_ref().clone(), t),
+            None => f.as_ref().clone(),
+        }).collect();
+        Ok(std::sync::Arc::new(Schema::new(fields)))
+    }
     /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
     pub fn into_columns(self) -> Vec<(String, String)> { self.record.list.columns.into_iter().map(|c| (c.stored.unwrap_or(c.name), c.dtype)).collect() }
 
@@ -2130,7 +2144,12 @@ use crate::memory_lake::in_memory;
 pub fn served(url: &str) -> bool { url.starts_with("pondra://") }
 
 /// The schemes of a bucket's lake (`s3://bucket/prefix`): `open_store` and `place` both take only these.
+#[cfg(not(all(feature = "doors", any(test, feature = "sim"))))]
 const BUCKETS: [&str; 5] = ["s3", "gs", "az", "abfs", "abfss"];
+
+/// (and the sim's members' bucket, in a test or sim build: `sim::store`)
+#[cfg(all(feature = "doors", any(test, feature = "sim")))]
+const BUCKETS: [&str; 6] = ["s3", "gs", "az", "abfs", "abfss", "sim"];
 
 /// The kinds of place a lake can be (`place`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2385,7 +2404,7 @@ impl Lake {
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
-                    let t0 = datafusion::common::instant::Instant::now();
+                    let t0 = Instant::now();
                     let kv = kv::writer(store.clone(), cache_dir, local, node.clone()).await?;
                     trace_since("the catalog's writer open", t0);
                     Catalog::writer(kv, t0, &node).await?
@@ -3280,7 +3299,7 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
 }
 
 /// A start's line (`NodeState::trace`), timed from `since`: the catalog's open times its own steps.
-pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
+pub fn trace_since(what: &str, since: Instant) {
     if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
     }
@@ -4290,7 +4309,7 @@ impl Stages {
             return now;
         }
         let mut s = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
+        let ms = now.duration_since(since).as_secs_f64() * 1e3;
         match s.1.iter_mut().find(|(n, _)| *n == stage) {
             Some((_, v)) => v.push(ms),
             None => s.1.push((stage, vec![ms])),
@@ -4348,9 +4367,12 @@ pub(crate) fn fatal(e: kv::Error, life: &dyn crate::lifecycle::Lifecycle) -> any
 
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
-pub fn maybe_crash(point: &str, life: &dyn crate::lifecycle::Lifecycle) {
+pub fn maybe_crash(point: &str, node: &crate::node_state::NodeState) {
+    if node.stops_at(point) {
+        panic!("the sim stopped this member at {point}"); // (its other tasks end as it is killed: `sim::Cluster::kill`)
+    }
     if crash_rolled(point) {
-        if !life.owns_process() {
+        if !node.life.owns_process() {
             panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
         }
         eprintln!("PONDRA_CRASH: aborting at {point}");

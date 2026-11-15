@@ -93,6 +93,39 @@ fn file_url(_: &str) -> Option<url::Url> {
     None
 }
 
+/// A lake's own files with nothing to leave out (no deletes, no lineage to add), as one scan planned from their entries
+/// alone: each file's size, rows and ranges are the catalog's, so planning reads no footer (step 5 piece 14b). `full`: a
+/// file's place (`Lake::full`). Its ranges are exact (the writer's own, `bounds::kept`, or a footer's that says so:
+/// `manifest::from_footer`), so an aggregate the statistics answer (`max(x)`, `count(*)`) is answered from them, as it
+/// was from the footers; but a float's, which leaves NaN out, isn't.
+pub(crate) fn own(full: impl Fn(&str) -> String, files: &[&crate::data_file::DataFile], schema: &SchemaRef) -> Result<Files> {
+    use datafusion::common::stats::Precision::{Absent, Exact, Inexact};
+    let first = full(&files.first().context("no files")?.path);
+    let url = url_of(&first)?;
+    let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
+    let files = files.iter().map(|f| {
+        let mut stats = statistics(f, f.rows, true, 0, true, schema);
+        // (sizes as a footer gives them: a fixed-width column's its rows times its width, another's its bytes before
+        // compression; and no total, which is the file's compressed size here and would be taken for any projection of it:
+        // joins pick their sides by it)
+        stats.total_byte_size = Absent;
+        for (c, field) in stats.column_statistics.iter_mut().zip(schema.fields()) {
+            c.byte_size = match field.data_type().primitive_width() {
+                Some(w) => Exact(w * f.rows as usize),
+                None => f.sizes.get(field.name()).map_or(Absent, |b| Inexact(*b as usize)),
+            };
+            if !field.data_type().is_floating() {
+                (c.min_value, c.max_value) = (exact(&c.min_value), exact(&c.max_value));
+            }
+        }
+        fn exact(v: &datafusion::common::stats::Precision<datafusion::common::ScalarValue>) -> datafusion::common::stats::Precision<datafusion::common::ScalarValue> {
+            match v { Inexact(x) => Exact(x.clone()), v => v.clone() }
+        }
+        Ok(File { key: key_of(&full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range: None, only: None, stats: Arc::new(stats), modified: None })
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(Files { store, file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None })
+}
+
 /// Another engine's files (`files`, of one table) read as `schema` says: its columns in its
 /// order, matched by field id where `table` gives them, partition values from each file's place,
 /// deleted rows left out.
@@ -130,7 +163,7 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::da
             (_, None) => (f.rows, !f.outside.as_ref().is_some_and(|o| o.guessed)),
         };
         let stats = Arc::new(statistics(f, rows, counted, gone.as_ref().map_or(0, |g| g.len()), table.is_none(), &file_schema));
-        out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats });
+        out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats, modified: f.modified });
     }
     let adapter = (!ids.is_empty()).then(|| Arc::new(ById { ids: ids.clone(), mapping: table.and_then(|t| t.name_mapping.as_deref()).map(name_mapping).unwrap_or_default() }) as _);
     let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter, row: None }))?;
@@ -150,8 +183,7 @@ pub(crate) fn statistics(f: &crate::data_file::DataFile, rows: u64, counted: boo
     let n = rows.saturating_sub(deleted as u64) as usize;
     (s.num_rows, s.total_byte_size) = (if plain && counted { Exact(n) } else { Inexact(n) }, Inexact(f.bytes as usize));
     for (field, c) in schema.fields().iter().zip(s.column_statistics.iter_mut()).filter(|_| plain) {
-        let parse = |v: &String| ScalarValue::try_from_string(v.clone(), field.data_type()).ok();
-        if let Some((Some(lo), Some(hi))) = f.stats.get(field.name()).map(|(lo, hi)| (parse(lo), parse(hi))) {
+        if let Some((lo, hi)) = crate::bounds::Ranged::range(f, field.name(), field.data_type()) {
             (c.min_value, c.max_value) = (Inexact(lo), Inexact(hi));
         }
     }
@@ -413,6 +445,7 @@ pub struct File {
     pub range: Option<(u64, u64)>,      // only its rows from .0 to (not including) .1
     pub only: Option<Arc<Vec<u64>>>,    // only its rows at these positions, sorted
     pub stats: Arc<datafusion::common::Statistics>, // (its file columns': partition values add theirs)
+    pub modified: Option<i64>, // its listing's time, nanoseconds (`DataFile::modified`); a lake file's none
 }
 
 #[async_trait::async_trait]
@@ -450,7 +483,8 @@ impl TableProvider for Files {
         for f in files {
             let mut pf = datafusion::datasource::listing::PartitionedFile::new_from_meta(datafusion::object_store::ObjectMeta {
                 location: datafusion::object_store::path::Path::parse(&f.key).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-                last_modified: Default::default(),
+                // (the time its footer was cached under at planning: a footer cached as of another time is read again)
+                last_modified: f.modified.map(chrono::DateTime::from_timestamp_nanos).unwrap_or_default(),
                 size: f.size,
                 e_tag: None,
                 version: None,

@@ -1,7 +1,9 @@
 //! Two lakes one after the other in one process (ADR-061 §3, invariant 301). A node stopped leaves
 //! nothing of itself, so the next one, on another lake, starts as in a process of its own: none of
 //! the first lake's users (nor what it remembered of their sign-ins), grants, tables, history writer
-//! or counters, its port free again, and no threads or files left over from it. `cargo test --release --test node_twice`.
+//! or counters, its port free again, and no threads or files left over from it. Then the two at once,
+//! as a folder of lakes' server runs its databases (`dbserver.rs`): each its own users, tables and history,
+//! and one stopped leaves the other serving. `cargo test --release --test node_twice`.
 #![cfg(feature = "server")]
 #![recursion_limit = "256"] // (as the program's: a node's futures are deep)
 use pondra::node::{Node, Options};
@@ -149,6 +151,26 @@ fn run() {
         assert_eq!(at.one("SELECT count(*) AS n FROM t", Some(ANN)).await, 3, "ann reads t on A again");
         assert_eq!(at.in_history("marker_of_b", Some(BOSS)).await, 0, "A's history has none of B's");
         node.stop().await;
+
+        // A and B at once, each on a port of its own: neither sees the other's tables, users or history, and B stopped
+        // leaves A serving.
+        let port_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let at_b = At { url: format!("http://127.0.0.1:{port_b}"), http: reqwest::Client::new() };
+        let node_a = Node::open(Options::local(&a, &addr)).await.expect("lake A, beside B");
+        let node_b = Node::open(Options::local(&b, &format!("127.0.0.1:{port_b}"))).await.expect("lake B, beside A");
+        assert_eq!(at.one("SELECT count(*) AS n FROM t", Some(ANN)).await, 3, "ann reads t on A, B open beside it");
+        assert!(at_b.sql("SELECT count(*) FROM t", Some(CARL)).await.is_err(), "B has no table t, A open beside it");
+        assert!(at_b.sql("SELECT 1 AS one", Some(ANN)).await.is_err(), "ann (A's) can't sign in on B");
+        assert!(at.sql("SELECT 1 AS one", Some(CARL)).await.is_err(), "carl (B's) can't sign in on A");
+        at_b.sql("CREATE TABLE u (id INT)", Some(CARL)).await.unwrap();
+        at_b.sql("INSERT INTO u VALUES (7)", Some(CARL)).await.unwrap();
+        assert!(at.sql("SELECT count(*) FROM u", Some(BOSS)).await.is_err(), "A has no table u");
+        assert!(at_b.in_history("INSERT INTO u", Some(CARL)).await > 0, "B's history has its INSERT, written beside A's");
+        assert_eq!(at.in_history("INSERT INTO u", Some(BOSS)).await, 0, "A's history has none of B's");
+        node_b.stop().await;
+        assert_eq!(at.one("SELECT count(*) AS n FROM t", Some(ANN)).await, 3, "A still serves once B stops");
+        assert!(at.sql("SELECT 1 AS one", None).await.is_err(), "A still has its users");
+        node_a.stop().await;
 
         // Nothing left over: three more opens and stops hold no more files, threads or tasks.
         // (Blocking threads go after a second idle, so the count is taken once it settles, within 10 s.)

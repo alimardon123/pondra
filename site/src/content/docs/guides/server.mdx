@@ -145,7 +145,8 @@ are every database's. A user signs in to one database, and is nobody in the othe
 
 - Another database that signs in on its own (it has a user, or the server has tokens) is read and
   written only through itself, or with one of the server's tokens. Its superuser can't read it from
-  the database next door either.
+  the database next door either, and neither can a task's run or a view's refresh, which no token
+  asks for, even when a token made the task or the view.
 - Another database with no sign-in is open to anyone, so it is open from the next one too. A user
   granted some tables still needs a grant naming its table there:
 

@@ -41,28 +41,75 @@ use std::sync::Arc;
 /// Accept Postgres clients on `addr`.
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let tls = crate::tls::pg(); // (sslmode=require: `tls.rs`)
-    let parser = Arc::new(Parser);
-    // One registry of connections for the server: a cancel request finds its connection's key here.
-    let cancels = Arc::new(ConnectionManager::new());
-    let cancel = Arc::new(DefaultCancelHandler::new(cancels.clone()));
+    let door = Door::new(app);
     loop {
         let (socket, _) = listener.accept().await?;
-        if app.lake.node.drain.draining() {
-            continue; // (stopping: a new connection goes to another node, `drain.rs`)
+        door.take(socket);
+    }
+}
+
+/// A node's Postgres door: what each connection to it is handed, whether it came to the node's own port (`serve`) or a
+/// host that keeps the node in its process passed it on (a lakes server's database, `dbserver.rs`). Its connections share
+/// one registry, where a cancel request finds its connection by its key.
+pub struct Door {
+    app: App,
+    tls: Option<tokio_rustls::TlsAcceptor>, // (sslmode=require: `tls.rs`)
+    parser: Arc<Parser>,
+    cancels: Arc<ConnectionManager>,
+    cancel: Arc<DefaultCancelHandler>,
+}
+
+impl Door {
+    pub fn new(app: App) -> Door {
+        let cancels = Arc::new(ConnectionManager::new());
+        Door { app, tls: crate::tls::pg(), parser: Arc::new(Parser), cancel: Arc::new(DefaultCancelHandler::new(cancels.clone())), cancels }
+    }
+
+    /// A new connection's handlers, and its session: a connection is a session, whose temporary tables end with it
+    /// (`temp.rs`). None while the node drains: a new connection goes to another node (`drain.rs`).
+    fn handlers(&self, peer: Option<Peer>) -> Option<(Arc<Pg>, String)> {
+        if self.app.lake.node.drain.draining() {
+            return None;
         }
-        let tls = tls.clone();
-        // A connection is a session: its temporary tables end with it (`temp.rs`).
-        let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone() });
-        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
-        let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
-        let used = app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
-        let home = crate::temp::sessions(&app.lake); // (the node's sessions, which this connection's ends in)
-        app.lake.node.tasks.spawn_as(crate::auth::Door, async move {
-            let _used = used;
+        let (app, session) = (&self.app, format!("pg-{}", uuid::Uuid::new_v4().simple()));
+        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: self.parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone(), parsed: Default::default(), forget: Default::default() });
+        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: self.cancels.clone(), peer };
+        Some((Arc::new(Pg(backend, Arc::new(startup), self.cancel.clone())), session))
+    }
+
+    /// A connection to the node's own port, served on a task of the node's.
+    pub fn take(&self, socket: tokio::net::TcpStream) { self.take_from(socket, None) }
+
+    /// A connection its host passed on over this machine's loopback (Windows has no pair of sockets), `peer` its client's.
+    #[cfg(not(unix))]
+    pub fn take_handed(&self, socket: tokio::net::TcpStream, peer: Peer) { self.take_from(socket, Some(peer)) }
+
+    fn take_from(&self, socket: tokio::net::TcpStream, peer: Option<Peer>) {
+        let Some((pg, session)) = self.handlers(peer) else { return };
+        let tls = if peer.is_some() { None } else { self.tls.clone() }; // (a passed one's TLS ended at its host)
+        self.serve_one(session, async move {
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
+        });
+    }
+
+    /// A connection its host passed on in this process, its startup message not read yet: the host ended the client's TLS
+    /// and checked it was allowed, as it does a connection to the node's own port (`dbserver.rs`). `peer`: its client's
+    /// address and TLS, which this end of the pair doesn't show.
+    #[cfg(unix)]
+    pub fn take_passed(&self, socket: tokio::net::UnixStream, peer: Peer) {
+        let Some((pg, session)) = self.handlers(Some(peer)) else { return };
+        self.serve_one(session, async move {
+            let _ = pgwire::tokio::process_socket_unix(socket, pg).await;
+        });
+    }
+
+    fn serve_one(&self, session: String, served: impl std::future::Future<Output = ()> + Send + 'static) {
+        let used = self.app.lake.node.idle.begin(); // (an open connection is a use of the node: `idle.rs`)
+        let home = crate::temp::sessions(&self.app.lake); // (the node's sessions, which this connection's ends in)
+        self.app.lake.node.tasks.spawn_as(crate::auth::Door, async move {
+            let _used = used;
+            served.await;
             if let Some(at) = &home {
                 at.end(&session);
             }
@@ -82,6 +129,34 @@ struct Backend {
     again: std::sync::Mutex<Option<Again>>,                // (how that sign-in is checked again: `signed`)
     copy: std::sync::Mutex<Option<Pending>>,               // (its COPY FROM STDIN under way: the connection's own, so its bytes end with it)
     me: std::sync::Weak<Backend>,                          // (a statement runs on the queries' runtime: `told`)
+    parsed: std::sync::Mutex<std::collections::HashSet<String>>, // (the names its Parses gave, which pgwire's store can't list: `forgotten`)
+    forget: std::sync::Mutex<Option<Forget>>,              // (what the statement just run dropped of them: `forgets`)
+}
+
+/// What a statement drops of the statements the protocol prepared (a Parse's), as Postgres's does.
+enum Forget {
+    One(String), // DEALLOCATE name (psycopg sends it as it lets one go)
+    All,         // DEALLOCATE ALL
+    Everything,  // DISCARD ALL: the portals too
+}
+
+/// The statements and portals `sql` drops from pgwire's store once it has run (`Backend::forgotten`), as Postgres's
+/// DEALLOCATE drops a statement the protocol prepared as well as one PREPARE made, so a pooled connection's next client
+/// can't run what the last one parsed (under its settings, its language among them).
+fn forgets(sql: &str) -> Option<Forget> {
+    let words = crate::text::first_word(sql).trim_end_matches(';').split_whitespace().collect::<Vec<_>>();
+    let is = |w: &str, as_: &str| w.eq_ignore_ascii_case(as_);
+    let named = |n: &str| match n.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        _ if is(n, "all") => Forget::All,
+        Some(quoted) => Forget::One(quoted.to_string()),
+        None => Forget::One(n.to_lowercase()), // (a name as SQL reads one: folded, as the protocol's are written by drivers)
+    };
+    match words.as_slice() {
+        [d, a] if is(d, "discard") && is(a, "all") => Some(Forget::Everything),
+        [d, p, n] if is(d, "deallocate") && is(p, "prepare") => Some(named(n)),
+        [d, n] if is(d, "deallocate") => Some(named(n)),
+        _ => None,
+    }
 }
 
 /// How a connection's sign-in is checked again (`Backend::signed`). Postgres checks a role's privileges at every statement, so
@@ -117,7 +192,11 @@ struct Startup {
     plain: tokio::sync::Mutex<bool>, // (a token asked for as a plain password)
     oauth: tokio::sync::Mutex<Option<Bearer>>, // (a token asked for by OAUTHBEARER, psql 18's)
     cancels: Arc<ConnectionManager>, // (the server's connections, by the key a cancel request names)
+    peer: Option<Peer>, // (a client its host passed on: `peer`)
 }
+
+/// A client's address, and whether it came over TLS.
+pub type Peer = (std::net::SocketAddr, bool);
 
 /// OAUTHBEARER's exchange (RFC 7628, as psql 18 speaks it; ADR-074): a client with no token yet, or a
 /// token refused, is told where the provider is, answers `\x01`, and is refused; psql then gets a token
@@ -192,6 +271,11 @@ async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAd
 }
 
 impl Startup {
+    /// The client's address and whether it came over TLS: its connection's, or what its host said of a client it passed on
+    /// (`Door::take_passed`), since this end shows neither (pgwire names a pair of sockets 127.0.0.1, not secure): a
+    /// password's rule, a refused sign-in's count and the audit go by the client (11-14 audit L1).
+    fn peer(&self, client: &impl ClientInfo) -> Peer { self.peer.unwrap_or((client.socket_addr(), client.is_secure())) }
+
     /// Signed in: in the database the client named at startup (`dbname`), then ready for queries. A name that is a
     /// database here (`ddl::database`: an attached lake, a clone among them) starts the session in it, as `USE DATABASE`
     /// does, with the signed-in user's rights: `psql -d br` reads and writes `br`, never the lake it was cloned from.
@@ -250,7 +334,7 @@ impl Startup {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let app = &self.backend.app;
-        let from = Some(client.socket_addr());
+        let from = Some(self.peer(client).0);
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let mut oauth = self.oauth.lock().await;
         let Some(bearer) = oauth.as_mut() else { return Ok(()) };
@@ -299,7 +383,8 @@ impl StartupHandler for Startup {
     {
         use pgwire::messages::startup::Authentication;
         let app = &self.backend.app;
-        let from = Some(client.socket_addr());
+        let (at, secure) = self.peer(client); // (the client's: `peer`)
+        let from = Some(at);
         let ip = from.map(|a| a.ip()); // (failed sign-ins are counted per address and user name: `auth::guessing`)
         let wrong = async |user: &str| {
             crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password").await;
@@ -307,7 +392,7 @@ impl StartupHandler for Startup {
         };
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
-                if !crate::tls::pg_allowed(client.is_secure(), client.socket_addr()) {
+                if !crate::tls::pg_allowed(secure, at) {
                     return Err(fatal(crate::tls::PLAIN.into()));
                 }
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
@@ -315,7 +400,7 @@ impl StartupHandler for Startup {
                 let epoch = app.lake.cat.rights_version(); // (before it is asked: a user made after it moves the version past it)
                 if app.open().await {
                     let who = crate::auth::Principal { epoch, ..crate::auth::Principal::of(crate::auth::Role::Admin) };
-                    self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(Again::Open));
+                    self.backend.signed_in(who.at("postgres", from), Some(Again::Open));
                     return self.ready(client).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -332,7 +417,7 @@ impl StartupHandler for Startup {
                 if no_password && !tokens && self.ask_oauth(client, listed).await? {
                     return Ok(());
                 }
-                let tokens_only = listed || (no_password && crate::tls::may_send_password(client.is_secure(), client.socket_addr()) && crate::sso::anyone(&app.lake).await);
+                let tokens_only = listed || (no_password && crate::tls::may_send_password(secure, at) && crate::sso::anyone(&app.lake).await);
                 *self.plain.lock().await = tokens_only;
                 client.send(PgWireBackendMessage::Authentication(if tokens_only { Authentication::CleartextPassword } else { Authentication::SASL(vec!["SCRAM-SHA-256".into()]) })).await?;
             }
@@ -342,7 +427,7 @@ impl StartupHandler for Startup {
                 let password = m.into_password()?.password;
                 let token = crate::users::is_token(&user, &password);
                 // (a user's password crosses only TLS from another machine; a token may, as `tls.rs` says)
-                if !token && !crate::tls::may_send_password(client.is_secure(), client.socket_addr()) {
+                if !token && !crate::tls::may_send_password(secure, at) {
                     return Err(fatal(crate::tls::PASSWORD_PLAIN.into()));
                 }
                 if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
@@ -364,7 +449,7 @@ impl StartupHandler for Startup {
                     true => Again::Token { user: user.clone(), token: password.clone() },
                     false => Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() },
                 };
-                self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
+                self.backend.signed_in(who.at("postgres", from), Some(again));
                 return self.ready(client).await;
             }
             PgWireFrontendMessage::PasswordMessageFamily(m) => {
@@ -406,7 +491,7 @@ impl StartupHandler for Startup {
                         };
                         let Some(who) = who else { return Err(wrong(&user).await) };
                         let again = Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() };
-                        self.backend.signed_in(who.at("postgres", Some(client.socket_addr())), Some(again));
+                        self.backend.signed_in(who.at("postgres", from), Some(again));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
                         return self.ready(client).await;
                     }
@@ -474,6 +559,23 @@ fn plain(e: anyhow::Error) -> PgWireError { worded(e, false) }
 impl Backend {
     /// This connection's session, with its node's sessions (the scope its statements run in: `temp::SESSION`).
     fn named(&self) -> Option<crate::temp::Named> { crate::temp::named(&self.app.lake, Some(self.session.clone())) }
+
+    /// What the statements just run dropped of the protocol's (`forgets`), taken out of pgwire's store, which can't list
+    /// its statements: their names are this connection's Parses'.
+    fn forgotten<S: PortalStore>(&self, store: &S) {
+        let Some(f) = self.forget.lock().unwrap().take() else { return };
+        let mut parsed = self.parsed.lock().unwrap();
+        match &f {
+            Forget::One(name) => {
+                store.rm_statement(name);
+                parsed.remove(name);
+            }
+            Forget::All | Forget::Everything => parsed.drain().for_each(|n| store.rm_statement(&n)),
+        }
+        if let Forget::Everything = f {
+            store.clear_portals();
+        }
+    }
 
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
@@ -555,13 +657,17 @@ impl Backend {
             });
         }
         if crate::set::is(&sql) {
-            // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: this connection's (round 31)
-            return match crate::set::statement(&self.app.lake, &sql, &self.who().scope).await {
+            // SET, RESET, PREPARE, EXECUTE, DEALLOCATE, DISCARD: this connection's (round 31)
+            let out = match crate::set::statement(&self.app.lake, &sql, &self.who().scope).await {
                 Ok(crate::set::Done::Said(kind)) => Ok(Response::Execution(tag(&kind, None))),
                 Ok(crate::set::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
                 Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(tag(&Kind::new("DEALLOCATE"), None))), // (a statement the protocol prepared: pgwire's)
                 Err(e) => Err(self.err()(e)),
             };
+            if let Some(f) = forgets(&sql).filter(|_| out.is_ok()) {
+                *self.forget.lock().unwrap() = Some(f); // (dropped from pgwire's store once the message is answered: `forgotten`)
+            }
+            return out;
         }
         if let Some(r) = session_command(&sql) {
             return Ok(r);
@@ -642,7 +748,11 @@ impl Backend {
         };
         let (out, heard) = crate::panics::work(&self.app.lake.node, true, Box::pin(run)).await.unwrap_or_else(|m| (Err(self.err()(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
         for n in heard {
-            let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
+            let (severity, code, n) = match n.strip_prefix("WARNING: ") {
+                Some(w) => ("WARNING", "01000", w.to_string()), // (a cut answer's: `answer::cut_said`)
+                None => ("NOTICE", "00000", n),
+            };
+            let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new(severity.into(), code.into(), n).into())).await; // (a client gone: the answer fails too)
         }
         if trace() {
             eprintln!("pg told: {} µs: {}", t0.elapsed().as_micros(), sql.chars().take(60).collect::<String>());
@@ -669,6 +779,18 @@ impl Backend {
 
     /// Whoever signed in on this connection (nobody, before).
     /// An error in the words this connection's sign-in may read (`worded`).
+    /// The language this session set itself (`set::own_language`). The port's sessions read Pondra's SQL otherwise,
+    /// whatever the node's language: it is the Postgres SQL its clients' drivers write.
+    fn language(&self) -> Option<&'static str> {
+        crate::temp::SESSION.sync_scope(self.named(), crate::set::own_language)
+    }
+
+    /// A statement in `language` (`language` above, as the message came) as Pondra's SQL (`statement::in_language`).
+    fn in_language(&self, language: Option<&str>, sql: &str) -> PgWireResult<String> {
+        let read = language.map_or(Ok(None), |l| crate::statement::in_language(l, sql)).map_err(self.err())?;
+        Ok(read.unwrap_or_else(|| sql.to_string()))
+    }
+
     fn err(&self) -> impl Fn(anyhow::Error) -> PgWireError + Send + Sync + 'static {
         let shows = self.who().scope.shows_code();
         move |e| worded(e, shows)
@@ -885,8 +1007,8 @@ impl Backend {
     async fn answer(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::app::Kept;
         let scope = self.signed().await?.scope; // (what its sign-in may read: planned for it, and its answer kept under its key)
-        let version = match crate::txn::open() {
-            true => None,
+        let version = match crate::txn::open() || scope.max_rows().is_some() {
+            true => None, // (a cut answer says so each time it is asked: `answer::cut`)
             false => self.app.remembers(sql, &scope).await,
         };
         let Some(version) = version else { return self.app.query(sql, None, &scope).await };
@@ -952,7 +1074,7 @@ fn tag(kind: &Kind, rows: Option<u64>) -> Tag {
 }
 
 /// Postgres's session commands: `SHOW` of a Postgres setting (what the session set, or what
-/// clients expect), and `DISCARD` and `CLOSE` accepted. (`SET` and the rest: `set.rs`.)
+/// clients expect), and `CLOSE` accepted. (`SET`, `DISCARD` and the rest: `set.rs`.)
 fn session_command(sql: &str) -> Option<Response> {
     if crate::script::is(sql) {
         return None; // (`BEGIN … END` that opens a block is a script's)
@@ -969,13 +1091,14 @@ fn session_command(sql: &str) -> Option<Response> {
     };
     match first.as_str() {
         "START" if crate::routines::start_of(sql).is_some() => None, // (`START CALL p(…)`: a run started)
-        "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "DISCARD" | "DEALLOCATE" | "CLOSE" if !commented => {
+        "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "DEALLOCATE" | "CLOSE" if !commented => {
             Some(Response::Execution(tag(&Kind::new(first.clone()), None)))
         }
         "SHOW" if show_column(sql).is_some() => {
             let (name, column) = show_column(sql)?;
             setting(&column, &crate::txn::shown(&name).or_else(|| crate::set::shown(&name)).unwrap_or_else(|| match name.as_str() {
                 "search_path" => "public".into(), // (no session path: this lake's public, as Postgres's `"$user", public` in its usual setup)
+                "language" => "pondra".into(), // (a session here reads Pondra's SQL until it sets its own, whatever the node's: `set::own_language`)
                 s if s.contains("standard_conforming_strings") => "on".into(),
                 s if s.contains("transaction") => "read committed".into(),
                 s if s.contains("server_version") => "16.0".into(),
@@ -1660,6 +1783,7 @@ impl SimpleQueryHandler for Backend {
         // (pgwire writes the answer's rows inside this call, so the drain counts the call until they are written)
         let _busy = self.app.lake.node.drain.busy();
         let out = self._on_query(client, query).await;
+        self.forgotten(client.portal_store());
         self.cancelled(&out);
         out
     }
@@ -1671,6 +1795,7 @@ impl SimpleQueryHandler for Backend {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let mut out = vec![];
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
+            let q = &self.in_language(self.language(), q)?; // (each read in the language the session has when it comes to it: a SET language before it counts)
             out.push(match Copy::of(q) {
                 Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await?,
                 _ => self.told(client, &user, q, &Format::UnifiedText).await?,
@@ -1698,6 +1823,7 @@ impl ExtendedQueryHandler for Backend {
         // (pgwire writes the rows this Execute sends inside this call, so the drain counts the call until they are written)
         let _busy = self.app.lake.node.drain.busy();
         let out = self._on_execute(&mut Corked::new(client), message).await;
+        self.forgotten(client.portal_store());
         if self.app.lake.node.drain.draining() {
             client.flush().await?; // (a node stopping writes the rows now, while the drain still counts this call)
         }
@@ -1732,6 +1858,9 @@ impl ExtendedQueryHandler for Backend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let name = message.name.clone().unwrap_or_else(|| pgwire::api::DEFAULT_NAME.to_owned());
+        self.parsed.lock().unwrap().insert(name.clone());
+        let mut message = message;
+        message.query = self.in_language(self.language(), &message.query)?; // (its `$1`s are placeholders in the language's grammar too)
         match StoredStatement::parse(client, &message, self.query_parser()).await? {
             Some(stmt) => client.portal_store().put_statement(Arc::new(stmt)),
             None => client.portal_store().put_empty_statement(&name),
@@ -2116,6 +2245,22 @@ fn trace() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_a_statement_drops_of_the_protocols() {
+        let said = |sql: &str| match forgets(sql) {
+            Some(Forget::One(n)) => n,
+            Some(Forget::All) => "(all)".into(),
+            Some(Forget::Everything) => "(everything)".into(),
+            None => "-".into(),
+        };
+        let cases = [("DISCARD ALL", "(everything)"), ("/* a pooler's */ discard all;", "(everything)"), ("DEALLOCATE ALL", "(all)"),
+            ("DEALLOCATE PREPARE ALL", "(all)"), ("DEALLOCATE _pg3_0", "_pg3_0"), ("deallocate prepare P1", "p1"), (r#"DEALLOCATE "P1""#, "P1"),
+            (r#"DEALLOCATE "all""#, "all"), ("DISCARD TEMP", "-"), ("DEALLOCATE", "-"), ("SELECT 1", "-")];
+        for (sql, drops) in cases {
+            assert_eq!(said(sql), drops, "{sql}");
+        }
+    }
 
     /// The types of `n` parameters of `sql`, as `arithmetic_types` leaves them (TEXT where nothing says).
     fn typed(sql: &str, n: usize) -> Vec<Type> {

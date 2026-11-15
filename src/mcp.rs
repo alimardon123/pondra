@@ -267,7 +267,7 @@ async fn list(app: &App, scope: &crate::rights::Scope) -> Result<Value> {
             // (a table granted in part: the columns granted, as every listing shows them: `rights::Scope::columns`)
             let shown = match prefix.is_empty() {
                 true => scope.columns(name),
-                false => scope.named("select", &format!("{prefix}{name}")),
+                false => scope.columns_named(&format!("{prefix}{name}")),
             }
             .flatten();
             let reads = |c: &str| shown.as_ref().is_none_or(|s| s.contains(c));
@@ -300,12 +300,23 @@ async fn query(app: &App, who: &crate::auth::Principal, sql: &str) -> Result<Str
     let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
     let how = crate::statement::How { job: None, spread: None, after: None, stale: None };
     let who = crate::routines::Who::signed(who.clone(), who.role, false);
-    match crate::auth::reading(crate::statement::run(app, req, how, who, &McpWire)).await? { // (nothing it runs moves a sequence: a view's nextval neither)
-        crate::statement::Answer::Own(text) => Ok(text),
-        crate::statement::Answer::Done(v) => Ok(v.to_string()),
-        crate::statement::Answer::Rows(batches) => rows_json(&batches),
+    let (out, heard) = crate::routines::with_notices(crate::auth::reading(crate::statement::run(app, req, how, who, &McpWire))).await; // (nothing it runs moves a sequence: a view's nextval neither)
+    let text = match out? {
+        crate::statement::Answer::Own(text) => text,
+        crate::statement::Answer::Done(v) => v.to_string(),
+        crate::statement::Answer::Rows(batches) => rows_json(&batches)?,
         _ => anyhow::bail!("an answer no tool asks for"), // (MCP keeps no answer and streams none)
+    };
+    if heard.is_empty() {
+        return Ok(text);
     }
+    // (what it said, a cut answer's WARNING among them, `answer::cut_said`: put in as written, never parsed back, as `Rows` says)
+    let said = serde_json::to_string(&heard)?;
+    Ok(match text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
+        Some(inside) if inside.trim().is_empty() => format!("{{\"notices\":{said}}}"),
+        Some(inside) => format!("{{{inside},\"notices\":{said}}}"),
+        None => text,
+    })
 }
 
 /// MCP's wire: a query's rows as JSON, kept nowhere (`kept_as` None: no results cache for a tool's answer).

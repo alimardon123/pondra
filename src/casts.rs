@@ -5,14 +5,14 @@
 //! value written into an integer column, or a constant or a setval's value cast into one, is rounded the
 //! same way (`into`).
 //!
-//! In Spark's dialect (`datafusion.sql_parser.dialect = 'spark'`, and `spark_sql('…')`, whose casts Pondra's
-//! SQL turns into `pondra_truncate`) the fraction is cut toward zero instead, as Spark and Polars cast:
-//! `CAST(2.7 AS INT)` is 2 and `CAST(-2.7 AS INT)` is -2 (`Rounds` picks it by the dialect).
+//! In Spark SQL (a session's `SET language = 'spark'`, and `spark_sql('…')`) a cast to an integer is written as a cast of
+//! `pondra_truncate(x)` as the statement arrives (`sparksql.rs`): the fraction is cut toward zero, as Spark and Polars
+//! cast (`CAST(2.7 AS INT)` is 2 and `CAST(-2.7 AS INT)` is -2), and `Rounds` leaves a value already cut alone.
 use datafusion::arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, AsArray, PrimitiveArray, StringArray};
 use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Decimal128Type, Decimal256Type, Decimal32Type, Decimal64Type, DecimalType, Float32Type, Float64Type};
 use datafusion::arrow::error::ArrowError;
-use datafusion::common::config::{ConfigOptions, Dialect};
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::expr::{Cast, TryCast};
@@ -261,11 +261,6 @@ fn decimal<T: DecimalType>(a: &PrimitiveArray<T>, rounds: bool) -> Result<Primit
 /// this one, and a second would need its own entry there).
 static WHOLE: LazyLock<[Arc<ScalarUDF>; 2]> = LazyLock::new(|| [udf(false), udf(true)]);
 
-/// The function a cast to an integer is rounded (or truncated) by.
-fn function(truncate: bool) -> &'static Arc<ScalarUDF> {
-    &WHOLE[truncate as usize]
-}
-
 fn udf(truncate: bool) -> Arc<ScalarUDF> {
     Arc::new(ScalarUDF::new_from_impl(Whole { truncate, signature: Signature::any(1, Volatility::Immutable) }))
 }
@@ -306,7 +301,7 @@ pub fn register(ctx: &SessionContext) {
 }
 
 /// Puts `pondra_whole` in every cast (and `TRY_CAST`) of a decimal with places or a float to an
-/// integer, or `pondra_truncate` in Spark's dialect. It runs after type coercion, so the casts coercion
+/// integer. It runs after type coercion, so the casts coercion
 /// adds round too. `arrow_cast(x, 'Int64')` becomes the cast it stands for here (the optimizer's
 /// simplifier would make it one later, past this rule).
 #[derive(Debug)]
@@ -317,8 +312,7 @@ impl AnalyzerRule for Rounds {
         "pondra_casts_round"
     }
 
-    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
-        let truncate = matches!(config.sql_parser.dialect, Dialect::Spark | Dialect::Databricks); // (Spark's casts cut a fraction; Pondra's round it)
+    fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up_with_subqueries(|plan| {
             // (most plans cast nothing to an integer: their inputs' schemas aren't merged for nothing)
             let mut any = false;
@@ -336,7 +330,7 @@ impl AnalyzerRule for Rounds {
             let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan);
             plan.map_expressions(|e| {
                 let name = names.save(&e);
-                let e = e.transform_up(|e| rounded(e, &schema, truncate))?;
+                let e = e.transform_up(|e| rounded(e, &schema))?;
                 Ok(e.update_data(|e| name.restore(e)))
             })
         })
@@ -363,9 +357,9 @@ fn already_cut(e: &Expr) -> bool {
     matches!(e, Expr::ScalarFunction(f) if matches!(f.func.name(), "pondra_whole" | "pondra_truncate"))
 }
 
-/// A cast to an integer of a value with a fraction, as a cast of that value rounded (or cut toward zero,
-/// in Spark's dialect). A value whose type isn't known yet (a parameter) is left as it is.
-fn rounded(e: Expr, schema: &DFSchema, truncate: bool) -> Result<Transformed<Expr>> {
+/// A cast to an integer of a value with a fraction, as a cast of that value rounded. A value whose type isn't known yet (a
+/// parameter) is left as it is.
+fn rounded(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let Some(t) = to_integer(&e) else { return Ok(Transformed::no(e)) };
     let value = match &e {
         Expr::Cast(c) => c.expr.as_ref(),
@@ -376,8 +370,7 @@ fn rounded(e: Expr, schema: &DFSchema, truncate: bool) -> Result<Transformed<Exp
     if already_cut(value) || !value.get_type(schema).is_ok_and(|v| fractional(&v)) {
         return Ok(Transformed::no(e));
     }
-    let f = function(truncate);
-    let cut = |v: Expr| Box::new(f.call(vec![v]));
+    let cut = |v: Expr| Box::new(WHOLE[0].call(vec![v]));
     Ok(Transformed::yes(match e {
         Expr::Cast(c) => Expr::Cast(Cast::new_from_field(cut(*c.expr), c.field)),
         Expr::TryCast(c) => Expr::TryCast(TryCast::new_from_field(cut(*c.expr), c.field)),
@@ -567,15 +560,16 @@ mod tests {
         assert_eq!(refused_cell("Division by zero"), None);
     }
 
-    /// Spark's dialect cuts a cast's fraction, Pondra's SQL rounds it, in the same session type: `SET` names the
-    /// dialect as a client does.
+    /// Pondra's SQL rounds a cast's fraction and Spark SQL's casts cut it, as they arrive: casts of `pondra_truncate`
+    /// (`sparksql.rs`). No cast asks a session's language or dialect, so one where DataFusion's dialect is Spark's rounds too.
     #[tokio::test]
-    async fn spark_s_dialect_cuts_a_fraction_and_pondra_s_rounds_it() {
-        let sql = "SELECT CAST(2.7 AS INT), CAST(-2.7 AS BIGINT), CAST(2.5 AS INT)";
+    async fn pondra_s_casts_round_a_fraction_and_spark_s_cut_it() {
         let plain = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         let spark = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         spark.sql("SET datafusion.sql_parser.dialect = 'spark'").await.unwrap().collect().await.unwrap();
-        for (ctx, want) in [(&plain, ["3", "-3", "3"]), (&spark, ["2", "-2", "2"])] {
+        let pondra = "SELECT CAST(2.7 AS INT), CAST(-2.7 AS BIGINT), CAST(2.5 AS INT)";
+        let cut = "SELECT CAST(pondra_truncate(2.7) AS INT), CAST(pondra_truncate(-2.7) AS BIGINT), CAST(pondra_truncate(2.5) AS INT)";
+        for (ctx, sql, want) in [(&plain, pondra, ["3", "-3", "3"]), (&spark, pondra, ["3", "-3", "3"]), (&plain, cut, ["2", "-2", "2"])] {
             let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
             let got: Vec<String> = (0..3).map(|i| array_value_to_string(batches[0].column(i), 0).unwrap()).collect();
             assert_eq!(got, want, "{sql}");

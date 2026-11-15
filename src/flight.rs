@@ -383,7 +383,7 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown,
     let batches = rows_of(w, got)?;
     let schema = match batches.is_empty() {
         false => first_announced(&batches),
-        true => match statement::plain_of(app, sql, &who.scope).await.map_err(w.err())? {
+        true => match statement::plain_of(app, &statement::as_pondra(sql).map_err(w.err())?, &who.scope).await.map_err(w.err())? {
             Some((_, one)) => planned(app, &one, &who.scope).await.map_err(w.err())?,
             None => Schema::empty(),
         },
@@ -452,7 +452,7 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<Strin
     .await?;
     let schema = first_announced(&batches);
     // (a read token's script could keep answers that no ticket reads: counted here, they are bounded by the query memory)
-    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| w.status(crate::query::too_big(crate::query::room_of(&pool))))?;
+    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| w.status(crate::query::too_big(&pool)))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let answers = lake.state::<Kept>().map_err(w.err())?;
     answers.0.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
@@ -557,6 +557,7 @@ where
 /// the schema and the end. An encoding error ends the stream with its status. `busy` is held until the stream ends or is
 /// dropped, as `piece_stream`'s is.
 fn whole(w: Worded, schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::node_state::Busy) -> Out<FlightData> {
+    let schema = crate::answer::with_cut(schema, &batches); // (a cut answer's stream says so: `MAX_ROWS`)
     // (at most one piece: the answer is encoded at once, its piece then its end, as the stream below writes them, and is
     // sent as those messages; an encoding error ends it after the messages before it, as the stream does)
     let mut pieces = crate::answer::pieces(batches.into_iter().map(|b| crate::answer::as_sent(b, Some("arrow"))));
@@ -966,11 +967,14 @@ impl FlightSqlService for Sql {
         let who = crate::routines::Who::signed(caller(&req), role, false); // (planned for its sign-in)
         let session = in_txn(crate::temp::sessions(&self.0.lake).as_deref(), who.name(), txn)?;
         let w = Worded::of(&who.scope);
-        if crate::routines::runs_procedure(&q.query) || crate::returning::of(&q.query).is_some() {
+        // (the looks read Pondra's SQL, in the language of the session it runs in, as its stream is: 11-13 audit L3; the
+        // ticket keeps the text as sent, which `statement::run` reads)
+        let read = in_session(crate::temp::named(&self.0.lake, session.clone()), async { statement::as_pondra(&q.query).map(|r| r.into_owned()).map_err(w.err()) }).await?;
+        if crate::routines::runs_procedure(&read) || crate::returning::of(&read).is_some() {
             // A CALL (or DO), or a write with RETURNING: run now, as every door runs one; the ticket reads back what it answered.
             return kept(&self.0, &q.query, who, session, req.into_inner()).await;
         }
-        if crate::write::parse(&q.query).is_some() {
+        if crate::write::parse(&read).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
             let (app, sql) = (self.0.clone(), q.query.clone());
             let rows = worked(w, app.lake.clone(), crate::temp::named(&app.lake, session), async move { write(&app, who, &sql).await }).await?;
@@ -978,7 +982,7 @@ impl FlightSqlService for Sql {
             return info(w, &crate::answer::arrow_schema(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
         // A query is planned here and run by its ticket; a script (several statements) can't be planned, so it runs now, as a CALL does.
-        let Some((_, one)) = in_session(crate::temp::named(&self.0.lake, session.clone()), async { statement::plain_of(&self.0, &q.query, &who.scope).await.map_err(w.err()) }).await? else {
+        let Some((_, one)) = in_session(crate::temp::named(&self.0.lake, session.clone()), async { statement::plain_of(&self.0, &read, &who.scope).await.map_err(w.err()) }).await? else {
             return kept(&self.0, &q.query, who, session, req.into_inner()).await;
         };
         let schema = in_session(crate::temp::named(&self.0.lake, session), async { planned(&self.0, &one, &who.scope).await.map_err(w.err()) }).await?;
