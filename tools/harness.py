@@ -490,9 +490,9 @@ def external():
     checks["a compression refused by name: a Parquet name's .gz (compressed inside the file), read_parquet's compression, COPY COMPRESSION lz4, COMPRESSION on Arrow"] = \
         "compressed inside the file" in refusal["parquet"] and "parquet has no option compression" in refusal["option"] \
         and "compression lz4" in refusal["codec"] and "COMPRESSION and ROW_GROUP_SIZE are Parquet's" in refusal["arrow"]
-    using, vector = refused("CREATE TABLE ut (a BIGINT) USING delta"), refused("CREATE TABLE vt (v VECTOR(3))")
-    checks["CREATE TABLE … USING delta and VECTOR(3) are refused by name with SQLSTATE 0A000, and no table is made"] = \
-        using[0] != 200 and using[1] == "0A000" and "USING delta" in using[2] and vector[0] != 200 and vector[1] == "0A000" and "VECTOR(n)" in vector[2] \
+    using, vector = refused("CREATE TABLE ut (a BIGINT) USING delta"), refused("CREATE TABLE vt (v HALFVEC(3))")
+    checks["CREATE TABLE … USING delta and HALFVEC(3) are refused by name with SQLSTATE 0A000, and no table is made"] = \
+        using[0] != 200 and using[1] == "0A000" and "USING delta" in using[2] and vector[0] != 200 and vector[1] == "0A000" and "HALFVEC(n)" in vector[2] \
         and "not found" in err("SELECT * FROM ut") and "not found" in err("SELECT * FROM vt")
     # The program that started the node has its answers remembered too (apart from anyone else's),
     # but never a statement that reads files: a file here changes on its own.

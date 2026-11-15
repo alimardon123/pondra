@@ -125,8 +125,10 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
     let (retention, columns, ttl) = async {
         let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
-        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`).
-        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::type_name(&crate::answer::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
+        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`), and a fixed-size
+        // list keeps its size only where the lake does (format 8: `answer::fixed_name`).
+        let fixed = crate::format::fixed(lake).await?;
+        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::fixed_name(&crate::answer::dtype(t)?, fixed)))).collect::<Result<Vec<_>>>()?;
         let ttl = ttl.map(|t| -> Result<(String, u64)> {
             let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
             ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "TTL: a timestamp or date column of a keyed table");
@@ -882,7 +884,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
         }
         (None, None) => declared().await?,
     };
-    let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+    let fixed = crate::format::fixed(from).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
+    let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::fixed_name(f.data_type(), fixed))).collect();
     // (what the statement declares, read from its AST alone: `rules/create.rs`, refused in the order a node always has)
     let d = crate::rules::create::declared(c)?;
     if d.keyed() && !columns.iter().any(|(c, _)| c == "_deleted") {
@@ -981,10 +984,11 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
                 Ok(t) => crate::rules::create::sql_type(t)?,
                 Err(_) => None,
             };
+            let fixed = crate::format::fixed(lake).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.to_columns();
-            columns.push((column.to_string(), crate::answer::type_name(ctx.table("t").await?.schema().field(0).data_type())));
+            columns.push((column.to_string(), crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed)));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
                 spec["enums"] = j!({column: e});

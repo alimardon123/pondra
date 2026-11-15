@@ -532,10 +532,19 @@ pub fn compact(b: RecordBatch) -> RecordBatch {
     RecordBatch::try_new_with_options(b.schema(), columns, &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(b.num_rows()))).unwrap_or(b)
 }
 
-/// The name a table's columns record a type under (what `dtype` reads back).
-pub fn type_name(t: &DataType) -> String {
+/// The name a table's columns record a type under (what `dtype` reads back): a list as `T[]`, a fixed-size list too
+/// (`fixed_name` keeps its size, where the lake records it).
+pub fn type_name(t: &DataType) -> String { fixed_name(t, false) }
+
+/// `type_name`, a fixed-size list of a type that isn't a list kept as one when `fixed` (`FLOAT[3]`, `VECTOR(3)`:
+/// `FixedSizeList(3 x Float32)`, as Arrow writes and reads it): a lake at format 8 records it so (`format::FIXED`), a node
+/// from before reading it as a list. Else, and below, a list.
+pub fn fixed_name(t: &DataType, fixed: bool) -> String {
     match stored(t) {
-        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => format!("{}[]", type_name(f.data_type())),
+        DataType::FixedSizeList(f, n) if fixed && !f.data_type().is_nested() => {
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(stored(f.data_type()), true)), n).to_string()
+        }
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => format!("{}[]", fixed_name(f.data_type(), fixed)),
         t => t.to_string(),
     }
 }
@@ -670,6 +679,19 @@ pub fn dtype(t: &str) -> Result<DataType> {
             _ => t.parse::<DataType>().map_err(|e| anyhow::anyhow!("unknown column type {t}: {e}"))?,
         },
     })
+}
+
+/// The element type a list column's stored type names: `T` of `T[]`, and of a fixed-size list
+/// (`FixedSizeList(3 x Float32)`, a `VECTOR(3)`), which Iceberg and Delta keep as a list of any length.
+pub fn list_item(t: &str) -> Option<String> {
+    match t.strip_suffix("[]") {
+        Some(item) => Some(item.to_string()),
+        None if t.starts_with("FixedSizeList(") => match t.parse() {
+            Ok(DataType::FixedSizeList(f, _)) => Some(f.data_type().to_string()),
+            _ => None,
+        },
+        None => None,
+    }
 }
 
 /// How a SQL type is kept: strings as Utf8; timestamps in microseconds, as Iceberg, Delta, Spark
