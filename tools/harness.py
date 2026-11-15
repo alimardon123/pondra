@@ -29631,8 +29631,9 @@ def publishing():
     left out of that format, and the statement says so; and nothing of theirs is written as Delta or
     Iceberg (a finished view's partial rows were, before). Then the files' ranges: the formats carry
     each file's min and max and NULLs, so every reader (Pondra, DuckDB, delta-rs, PyIceberg) answers
-    a filter as the model does, and a reader skips the files a filter rules out. And the Iceberg view lists only the
-    snapshots whose files are still there: none from before a merge that let files go."""
+    a filter as the model does, and a reader skips the files a filter rules out. A list column reads with its values in
+    each of them. And the Iceberg view lists only the snapshots whose files are still there: none from before a merge that
+    let files go."""
     import urllib.request
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=0.5, publish="delta,iceberg").start()
@@ -29666,6 +29667,30 @@ def publishing():
         checks["…the others never: no Iceberg or Delta of them"] = not any(iceberg(t) for t in ("spans", "avgs", "hist")) and (A.s3 or not any(
             os.path.exists(os.path.join(lake, "data", t, d)) for t in ("spans", "avgs", "hist") for d in ("_delta_log", "metadata")))
         checks["…and read as before"] = q("SELECT g, a FROM avgs ORDER BY g") == [{"g": "a", "a": 3.0}, {"g": "b", "a": 6.0}] and q("SELECT count(*) AS n FROM spans") == [{"n": 1}]
+        # A list column (an embedding) reads with its values in every reader: its elements carry a field id in the files, the
+        # Iceberg schema's element-id (`tier::field_ids`), which DuckDB's iceberg_scan matches them by (NULLs before).
+        import open_check
+        q("CREATE TABLE embs (id BIGINT, e FLOAT[])")
+        q("INSERT INTO embs VALUES (1, [1.0, 2.0]), (2, [3.0, 4.5, 6.0])")
+        q("CHECKPOINT")
+        want_embs = [[1, [1.0, 2.0]], [2, [3.0, 4.5, 6.0]]]
+        delta_opts = {"AWS_ENDPOINT_URL": os.environ["AWS_ENDPOINT"], "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"], "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
+                      "AWS_REGION": "auto", "AWS_S3_ALLOW_UNSAFE_RENAME": "true"} if A.s3 else None
+        def embs():
+            from pyiceberg.table import StaticTable
+            import deltalake, pyarrow as pa
+            duck, meta = open_check.duck(lake), open_check.iceberg_metadata(lake, "embs")
+            rows = lambda t: [[r["id"], r["e"]] for r in sorted(t.to_pylist(), key=lambda r: r["id"])]
+            return {
+                "DuckDB iceberg_scan": _try(lambda: [list(r) for r in duck.execute(f"SELECT id, e FROM iceberg_scan('{meta}') ORDER BY id").fetchall()]),
+                "DuckDB delta_scan": _try(lambda: [list(r) for r in duck.execute(f"SELECT id, e FROM delta_scan('{lake}/data/embs') ORDER BY id").fetchall()]),
+                "PyIceberg": _try(lambda: rows(StaticTable.from_metadata(meta, properties=open_check.iceberg_props(lake)).scan().to_arrow())),
+                "delta-rs": _try(lambda: rows(pa.table(deltalake.QueryBuilder().register("t", deltalake.DeltaTable(f"{lake}/data/embs", storage_options=delta_opts)).execute("SELECT id, e FROM t").read_all()))),
+            }
+        lists = until(lambda: _try(embs), {k: want_embs for k in ("DuckDB iceberg_scan", "DuckDB delta_scan", "PyIceberg", "delta-rs")}, 60)
+        checks["a list column: its values in DuckDB's iceberg_scan and delta_scan, PyIceberg and delta-rs"] = all(v == want_embs for v in (lists or {}).values()) and len(lists or {}) == 4
+        if not checks["a list column: its values in DuckDB's iceberg_scan and delta_scan, PyIceberg and delta-rs"]:
+            print(f"publishing: a list column: the readers said {lists}")
         # The ranges the open formats carry (`delta.rs` `stats`, `iceberg.rs` `entry`): each file's min and max and its NULLs,
         # so a reader skips the files a filter rules out. Each batch is one file (a CHECKPOINT after each INSERT: small files merge
         # only 8 at a time), and every reader answers each filter as the model does.
