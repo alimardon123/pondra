@@ -67,6 +67,7 @@ log catalog
 manifest catalog
 members catalog
 objects catalog
+partition catalog
 records catalog
 replica catalog
 scan catalog

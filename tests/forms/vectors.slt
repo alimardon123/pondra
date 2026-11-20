@@ -42,5 +42,25 @@ SELECT arrow_typeof(CAST([1, 2, 3] AS VECTOR(3)))
 ----
 FixedSizeList(3 x Float32)
 
+# The text form, pgvector's and DuckDB's [1,2,3] or Postgres's {1,2,3}, goes into a VECTOR and a list column, and back out
+statement ok
+INSERT INTO emb VALUES (3, '[7,8,9]', '{1,2}', '[0.5, 1]')
+
+query TTT
+SELECT v::text, f::text, d::text FROM emb WHERE id = 3
+----
+[7.0, 8.0, 9.0] [1.0, 2.0] [0.5, 1.0]
+
+query T
+SELECT arrow_typeof('[1,2,3]'::vector(3))
+----
+FixedSizeList(3 x Float32)
+
+statement error 22000 expected 3 dimensions, not 2
+INSERT INTO emb VALUES (4, '[1,2]', NULL, NULL)
+
+statement error 22P02 malformed array literal
+INSERT INTO emb VALUES (4, '[1,2', NULL, NULL)
+
 statement ok
 DROP TABLE emb

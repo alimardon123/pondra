@@ -130,7 +130,7 @@ async fn produce(c: &Cluster, name: &str, batches: u64, size: u64) {
 /// again. Then, started without them: every event is there once, and so is the task's output and each view's.
 #[tokio::test(start_paused = true)]
 async fn crashes_and_kills_lose_and_double_nothing() {
-    let (producers, batches, size) = (3u64, 20u64, 10u64);
+    let (producers, batches, size) = (3u64, 40u64, 10u64);
     for seed in seeds() {
         let c = Cluster::new(seed, 1);
         c.set_start(|s| (s.flush_ms, s.tier_secs, s.task_ms, s.retain_secs) = (50, 1.0, 200, 0));
@@ -154,7 +154,8 @@ async fn crashes_and_kills_lose_and_double_nothing() {
         };
         let chaos = async {
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(200 + dice(1300))).await;
+                // (the harness's pace is 0.2 to 1.5 s, but its writes take real time: the sim's take the commits' alone)
+                tokio::time::sleep(Duration::from_millis(100 + dice(400))).await;
                 if dice(2) == 0 {
                     c.kill(0);
                     kills += 1;
@@ -250,5 +251,79 @@ async fn finals_on_three_are_each_kept_once_through_two_leader_kills() {
         assert_eq!(rows(&groups).first(), Some(&serde_json::json!({"g": 80, "d": 80})), "seed {seed}: each group once");
         assert_eq!(killed, 2);
         println!("seed {seed}: 80 final groups once on each of three members, the leader killed twice");
+    }
+}
+
+/// SurrealDB's R3: keyed writes from three members at once (a follower's go to the leader), while the leader is killed
+/// once: no key is ever doubled, every key written is there, and each holds the value one of its writers wrote last
+/// (a writer's own writes land in order), on every member.
+#[tokio::test(start_paused = true)]
+async fn keyed_writes_from_three_members_never_double_a_key() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        for m in 0..3 {
+            c.start(m).await.unwrap();
+        }
+        c.sql(0, "CREATE TABLE kv (id BIGINT PRIMARY KEY, v BIGINT)").await.unwrap();
+        let (cluster, rounds) = (&c, AtomicUsize::new(0));
+        let rounds = &rounds;
+        let writer = |m: usize| async move {
+            let (mut roll, mut last) = (seed.wrapping_mul(31).wrapping_add(m as u64), BTreeMap::new());
+            for round in 0..30u64 {
+                let rows: BTreeMap<u64, u64> = (0..20)
+                    .map(|j| {
+                        roll = roll.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                        ((roll >> 33) % 100, m as u64 * 1_000_000 + round * 100 + j)
+                    })
+                    .collect();
+                let values = rows.iter().map(|(k, v)| format!("({k}, {v})")).collect::<Vec<_>>().join(", ");
+                let sql = format!("INSERT INTO kv VALUES {values} ON CONFLICT (id) DO UPDATE SET v = excluded.v");
+                // (to its own member until taken: one a kill cut short is sent again, and sets the same values again)
+                let mut tries = 0;
+                while !cluster.up(m) || {
+                    let r = cluster.sql(m, &sql).await;
+                    tries += 1;
+                    assert!(tries < 100, "seed {seed}: member {m}'s write was never taken: {r:?}\n{}", cluster.met());
+                    r.is_err()
+                } {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                last.extend(rows);
+                rounds.fetch_add(1, Relaxed);
+            }
+            last
+        };
+        let chaos = async {
+            while rounds.load(Relaxed) < 30 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let mut lead = None;
+            for m in 0..3 {
+                if c.role(m).await.as_deref() == Some("leader") {
+                    lead = Some(m);
+                }
+            }
+            let lead = lead.unwrap_or_else(|| panic!("seed {seed}: no member leads\n{}", c.met()));
+            c.kill(lead);
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            c.start(lead).await.unwrap();
+        };
+        let (lasts, ()) = futures::join!(futures::future::join_all((0..3).map(writer)), chaos);
+        let keys: BTreeSet<u64> = lasts.iter().flat_map(|l| l.keys().copied()).collect();
+        for m in 0..3 {
+            let seen = || async {
+                let got = rows(&c.sql(m, "SELECT id, v FROM kv ORDER BY id").await.ok()?);
+                Some(got.iter().map(|r| (r["id"].as_u64().unwrap_or(u64::MAX), r["v"].as_u64().unwrap_or(u64::MAX))).collect::<Vec<_>>())
+            };
+            let right = |got: &[(u64, u64)]| got.iter().map(|(k, _)| *k).collect::<BTreeSet<_>>() == keys && got.len() == keys.len() && got.iter().all(|(k, v)| lasts.iter().any(|l| l.get(k) == Some(v)));
+            c.until(&format!("member {m} holds each key once, at a last write"), Duration::from_secs(30), || async { seen().await.is_some_and(|g| right(&g)) })
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        }
+        let groups = c.sql(0, "SELECT count(*) AS n, count(DISTINCT id) AS d FROM kv").await.unwrap();
+        assert_eq!(rows(&groups).first(), Some(&serde_json::json!({"n": keys.len(), "d": keys.len()})), "seed {seed}: a key doubled");
+        println!("seed {seed}: {} keys from three members, each once, the leader killed once", keys.len());
     }
 }

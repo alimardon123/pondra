@@ -840,10 +840,7 @@ impl TableProvider for HotFiles {
         }
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
         let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| plain_file(f, deletes));
-        // (a file written before its entry kept its columns' sizes is planned from its footer, as before: without them a
-        // plan would size its text by its rows alone, and pick other sides for its joins)
-        let sized = |f: &DataFile| self.schema.fields().iter().all(|c| c.data_type().primitive_width().is_some() || f.sizes.contains_key(c.name()));
-        let (planned, footed): (Vec<&DataFile>, Vec<&DataFile>) = plain.iter().copied().partition(|f| sized(f));
+        let (planned, footed): (Vec<&DataFile>, Vec<&DataFile>) = plain.iter().copied().partition(|f| crate::scan::sized(f, &self.schema));
         // The loads this scan starts wait on this sender: the files of its plan carry it (`gated`), so they start when the
         // last copy of those files goes, with the query's plan. Here the scan lets go of its own copy.
         let (go, gate) = tokio::sync::oneshot::channel::<()>();
@@ -855,6 +852,7 @@ impl TableProvider for HotFiles {
             plans.push(gated(told(table.scan(state, projection, filters, limit).await?, &self.known)?, &holder)?);
         }
         if !footed.is_empty() {
+            crate::metrics::add(&self.lake.node.metrics.footers_planned, footed.len() as u64);
             let urls = footed.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
             let options = ParquetReadOptions::default().to_listing_options(state.config(), state.default_table_options());
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());

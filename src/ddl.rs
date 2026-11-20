@@ -1820,7 +1820,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         ensure!(matches!(change, Change::Drop { if_exists: true }), crate::rules::alter::no_column(&name, column));
         return Ok(j!({"table": name, "unchanged": true}));
     };
-    let partition = m.partition.as_deref().map(|p| p.split_once('(').map_or(p, |(_, c)| c.trim_end_matches(')')).to_string()); // (its own: the edits below take the entry)
+    let partition: Vec<String> = m.partition.as_deref().and_then(|p| crate::partition::Spec::parse(p).ok()).map_or(vec![], |s| s.columns().into_iter().map(str::to_string).collect()); // (its own: the edits below take the entry)
     let what = match change {
         Change::Rename(to) => {
             ensure!(!to.is_empty(), "a column needs a name");
@@ -1835,7 +1835,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         Change::Drop { .. } => {
             let role = match () {
                 _ if m.key.contains(&stored) => "key",
-                _ if partition.as_deref() == Some(stored.as_str()) => "partition_by",
+                _ if partition.contains(&stored) => "partition_by",
                 _ if m.ttl.as_ref().is_some_and(|(c, _)| *c == stored) => "ttl",
                 _ if m.order.as_ref() == Some(&stored) => "order_by",
                 _ => "",
@@ -1879,7 +1879,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                     return Ok(j!({"table": name, "unchanged": true}));
                 }
                 ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
-                ensure!(old == new || partition.as_deref() != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
+                ensure!(old == new || !partition.contains(&stored), "{column} is {name}'s partition_by column: its type stays");
                 m.retype_column(&stored, crate::answer::type_name(&new));
                 j!({"column": column, "type": m.col(&stored).map(|c| c.dtype.as_str())})
             }
