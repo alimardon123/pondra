@@ -7,6 +7,18 @@ use datafusion::arrow::datatypes::DataType;
 /// for an array, its element's).
 pub struct PgType(pub u32, pub &'static str, pub &'static str, pub i16, pub char, pub u32);
 
+/// pgvector's `vector`, and its array. pgvector's types have no oid of their own: each database gets one when CREATE
+/// EXTENSION runs, in the schema it names, public by default. Pondra's are fixed, in public (`schema`), above the oids
+/// the catalog gives the lake's objects (`pg_catalog::oid`: 16384 up to 2,000,016,384), so none lands on one, and below
+/// 2^31 for the drivers that hold an oid as a signed int. A VECTOR(n) column is still sent as `real[]`, which every
+/// driver reads as a list; the type is here for the drivers that look `vector` up to send one (pgvector's
+/// `register_vector`), so a parameter of it is read (`pg_values`). `bit` is there for the same call, which looks up both.
+pub const VECTOR: u32 = 2_100_000_001;
+pub const VECTORS: u32 = 2_100_000_002;
+
+/// A type's schema: pg_catalog's (11), or public's (2200) for pgvector's.
+pub fn schema(oid: u32) -> u32 { if oid == VECTOR || oid == VECTORS { 2200 } else { 11 } }
+
 pub const TYPES: &[PgType] = &[
     PgType(16, "bool", "boolean", 1, 'B', 1000), PgType(17, "bytea", "bytea", -1, 'U', 1001), PgType(18, "char", "\"char\"", 1, 'Z', 1002),
     PgType(19, "name", "name", 64, 'S', 1003), PgType(20, "int8", "bigint", 8, 'N', 1016), PgType(21, "int2", "smallint", 2, 'N', 1005),
@@ -18,7 +30,7 @@ pub const TYPES: &[PgType] = &[
     PgType(1184, "timestamptz", "timestamp with time zone", 8, 'D', 1185), PgType(1186, "interval", "interval", 16, 'T', 1187),
     PgType(1700, "numeric", "numeric", -1, 'N', 1231), PgType(2205, "regclass", "regclass", 4, 'N', 2210), PgType(2206, "regtype", "regtype", 4, 'N', 2211),
     PgType(2950, "uuid", "uuid", 16, 'U', 2951), PgType(3802, "jsonb", "jsonb", -1, 'U', 3807), PgType(2278, "void", "void", 4, 'P', 0),
-    PgType(2249, "record", "record", -1, 'P', 2287),
+    PgType(2249, "record", "record", -1, 'P', 2287), PgType(1560, "bit", "bit", -1, 'V', 1561), PgType(VECTOR, "vector", "vector", -1, 'U', VECTORS),
 ];
 
 pub fn arrays() -> impl Iterator<Item = (u32, String, String, u32)> {
@@ -67,6 +79,7 @@ pub fn format_type(oid: u32, typmod: i32) -> Option<String> {
         (1700, m) if m >= 4 => format!("numeric({},{})", (m - 4) >> 16, (m - 4) & 0xffff),
         (1043, m) if m >= 4 => format!("character varying({})", m - 4), // (a VARCHAR(n) column: n + 4, as Postgres keeps it)
         (1042, m) if m >= 4 => format!("character({})", m - 4),
+        (VECTOR | 1560, m) if m >= 1 => format!("{name}({m})"), // (pgvector keeps a vector's dimensions as they are, and bit(n) its n)
         _ => name,
     })
 }
