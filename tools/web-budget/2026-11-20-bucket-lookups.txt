@@ -1,0 +1,7 @@
++36_000
+
+The module's code order, mostly (#837, step 5 I3-b: a bucketed table's point lookups skip the other buckets' files).
+Into main's 4b03d1e (measured on CI's modules, brotli 11 as web_check.mjs runs it): its wasm 5,556 B over main's
+(59,469,373 against 59,463,817), its brotli 67.1 KB over (9,436,047 against 9,368,922), as #798's and #709's were:
+brotli's window finds fewer matches when the same code lands in another order. The budget was 34.2 KB above main, so
+this is the rest plus 3 KB of room.
