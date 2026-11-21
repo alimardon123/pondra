@@ -525,6 +525,14 @@ fn parsed_query(sql: &str) -> Option<datafusion::sql::parser::Statement> {
     }
 }
 
+/// `sql` as `state`'s parser reads it, from the statement's own parse when its looks made one and `state` parses as they
+/// did (`parsed_query`, as `planned` takes it), so a look at what a query names (`query::named_records`) parses it no
+/// more. None: parsed by DataFusion here.
+pub(crate) fn kept_query(state: &datafusion::execution::SessionState, sql: &str) -> Option<datafusion::sql::parser::Statement> {
+    let options = &state.config().options().sql_parser;
+    (matches!(options.dialect, datafusion::config::Dialect::Generic) && options.recursion_limit.get() == LOOKS_DEPTH).then(|| parsed_query(sql)).flatten()
+}
+
 /// A planned statement run, as `sql_checked` runs it: the frame of its rows. A DDL statement takes effect here.
 pub async fn run(ctx: &SessionContext, plan: LogicalPlan) -> anyhow::Result<datafusion::dataframe::DataFrame> {
     Ok(text_unions(ctx.execute_logical_plan(plan).await?)?)

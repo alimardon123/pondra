@@ -860,9 +860,8 @@ mod tests {
                     assert!(sql[t.start[i]..t.end[i]].contains(w.value.as_str()), "{sql}: {:?} at {}..{}", w, t.start[i], t.end[i]);
                 }
             }
-            // (asked again at once, the same tokens; tried a few times, as other tests running beside this one share the
-            // cache and may push a text out between two asks)
-            assert!((0..10).any(|_| std::sync::Arc::ptr_eq(&tokens(sql).expect("tokenized"), &tokens(sql).expect("kept"))), "{sql}: asked again, the same tokens");
+            // (asked again in one statement, the same tokens: its context keeps them)
+            assert!(crate::context::sync_scope(|| std::sync::Arc::ptr_eq(&tokens(sql).expect("tokenized"), &tokens(sql).expect("kept"))), "{sql}: asked again, the same tokens");
         }
         assert!(tokens("SELECT 'unclosed").is_none());
         let solid: Vec<String> = tokens("SELECT /* c */ a ,b").expect("tokenized").solid().iter().map(|s| s.token.to_string()).collect();
