@@ -95,7 +95,7 @@ pub fn inline(sql: &str) -> Result<String> {
         return Err(e);
     }
     Ok(match found.any {
-        true => stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"),
+        true => crate::text::text_kept(stmts), // (kept as its print's parse: the door, the binder and the front read the tree)
         false => sql.to_string(),
     })
 }
