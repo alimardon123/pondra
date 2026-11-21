@@ -16,7 +16,7 @@ pub fn conform(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
         return Ok(b.clone());
     }
     let columns = s.fields().iter().map(|f| match b.column_by_name(f.name()) {
-        Some(c) => Ok(strict(c, f.data_type())?),
+        Some(c) => strict_to(c, f),
         None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
     });
     Ok(RecordBatch::try_new(s.clone(), columns.collect::<Result<Vec<_>>>()?)?)
@@ -31,6 +31,15 @@ pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
         (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)) => crate::casts::into(&lists(c)?, t)?,
         _ => crate::casts::into(c, t)?,
     })
+}
+
+/// `strict`, into a column of `f`: text given for a column type whose storage isn't text (INET, its field marked) is read as
+/// that type, or refused in its words (`column_types::parsed`).
+pub fn strict_to(c: &ArrayRef, f: &datafusion::arrow::datatypes::Field) -> Result<ArrayRef> {
+    match crate::column_types::parsed(c, f) {
+        Some(read) => read,
+        None => strict(c, f.data_type()),
+    }
 }
 
 /// Text meant as lists, each read as a list's text (`casts::list_literal`): Postgres's `{1,2}`, or pgvector's and
@@ -118,7 +127,7 @@ pub fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, V
             };
         }
         match given.len() > 0 {
-            true => strict(given.next().expect("counted"), f.data_type()),
+            true => strict_to(given.next().expect("counted"), f),
             false => {
                 padded.push(f.name().clone()); // (left out by the row: its DEFAULT, if it has one, in `shape`)
                 Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows()))

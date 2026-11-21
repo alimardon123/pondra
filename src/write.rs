@@ -157,8 +157,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
             bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
         }
-        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
-            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
+        let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its 16 bytes)
+        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && *ty == holds(t))) {
+            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, and an INET its address (a column of the table, of type {})", holds(t));
         }
         for (c, expr) in &defaults {
             ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
@@ -874,6 +875,12 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
                 true => {
                     let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
                     sql_types.extend(query_types(from, &sql, &names, scope).await);
+                    // (a column of a type whose storage isn't text keeps its type: an INET column's query gives it marked)
+                    for f in &fields {
+                        if let Some(t) = crate::column_types::of(f).filter(|t| t.parse.is_some()) {
+                            sql_types.entry(f.name().clone()).or_insert_with(|| t.name.to_string());
+                        }
+                    }
                     fields
                 }
                 false => {
@@ -886,6 +893,12 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
     };
     let fixed = crate::format::fixed(from).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
     let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::fixed_name(f.data_type(), fixed))).collect();
+    // (a column type whose storage isn't text holds that storage, INET's 16 bytes: declared as text above, it is read into it)
+    for (c, t) in columns.iter_mut() {
+        if let Some(s) = sql_types.get(c.as_str()).and_then(|held| crate::column_types::stored(held)) {
+            *t = crate::answer::type_name(&s);
+        }
+    }
     // (what the statement declares, read from its AST alone: `rules/create.rs`, refused in the order a node always has)
     let d = crate::rules::create::declared(c)?;
     if d.keyed() && !columns.iter().any(|(c, _)| c == "_deleted") {
@@ -988,7 +1001,11 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.to_columns();
-            columns.push((column.to_string(), crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed)));
+            let planned = match held.as_deref().and_then(crate::column_types::stored) {
+                Some(s) => crate::answer::type_name(&s), // (INET: its 16 bytes)
+                None => crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed),
+            };
+            columns.push((column.to_string(), planned));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
                 spec["enums"] = j!({column: e});
@@ -1407,6 +1424,10 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         None => default(name)?,
     }, t.clone()).alias(name))).collect::<Result<Vec<_>>>()?;
     let schema: SchemaRef = Arc::new(df.clone().select(casts)?.schema().as_arrow().clone());
+    let schema = match &meta {
+        Some(m) => crate::column_types::parsing(schema, |n| m.held_of(n)), // (an INET column's text is read as one, in `cast_given`)
+        None => schema,
+    };
     let given_n = given.len();
     let df = df.select(picks)?;
     let columns = target.iter().map(|(n, t)| (n.clone(), t.to_string())).collect();
@@ -1432,7 +1453,7 @@ fn cast_given(rows: datafusion::execution::SendableRecordBatchStream, schema: Sc
         let mut columns = b.map_err(|e| crate::casts::parse_refusal(&e.to_string()).unwrap_or(e))?.columns().to_vec();
         for (column, field) in columns.iter_mut().zip(schema.fields()).take(given) {
             // (a refusal is the DataFusion error `casts::into` made, kept as it is: `codes::of` finds its code)
-            *column = crate::query::strict(column, field.data_type()).map_err(|e| match e.downcast::<datafusion::error::DataFusionError>() {
+            *column = crate::rules::fit::strict_to(column, field).map_err(|e| match e.downcast::<datafusion::error::DataFusionError>() {
                 Ok(d) => d,
                 Err(e) => datafusion::error::DataFusionError::External(e.into()),
             })?;

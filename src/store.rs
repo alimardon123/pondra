@@ -980,6 +980,10 @@ impl TableMeta {
         }).collect();
         Ok(std::sync::Arc::new(Schema::new(fields)))
     }
+    /// The type the column stored as `stored` is held as (`Col::held`: uuid, inet), if any: what `column_types::parsing`
+    /// marks a schema of stored names by.
+    pub fn held_of(&self, stored: &str) -> Option<&str> { self.list().columns.iter().find(|c| c.stored_name() == stored).and_then(|c| c.held.as_deref()) }
+
     /// The stored columns, taken out of an entry made for the purpose (`described`, `with_sys`).
     pub fn into_columns(self) -> Vec<(String, String)> { self.record.list.columns.into_iter().map(|c| (c.stored.unwrap_or(c.name), c.dtype)).collect() }
 
@@ -1216,7 +1220,7 @@ impl TableMeta {
     /// statistics. Each column SQL sees (`live`, the one mapping of stored names to SQL's) takes its rules by its
     /// stored name, as the entry keeps them.
     pub fn to_rules(&self) -> Result<crate::table_record::Table> {
-        let columns = self
+        let columns: Vec<crate::table_record::Column> = self
             .list()
             .columns
             .iter()
@@ -1231,8 +1235,10 @@ impl TableMeta {
                 labels: c.labels.as_ref().map(|e| (e.of.clone(), e.labels.clone())),
             })
             .collect();
+        // (a column whose storage isn't text, INET, is marked: a write's text is read into it, `rules::fit`)
+        let schema = crate::column_types::parsing(crate::answer::schema(&self.logical_columns())?, |n| columns.iter().find(|c| c.name == n).and_then(|c| c.held.as_deref()));
         Ok(crate::table_record::Table {
-            schema: crate::answer::schema(&self.logical_columns())?,
+            schema,
             columns,
             key: self.key.iter().map(|c| self.name_of(c).to_string()).collect(),
             key_checked: self.key_checked(),

@@ -160,6 +160,16 @@ class Exact:
         self.nanos = self.n * 10 ** (9 - self.digits)
 
 
+def as_text(field):
+    """How a column of a Pondra column type whose storage isn't text shows, by its Arrow extension name, as Pondra's JSON and
+    CSV answers show it: INET (`pondra.inet`, 16 bytes) as Postgres shows a host, an IPv4-mapped address as IPv4. None for
+    any other column, which shows as its Arrow type does."""
+    import ipaddress
+    if (field.metadata or {}).get(b"ARROW:extension:name") == b"pondra.inet":
+        return lambda v: str((lambda a: a.ipv4_mapped or a)(ipaddress.IPv6Address(bytes(v))))
+    return None
+
+
 def values(c):
     """A column's values: times, timestamps and durations as `Exact`."""
     import pyarrow as pa
@@ -259,6 +269,9 @@ def printed(data):
     reader = pa.ipc.open_stream(io.BytesIO(data))
     for batch in reader:
         cols = [(values(c), c.type) for c in batch.columns]
+        for i, f in enumerate(batch.schema):
+            if show := as_text(f):
+                cols[i] = ([None if v is None else show(v) for v in batch.column(i).to_pylist()], pa.string())
         for r in range(batch.num_rows):
             row = [cell(vals[r], t) for vals, t in cols]
             lines = row[-1].split("\n") if row else []

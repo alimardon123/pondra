@@ -350,8 +350,8 @@ pub fn identity_default(sequence: &str) -> String { format!("nextval('{}')", seq
 
 // ---------------------------------------------------------------- types (`types.rs`)
 
-/// A column's declared type, if it is one held as text that isn't an enum: `uuid`, `json`, `jsonb`, or
-/// `varchar(n)` for a length (`VARCHAR(n)`, `CHARACTER VARYING(n)`, `NVARCHAR(n)`). An array of uuids is
+/// A column's declared type, if it is one the lake checks that isn't an enum: `uuid`, `json`, `jsonb`, a column type's
+/// name (`inet`, held as its own storage: `column_types::stored`), or `varchar(n)` for a length (`VARCHAR(n)`, `CHARACTER VARYING(n)`, `NVARCHAR(n)`). An array of uuids is
 /// refused by name (a list's items aren't checked yet).
 pub fn sql_type(t: &ast::DataType) -> Result<Option<String>> {
     use ast::{ArrayElemTypeDef as A, CharacterLength as L, DataType as D};
@@ -366,6 +366,8 @@ pub fn sql_type(t: &ast::DataType) -> Result<Option<String>> {
             0 => Err(crate::codes::coded("22023", format!("{t}: a length is at least 1"))),
             n => Ok(Some(format!("varchar({n})"))),
         },
+        // (a column type of the registry's by its name alone, INET: `column_types`)
+        D::Custom(name, args) if args.is_empty() && name.0.len() == 1 => Ok(crate::column_types::named(&name.to_string().to_lowercase()).map(|t| t.name.to_string())),
         D::Array(A::AngleBracket(e) | A::SquareBracket(e, _) | A::Parenthesis(e)) if matches!(**e, D::Uuid) => {
             Err(crate::codes::coded("0A000", "UUID[]: an array of uuids isn't kept yet (TEXT[] holds them as text, or a table of its own holds one a row)"))
         }
@@ -577,6 +579,11 @@ impl Table {
         if d.keyed() && !fields.iter().any(|(n, _)| n == "_deleted") {
             fields.push(("_deleted".into(), "Boolean".into()));
         }
+        for (name, t) in fields.iter_mut() {
+            if let Some(s) = written.get(name).and_then(|(held, _)| held.as_deref()).and_then(crate::column_types::stored) {
+                *t = crate::answer::type_name(&s); // (INET: its 16 bytes, as `create_spec` holds it)
+            }
+        }
         let table = object(&c.name); // (the table's name as the node has it: its identity columns' sequences are named from it)
         let columns: Vec<Column> = fields
             .iter()
@@ -599,7 +606,7 @@ impl Table {
             .collect();
         constraint_columns(&fields, &d.constraints).map_err(definition)?; // (create_table's refusals, as its block maps them)
         identity_types(&fields, &d.identity).map_err(definition)?;
-        let schema = crate::answer::schema(&fields)?;
+        let schema = crate::column_types::parsing(crate::answer::schema(&fields)?, |n| columns.iter().find(|c| c.name == n).and_then(|c| c.held.as_deref()));
         Ok(Table {
             schema,
             order: columns.iter().map(|c: &crate::rules::Column| c.name.clone()).collect(),
