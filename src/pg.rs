@@ -1161,13 +1161,13 @@ fn each_row<T>(b: &RecordBatch, types: &[DataType], mut row: impl FnMut(&[ArrayR
 }
 
 /// A column's Postgres type and the Arrow type its values are sent as: a uuid's, json's or jsonb's
-/// (`pg_types::typed` marks one), an INET's (its 16 bytes, `PgInet`), a catalog's `"char"`, else its Arrow type's.
+/// (`pg_types::typed` marks one), an INET's (its bytes, `PgInet`), a catalog's `"char"`, else its Arrow type's.
 fn field_type(f: &datafusion::arrow::datatypes::Field, format: FieldFormat) -> (Type, DataType) {
     if crate::pg_types::is_char(f) {
         return (Type::CHAR, DataType::Utf8); // (a catalog's kind: `pg_catalog::CHARS`)
     }
     if crate::column_types::of(f).is_some_and(|t| t.name == crate::column_types::INET.name) {
-        return (Type::INET, DataType::FixedSizeBinary(16));
+        return (Type::INET, DataType::FixedSizeBinary(crate::column_types::inet::WIDTH as i32));
     }
     match crate::pg_types::marked_type(f) {
         Some(Ty::Uuid) => (Type::UUID, DataType::Utf8),
@@ -1436,7 +1436,7 @@ impl pgwire::types::ToSqlText for PgJson {
     }
 }
 
-/// An INET's 16 bytes (`column_types::inet`) as Postgres sends an `inet`: a host's text (`10.0.0.1`), or its binary form
+/// An INET's bytes (`column_types::inet`) as Postgres sends an `inet`: a host's text (`10.0.0.1`), or its binary form
 /// (`pg_values::inet_binary`).
 #[derive(Debug)]
 struct PgInet(Vec<u8>);

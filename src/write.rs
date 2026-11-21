@@ -157,7 +157,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
             bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
         }
-        let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its 16 bytes)
+        let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its bytes)
         if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && *ty == holds(t))) {
             bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, and an INET its address (a column of the table, of type {})", holds(t));
         }
@@ -914,7 +914,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
     };
     let fixed = crate::format::fixed(from).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
     let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::fixed_name(f.data_type(), fixed))).collect();
-    // (a column type whose storage isn't text holds that storage, INET's 16 bytes: declared as text above, it is read into it)
+    // (a column type whose storage isn't text holds that storage, INET's bytes: declared as text above, it is read into it)
     for (c, t) in columns.iter_mut() {
         if let Some(s) = sql_types.get(c.as_str()).and_then(|held| crate::column_types::stored(held)) {
             *t = crate::answer::type_name(&s);
@@ -1023,7 +1023,7 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.to_columns();
             let planned = match held.as_deref().and_then(crate::column_types::stored) {
-                Some(s) => crate::answer::type_name(&s), // (INET: its 16 bytes)
+                Some(s) => crate::answer::type_name(&s), // (INET: its bytes)
                 None => crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed),
             };
             columns.push((column.to_string(), planned));
