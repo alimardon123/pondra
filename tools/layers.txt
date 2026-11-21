@@ -24,6 +24,7 @@ buckets base
 memo base
 metrics base
 parsed base
+context base
 languages base
 lake_state base
 passes base

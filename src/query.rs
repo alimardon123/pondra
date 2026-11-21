@@ -1519,7 +1519,7 @@ pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str], sc
     let state = ctx.state();
     let (dialect, catalog) = (state.config().options().sql_parser.dialect.clone(), state.config().options().catalog.clone());
     let refers = |sql: &str| -> Option<Vec<String>> {
-        let stmt = state.sql_to_statement(sql, &dialect).ok()?;
+        let stmt = crate::engine::kept_query(&state, sql).map_or_else(|| state.sql_to_statement(sql, &dialect), Ok).ok()?; // (the statement's own parse: `engine::kept_query`)
         let refs = state.resolve_table_references(&stmt).ok()?;
         // (and each name as written, not lower-cased: a caller that names a table unquoted and then looks it up by its
         // own name, as `views::join` does, finds it, as it did when every table whose name was a word of the text was read)

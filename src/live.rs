@@ -40,6 +40,8 @@ struct One {
 struct Watch {
     app: App,
     sql: String,
+    /// Its context (`context.rs`): one statement, read again at each look, so its text is parsed once.
+    context: std::sync::Arc<crate::context::Context>,
     tables: Vec<String>,   // this lake's tables it reads (its own, and its views')
     others: Vec<String>,   // attached lakes it reads
     seen: u64,             // the last commit looked at
@@ -105,7 +107,8 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, who: Option<a
 /// A live query made ready: its SQL prepared, the tables it reads found, as its session and caller.
 async fn watch(app: &App, who: &crate::auth::Principal, headers: &axum::http::HeaderMap, sql: Option<&str>, kind: &str, body: &[u8], every: Duration, tag: String) -> anyhow::Result<Watch> {
     let session = crate::temp::of(&app.lake, headers, &who.name)?;
-    crate::temp::SESSION.scope(crate::temp::named(&app.lake, session.clone()), async {
+    let context = crate::context::Context::new();
+    crate::temp::SESSION.scope(crate::temp::named(&app.lake, session.clone()), crate::context::carried(context.clone(), async {
         let mut req = match sql {
             Some(sql) => crate::routines::Request::read("", sql.as_bytes())?,
             None => crate::routines::Request::read(kind, body)?,
@@ -116,8 +119,8 @@ async fn watch(app: &App, who: &crate::auth::Principal, headers: &axum::http::He
         let sql = crate::routines::prepare(&app.lake, &req.sql, &req.params, &req.views, &who.scope).await?;
         anyhow::ensure!(crate::routines::split(&sql).len() == 1 && crate::write::parse(&sql).is_none(), "a live query is one query");
         let (tables, others) = reads(app, &sql, &who.scope).await?;
-        anyhow::Ok(Watch { seen: app.lake.visible(), app: app.clone(), sql, tables, others, print: None, answer: None, next: Instant::now(), every, session, who, header: header(headers), temps: 0, tag, _open: Open::new() })
-    })
+        anyhow::Ok(Watch { seen: app.lake.visible(), app: app.clone(), sql, context, tables, others, print: None, answer: None, next: Instant::now(), every, session, who, header: header(headers), temps: 0, tag, _open: Open::new() })
+    }))
     .await
 }
 
@@ -154,7 +157,7 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
                 _ => w.who.clone(),
             };
             let scope = who.scope.clone();
-            let rows = crate::temp::SESSION.scope(crate::temp::named(&w.app.lake, w.session.clone()), crate::auth::WHO.scope(who, w.app.query(&w.sql, None, &scope))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
+            let rows = crate::temp::SESSION.scope(crate::temp::named(&w.app.lake, w.session.clone()), crate::auth::WHO.scope(who, crate::context::carried(w.context.clone(), w.app.query(&w.sql, None, &scope)))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
             let rows = match rows {
                 Ok(r) => r,
                 Err(e) => return Some((Ok(error(e, &w.tag, scope.shows_code())), None)),
