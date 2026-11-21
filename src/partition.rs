@@ -145,6 +145,14 @@ fn part(values: &[&str]) -> String {
     }
 }
 
+/// A part's values, one a field of a spec of `n`: `part` read back.
+pub fn values(part: &str, n: usize) -> Vec<String> {
+    match n {
+        1 => vec![part.to_string()],
+        _ => part.split('/').map(|v| v.replace("%2F", "/").replace("%25", "%")).collect(),
+    }
+}
+
 /// A partitioned table's rows, one group per part (`day(ts)`: the day, `col`: the value).
 pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
     let Some(first) = batches.first() else { return Ok(vec![]) };
