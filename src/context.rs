@@ -32,10 +32,12 @@ tokio::task_local! {
     static THIS: Arc<Context>;
 }
 
-/// One statement's context. What it holds next (step 8, l6/step8-pr9-plan.md): the text as sent and its language, the
-/// front's facts (`front::Facts`), the statement's kind and its point lookup, so the door, the binder and the point read
-/// them here rather than look at the text again; and for places (local-cloud C1, design only) each object it reads or
-/// writes with its place and the version read there, and the places the request has passed.
+/// One statement's context. The rest of what step 8 listed for it (l6/step8-pr9-plan.md) is read from the trees kept
+/// here: the door, the binder (`path::door`, `routines::bind`, both after `languages::inline`, which keeps its tree) and
+/// the point lookup (`serve::point_of`) parse nothing of their own, a statement's kind is read from its kept parse
+/// (`write::parse`), and the front's facts are the front's alone, as nothing after it reads them. A field joins when a
+/// reader after the front needs one. For places (local-cloud C1, design only): each object it reads or writes with its
+/// place and the version read there, and the places the request has passed.
 #[derive(Default)]
 pub(crate) struct Context {
     /// The statement it runs inside (a script's or a procedure's statement inside the request that sent it): what that one
