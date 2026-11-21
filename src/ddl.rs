@@ -1820,7 +1820,9 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         ensure!(matches!(change, Change::Drop { if_exists: true }), crate::rules::alter::no_column(&name, column));
         return Ok(j!({"table": name, "unchanged": true}));
     };
-    let partition: Vec<String> = m.partition.as_deref().and_then(|p| crate::partition::Spec::parse(p).ok()).map_or(vec![], |s| s.columns().into_iter().map(str::to_string).collect()); // (its own: the edits below take the entry)
+    // (its own: the edits below take the entry; a spec before it too, `TableMeta::specs`, whose files are read, and published,
+    // by its columns)
+    let partition: Vec<String> = m.partition.iter().chain(m.specs.values()).filter_map(|p| crate::partition::Spec::parse(p).ok()).flat_map(|s| s.columns().into_iter().map(str::to_string).collect::<Vec<_>>()).collect();
     let what = match change {
         Change::Rename(to) => {
             ensure!(!to.is_empty(), "a column needs a name");

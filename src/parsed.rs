@@ -1,25 +1,18 @@
 //! A statement's text parsed once for the front's looks at it. `write::parse` (what kind of statement it is), `front::expand`
 //! (what to expand in it) and `expander::named_apart` (its answer's column names) each parsed the same text with sqlparser's
 //! generic dialect: about 0.4M instructions each for a TPC-H query, where a copy of what one parse made is a fifteenth of that.
-//! So the last `KEPT` texts are kept with what they parsed to, and each look takes its own copy, to change as it likes. A
-//! text's tokens are kept the same way (`text::tokens`), by `kept`.
+//! So a statement's texts are kept with what they parsed to, in its context (`context.rs`), and each look takes its own
+//! copy, to change as it likes. A text's tokens are kept the same way (`text::tokens`).
 use datafusion::sql::sqlparser::ast::{self, Expr, Statement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
-use std::collections::VecDeque;
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// The texts kept: a statement's looks come one after the other, so the last few are what the next look asks for.
-const KEPT: usize = 4;
 /// A longer text (a bulk INSERT's rows) is parsed each time it is asked for: keeping its tree would hold its rows twice.
 pub(crate) const LONGEST: usize = 64 << 10;
 
-type Parsed = Arc<Result<Vec<Statement>, ParserError>>;
-
-// (the last texts and what they parsed to: a function of the text (a tree kept, `keep`, is its text's parse), so the
-// process's, the same for any lake here. An interim, as `text::TOKENS` is: step 8's statement context carries the parse instead)
-static LAST: std::sync::LazyLock<Mutex<VecDeque<(String, Parsed)>>> = std::sync::LazyLock::new(Default::default);
+type Parsed = crate::context::Parsed;
 
 /// `sql` parsed as `Parser::parse_sql(&GenericDialect {}, sql)` parses it, the same statements or the same error, but
 /// for `signed`'s parentheses. Under the one-parse check (`checked`) each query is held to its print: it reads back as
@@ -28,7 +21,7 @@ pub(crate) fn generic(sql: &str) -> Result<Vec<Statement>, ParserError> {
     if sql.len() > LONGEST {
         return Parser::parse_sql(&GenericDialect {}, sql).map(signed_all);
     }
-    let parsed = kept(&LAST, sql, |sql| {
+    let parsed = crate::context::parse(sql, |sql| {
         let parsed = Parser::parse_sql(&GenericDialect {}, sql).map(signed_all);
         if let (Ok(stmts), true) = (&parsed, checked()) {
             // (a panic: a request's is answered as an error, so a gate's run names the text)
@@ -142,11 +135,9 @@ fn reached(e: &ParserError) -> (u64, u64) {
     }
 }
 
-/// `sql`'s parse when one of the last few looks made it (`generic`), and None when none did: nothing is parsed here. The
-/// engine plans a query from it rather than parse the text again (`engine::planned`).
-pub(crate) fn already(sql: &str) -> Option<Parsed> {
-    LAST.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(text, _)| text == sql).map(|(_, parsed)| parsed.clone())
-}
+/// `sql`'s parse when one of the statement's looks made it (`generic`), and None when none did: nothing is parsed here.
+/// The engine plans a query from it rather than parse the text again (`engine::planned`).
+pub(crate) fn already(sql: &str) -> Option<Parsed> { crate::context::already(sql) }
 
 /// `stmts` kept as `sql`'s parse, for a tree that `sql` is its text of (`text::text_kept`): a look or the engine that then
 /// asks for `sql`'s parse takes them, and the text is not parsed again. It parses back to the same statements (sqlparser's
@@ -161,27 +152,12 @@ pub(crate) fn keep(sql: &str, stmts: Vec<Statement>) {
         // (a panic: a request's is answered as an error, so a gate's run names the text; keep says nothing to its caller)
         assert!(theirs.as_ref().is_ok_and(|t| *t == stmts), "one parse: a tree kept is not its text's parse, for {sql}\nthe tree: {stmts:?}\nthe text's: {theirs:?}");
     }
-    kept(&LAST, sql, |_| Arc::new(Ok(stmts)));
+    crate::context::keep(sql, stmts);
 }
 
 /// Whether the front's trees are checked against the parse of their text (`keep`, `engine::datafusions_parse`):
 /// `env::front_checked`.
 pub(crate) fn checked() -> bool { crate::env::front_checked() }
-
-/// What `make` makes of `sql`, kept with it among the last `KEPT` texts of `last` (the caller leaves out a text past
-/// `LONGEST`): made once while the text is among them. The lock is held for the look and the keeping, never for `make`.
-pub(crate) fn kept<T: Clone>(last: &Mutex<VecDeque<(String, T)>>, sql: &str, make: impl FnOnce(&str) -> T) -> T {
-    if let Some(made) = last.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(text, _)| text == sql).map(|(_, made)| made.clone()) {
-        return made;
-    }
-    let made = make(sql);
-    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
-    if last.len() == KEPT {
-        last.pop_front();
-    }
-    last.push_back((sql.to_string(), made.clone()));
-    made
-}
 
 #[cfg(test)]
 mod tests {
@@ -196,7 +172,7 @@ mod tests {
             }
         }
         // (more texts than are kept: each still parses as it does, the first one too, parsed again)
-        for i in 0..KEPT + 2 {
+        for i in 0..10 {
             let sql = format!("SELECT {i}");
             assert_eq!(generic(&sql), Parser::parse_sql(&GenericDialect {}, &sql));
         }

@@ -4410,6 +4410,16 @@ def scale():
         "tables that share a key meet where they are, by its ranges": sum(r for *_, r in list(shuffles.values())[23:29]) >= 4,
         "Delta and Iceberg readers see sealed files": all(v == n_rows for v in theirs.values()),
     }
+    # (step 5 I3-d: a published table's partition_by changes; its readers read the files of both specs, each under its own)
+    q("ALTER TABLE ev SET (partition_by = 'k, month(ts)')")
+    q(f"INSERT INTO ev SELECT value + 5000000, to_timestamp_seconds({base} + value * 3600), 1.0, 'k' || (value % 5), NULL FROM generate_series(0, 99)")
+    for _ in range(20):
+        call(port, "POST", "/tier")
+        respec = {**open_check.readers(lake, "ev"), **{f"iceberg/{k}": v for k, v in open_check.iceberg_readers(lake, "ev").items()}}
+        if all(v == n_rows + 100 for v in respec.values()):
+            break
+        time.sleep(1)
+    checks["a published table's partition_by changes: readers read both specs' files"] = all(v == n_rows + 100 for v in respec.values()) and q("SELECT count(*) AS n FROM ev")[0]["n"] == n_rows + 100
     for n in list(NODES):
         n.kill()
     # A 50 MB memory limit: a 2M-group aggregation and a sort spill, a join of 3M rows switches
@@ -12065,16 +12075,29 @@ def row_filters():
              "all": as_(ann, "UPDATE k SET v = v + 1"), "after": as_(boss, "SELECT id, v FROM k ORDER BY id")}
     checks["a writer a filter holds changes only rows it reads: a one-key UPDATE of a hidden key changes nothing"] = \
         all(isinstance(keyed[k], dict) and keyed[k].get("rows") == n for k, n in (("hidden", 0), ("shown", 1), ("all", 1))) and keyed["after"] == [{"id": 1, "v": 2}, {"id": 2, "v": 0}]
-    # ... and an upsert or a MERGE on the key doesn't replace a row it can't read: its key is held, so its insert is refused
+    # ... and an upsert or a MERGE on the key doesn't replace a row it can't read. Its key conflicts all the same, as in Postgres:
+    # ON CONFLICT DO NOTHING skips that row (the others go in), DO UPDATE is refused (42501), whatever its WHERE (Postgres
+    # tries the WHERE on the hidden row first; Pondra runs none of the writer's expressions on a row it can't read); a MERGE's
+    # insert of that key is refused 23505, as Postgres's is
     assert "ERROR" not in str(as_(boss, "GRANT INSERT ON k TO ann"))
     keyed.update({"upsert hidden": as_(ann, "INSERT INTO k VALUES (2, 'eu', 9) ON CONFLICT (id) DO UPDATE SET v = 9"),
+                  "upsert hidden where": as_(ann, "INSERT INTO k VALUES (2, 'eu', 9) ON CONFLICT (id) DO UPDATE SET v = 9 WHERE k.v > 100"),
+                  "upsert hidden nothing": as_(ann, "INSERT INTO k VALUES (2, 'eu', 9), (3, 'eu', 1) ON CONFLICT (id) DO NOTHING"),
                   "merge hidden": as_(ann, "MERGE INTO k USING (SELECT 2 AS id, 'eu' AS region, 7 AS v) AS s ON k.id = s.id "
                                            "WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.region, s.v)"),
                   "upsert shown": as_(ann, "INSERT INTO k VALUES (1, 'eu', 5) ON CONFLICT (id) DO UPDATE SET v = 5"),
                   "upserted": as_(boss, "SELECT id, region, v FROM k ORDER BY id")})
-    checks["... and an upsert or a MERGE of a key a row it can't read holds is refused (23505), replacing nothing"] = \
-        all("duplicate key" in str(keyed[k]) for k in ("upsert hidden", "merge hidden")) and isinstance(keyed["upsert shown"], dict) \
-        and keyed["upsert shown"].get("rows") == 1 and keyed["upserted"] == [{"id": 1, "region": "eu", "v": 5}, {"id": 2, "region": "us", "v": 0}]
+    with pg("ann", "ann-password-1") as uc:
+        keyed["upsert hidden pg"] = pg_said(uc, "INSERT INTO k VALUES (2, 'eu', 9) ON CONFLICT (id) DO UPDATE SET v = 9")
+        keyed["upsert hidden nothing pg"] = pg_said(uc, "INSERT INTO k VALUES (2, 'eu', 9) ON CONFLICT DO NOTHING")
+    keyed["upserted pg"] = as_(boss, "SELECT id, region, v FROM k ORDER BY id")
+    checks["... an upsert of a key a row it can't read holds: DO NOTHING skips it, DO UPDATE is refused (42501), replacing nothing"] = \
+        all(str(keyed[k]).startswith("ERROR 403") and "can't update it" in str(keyed[k]) for k in ("upsert hidden", "upsert hidden where")) \
+        and isinstance(keyed["upsert hidden nothing"], dict) and keyed["upsert hidden nothing"].get("rows") == 1 \
+        and "42501" in str(keyed["upsert hidden pg"]) and "42501" not in str(keyed["upsert hidden nothing pg"]) and "ERROR" not in str(keyed["upsert hidden nothing pg"]) \
+        and "duplicate key" in str(keyed["merge hidden"]) and isinstance(keyed["upsert shown"], dict) and keyed["upsert shown"].get("rows") == 1 \
+        and keyed["upserted"] == [{"id": 1, "region": "eu", "v": 5}, {"id": 2, "region": "us", "v": 0}, {"id": 3, "region": "eu", "v": 1}] \
+        and keyed["upserted pg"] == keyed["upserted"]
     # ... nor does a load: its rows replace their keys' rows unread (a keyed table), so it is refused, naming SQL's ways;
     # a load's new rows into a table without a key change no row, so they go in
     def copied(table, line, user="ann"):

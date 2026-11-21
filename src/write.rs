@@ -216,9 +216,6 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 if !m.key.is_empty() {
                     return Err(crate::codes::coded("0A000", format!("{name} has a key: its partition_by can't change (an append table's can), since its newer rows shadow older ones file by file")));
                 }
-                if !m.publish.is_empty() {
-                    return Err(crate::codes::coded("0A000", format!("{name} is published ({}): its partition_by can't change yet", m.publish.join(", "))));
-                }
                 crate::format::require(lake, crate::format::SPECS, "a table's partition_by changed").await?;
             }
             // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
@@ -226,10 +223,6 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let (old, new) = (l.columns().len(), columns.len());
             ensure!(columns[..new.min(old)].iter().map(|(c, t)| (c.as_str(), t.as_str())).eq(l.columns().take(new.min(old))), "{name} exists with other columns (only new ones can be added, at the end)");
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
-            if republish && publish.as_ref().is_some_and(|p| !p.is_empty()) && !m.specs.is_empty() {
-                // (I3-d publishes every spec; until then a file's record is its own spec's, which the table's doesn't name)
-                return Err(crate::codes::coded("0A000", format!("{name}'s partition_by changed, and its files are split by more than one spec: it can't be published yet")));
-            }
             // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
             ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
             if publish.iter().flatten().any(|f| !m.publish.contains(f)) {
