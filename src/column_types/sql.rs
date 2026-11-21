@@ -1,4 +1,4 @@
-//! How SQL reaches a column type whose storage isn't its text (INET): its name as a cast's type (`Named`, a type planner:
+//! How SQL reaches a column type whose storage isn't its text (INET, FILE): its name as a cast's type (`Named`, a type planner:
 //! `'10.0.0.1'::inet`, `CAST(x AS INET)`, `INET '10.0.0.1'`), a string compared with a value of one (`Compared`, an expression
 //! planner, for `ip = '10.0.0.1'` wherever it is written), and the casts and the lists and ranges of strings that DataFusion
 //! can't plan for its storage (`Casts`, an analyzer rule before type coercion). A string literal is read once, as the
@@ -131,7 +131,7 @@ fn as_typed(t: &'static ColumnType, e: &mut Expr) -> Result<bool> {
             *e = literal(t, s)?;
             Ok(true)
         }
-        Expr::Literal(v, _) if v.is_null() && !matches!(v.data_type(), DataType::FixedSizeBinary(_)) => {
+        Expr::Literal(v, _) if v.is_null() && v.data_type() != (t.storage)(&[]) => {
             *e = Expr::Literal(ScalarValue::try_from(&(t.storage)(&[]))?, None);
             Ok(true)
         }
@@ -139,7 +139,7 @@ fn as_typed(t: &'static ColumnType, e: &mut Expr) -> Result<bool> {
     }
 }
 
-/// A type's name as a cast writes it, `INET`: its storage, marked as the type, which `Casts` makes a read of the text.
+/// A type's name as a cast writes it, `INET`, `FILE`: its storage, marked as the type, which `Casts` makes a read of the text.
 #[derive(Debug)]
 pub struct Named;
 

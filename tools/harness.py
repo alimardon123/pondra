@@ -19927,6 +19927,157 @@ def inets():
     return f"{sum(checks.values())} of {len(checks)} inets checks"
 
 
+def filecols():
+    """FILE at every door (step 5, E1 and E3, 5-TY-c3d): a FILE column holds a file's path, version and content type as a
+    struct. `path::FILE` reads files()'s paths into one, its content type by its extension, so CREATE TABLE … AS keeps a
+    table of the lake's files whose bytes file_read reads back. A JSON answer shows a value as its object; a CSV answer as
+    its text, the object as Postgres writes a jsonb. The Postgres port sends one as a jsonb (oid 3802), in text and binary
+    results, so psycopg and asyncpg hand over its object; pg_attribute and information_schema say jsonb; a parameter's
+    path or object goes into the column, and COPY … TO STDOUT writes its text. POST /append takes its object, and COPY …
+    FROM STDIN (CSV) its path, refusing what is neither with 22P02 and writing nothing. A view and a materialized view's
+    table keep the type (a filter by path), and so does a branch. Delta and Iceberg have no type for it yet: a table of
+    one is refused publishing, naming the column and FILE."""
+    import asyncio
+    import psycopg
+    try:
+        import asyncpg
+    except ImportError:
+        asyncpg = None
+
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    checks, info = {}, {}
+    node = None
+    obj = lambda path, ct, version=None: {"path": path, "version": version, "content_type": ct}
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def http_err(path, body):
+        """(status, x-pondra-sqlstate, body) of a POST; (200, None, '') when it went through."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, body, {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data) if r.status != 200 else (200, None, "")
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        call(port, "PUT", "/files/cams/a.jpg", b"\xff\xd8jpeg-a")
+        call(port, "PUT", "/files/cams/b.png", b"\x89PNG-b")
+
+        def listed():
+            q("CREATE TABLE shots AS SELECT row_number() OVER (ORDER BY path) AS id, path::FILE AS photo FROM files('cams/')")
+            info["shots"] = q("SELECT id, photo FROM shots ORDER BY id")
+            info["shots definition"] = q("SELECT replace(definition, chr(10), ' ') AS d FROM pondra.objects WHERE name = 'shots'")
+            read = q("SELECT encode(file_read(photo['path']), 'hex') AS b FROM shots ORDER BY id")
+            return [(r["id"], r["photo"]) for r in info["shots"]] == [(1, {"path": "files/cams/a.jpg", "content_type": "image/jpeg"}), (2, {"path": "files/cams/b.png", "content_type": "image/png"})] \
+                and "photo FILE" in info["shots definition"][0]["d"] and read == [{"b": b"\xff\xd8jpeg-a".hex()}, {"b": b"\x89PNG-b".hex()}]
+        check("files()'s paths read as FILEs (content type by extension), kept by CREATE TABLE … AS, a JSON answer's objects, file_read reads their bytes", listed)
+
+        def csv_answer():
+            got = call(port, "POST", "/sql?format=csv", b"SELECT photo FROM shots WHERE id = 1", timeout=60)
+            info["csv"] = got if isinstance(got, str) else got.decode() if isinstance(got, bytes) else got
+            return info["csv"] == 'photo\n"{""path"": ""files/cams/a.jpg"", ""version"": null, ""content_type"": ""image/jpeg""}"\n'
+        check("a CSV answer shows a FILE as its text, the object as Postgres writes a jsonb", csv_answer)
+
+        with psycopg.connect(url, autocommit=True) as conn:
+            info["columns"] = conn.execute("SELECT a.atttypid, format_type(a.atttypid, a.atttypmod), c.data_type FROM pg_attribute a JOIN pg_class t ON t.oid = a.attrelid "
+                                           "JOIN information_schema.columns c ON c.table_name = t.relname AND c.column_name = a.attname WHERE t.relname = 'shots' AND a.attname = 'photo'").fetchall()
+            check("a FILE column is jsonb in pg_attribute and information_schema", lambda: info["columns"] == [(3802, "jsonb", "jsonb")])
+            rows = conn.execute("SELECT id, photo FROM shots ORDER BY id").fetchall()
+            info["text rows"] = rows
+            want = [(1, obj("files/cams/a.jpg", "image/jpeg")), (2, obj("files/cams/b.png", "image/png"))]
+            check("psycopg reads a FILE column as its object (text results)", lambda: rows == want)
+            binary = conn.cursor(binary=True).execute("SELECT id, photo FROM shots ORDER BY id").fetchall()
+            info["binary rows"] = binary
+            check("…and in binary results too", lambda: binary == want)
+            check("the column's type is sent as jsonb (3802)", lambda: [d.type_code for d in conn.execute("SELECT photo FROM shots").description] == [3802])
+            conn.execute("INSERT INTO shots VALUES (%s, %s)", (3, "cams/c.gif"))
+            conn.execute("INSERT INTO shots VALUES (%s, %s)", (4, json.dumps({"path": "cams/d", "version": "9"})))
+            check("a parameter's path or object goes into the column",
+                  lambda: conn.execute("SELECT id, photo FROM shots WHERE id >= 3 ORDER BY id").fetchall() == [(3, obj("cams/c.gif", "image/gif")), (4, obj("cams/d", "application/octet-stream", "9"))])
+            check("…and one is compared with it", lambda: conn.execute("SELECT id FROM shots WHERE photo = %s", ("cams/c.gif",)).fetchall() == [(3,)])
+            try:
+                conn.execute("INSERT INTO shots VALUES (%s, %s)", (5, json.dumps({"path": "x", "size": 1})))
+                info["refused"] = None
+            except psycopg.Error as e:
+                info["refused"] = (e.sqlstate, str(e).splitlines()[0])
+            check("what is neither a path nor its object is refused in Postgres's words, 22P02", lambda: (info["refused"] or ("",))[0] == "22P02" and "type file" in info["refused"][1])
+            with conn.cursor().copy("COPY (SELECT photo FROM shots WHERE id = 3) TO STDOUT") as copy:
+                info["copy"] = b"".join(bytes(b) for b in copy).decode()
+            check("COPY … TO STDOUT writes its text", lambda: info["copy"] == '{"path": "cams/c.gif", "version": null, "content_type": "image/gif"}\n')
+
+        def appended():
+            q("CREATE TABLE doors (id INT, photo FILE)")
+            call(port, "POST", "/append/doors", b'{"id": 1, "photo": {"path": "a.jpg", "content_type": "image/jpeg"}}\n{"id": 2, "photo": null}\n', timeout=60)
+            return q("SELECT id, photo FROM doors ORDER BY id") == [{"id": 1, "photo": {"path": "a.jpg", "content_type": "image/jpeg"}}, {"id": 2}]
+        check("POST /append takes a FILE's object", appended)
+
+        def copied():
+            with psycopg.connect(url, autocommit=True) as conn:
+                with conn.cursor().copy("COPY doors (id, photo) FROM STDIN (FORMAT csv)") as cp:
+                    cp.write('3,b.pdf\n4,"{""path"": ""c.wav"", ""version"": ""2""}"\n')
+                try:
+                    with conn.cursor().copy("COPY doors (id, photo) FROM STDIN (FORMAT csv)") as cp:
+                        cp.write('5,e.png\n6,"{""size"": 1}"\n')
+                    info["copy bad"] = None
+                except psycopg.Error as e:
+                    info["copy bad"] = (e.sqlstate, str(e).splitlines()[0])
+            return q("SELECT id, photo['path'] AS p, photo['version'] AS v, photo['content_type'] AS t FROM doors WHERE id >= 3 ORDER BY id") == \
+                [{"id": 3, "p": "b.pdf", "t": "application/pdf"}, {"id": 4, "p": "c.wav", "v": "2", "t": "audio/wav"}] and (info["copy bad"] or ("",))[0] == "22P02"
+        check("the Postgres port's COPY … FROM STDIN (CSV) reads a path or its object, and refuses what is neither with 22P02, writing nothing", copied)
+
+        def viewed():
+            q("CREATE VIEW near AS SELECT id, photo FROM doors WHERE id < 4")
+            q("CREATE MATERIALIZED VIEW seen AS SELECT photo, count(*) AS n FROM doors GROUP BY photo")
+            info["materialized"] = q("SELECT n FROM seen WHERE photo = 'b.pdf'")
+            info["materialized definition"] = q("SELECT replace(definition, chr(10), ' ') AS d FROM pondra.objects WHERE name = 'seen'")
+            return q("SELECT id FROM near WHERE photo = 'b.pdf'") == [{"id": 3}] and info["materialized"] == [{"n": 1}]
+        check("a view filters by path, and a materialized view's table keeps the type: filtered by path", viewed)
+
+        def branched():
+            db, dev = q("SELECT current_database() AS d")[0]["d"], f"filecols_{uuid.uuid4().hex[:8]}"
+            q(f'CREATE DATABASE {dev} CLONE "{db}"')
+            LAKES.append(lake.rstrip("/").rsplit("/", 1)[0] + "/" + dev)  # (its folder, beside the lake: removed with it)
+            return q(f"SELECT id FROM {dev}.doors WHERE photo = 'b.pdf'") == [{"id": 3}]
+        check("a branch (CREATE DATABASE … CLONE) keeps the type: filtered by path", branched)
+
+        def published():
+            info["published"] = http_err("/sql", b"CREATE TABLE pub (id INT, photo FILE) WITH (publish = 'iceberg')")
+            return info["published"][:2] == (501, "0A000") and "iceberg has no type for photo (FILE)" in info["published"][2]
+        check("a table of one isn't published: Iceberg has no type for it yet, said by name", published)
+        if asyncpg is not None:
+            async def apg():
+                conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")
+                try:
+                    return [(r["id"], json.loads(r["photo"])) for r in await conn.fetch("SELECT id, photo FROM shots WHERE id <= 2 ORDER BY id")]
+                finally:
+                    await conn.close()
+            got = {}
+            check("asyncpg reads a FILE column as a jsonb (binary results)",
+                  lambda: got.setdefault("asyncpg", asyncio.run(apg())) == [(1, obj("files/cams/a.jpg", "image/jpeg")), (2, obj("files/cams/b.png", "image/png"))])
+            info.update(got)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"filecols": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} filecols checks"
+
+
 def vectors():
     """pgvector's drivers at the Postgres port (step 5, E1, 5-TY-c2b): a VECTOR(n) column is sent as real[] (a list to
     every driver), and the port has pgvector's `vector` type in pg_type, in public, so `register_vector` finds it. psycopg's
@@ -32116,7 +32267,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, row_filters, read_only, max_rows, max_memory, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, vectors, inets, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents, diffs, otherviews)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, row_filters, read_only, max_rows, max_memory, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, vectors, inets, filecols, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents, diffs, otherviews)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -32317,7 +32468,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "diffs", "otherviews", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "row_filters", "read_only", "max_rows", "max_memory", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "vectors", "inets", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "diffs", "otherviews", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "row_filters", "read_only", "max_rows", "max_memory", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "vectors", "inets", "filecols", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -32330,7 +32481,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "diffs": diffs, "otherviews": otherviews, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "row_filters": row_filters, "read_only": read_only, "max_rows": max_rows, "max_memory": max_memory, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "vectors": vectors, "inets": inets, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "diffs": diffs, "otherviews": otherviews, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "row_filters": row_filters, "read_only": read_only, "max_rows": max_rows, "max_memory": max_memory, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "vectors": vectors, "inets": inets, "filecols": filecols, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

@@ -1,0 +1,107 @@
+# FILE (the every-data-kind review's E3): a file a row points at, held as a struct of its path, its version and its content
+# type, so an Arrow answer has the struct and its parts read as a struct's (`photo['path']`). It is read from a path alone,
+# its content type then known by its extension, or from its object, which is its text (`::text`, a CSV answer, the Postgres
+# door's jsonb). A version left out is NULL, the file as it is now: pinning one is the stores work's. What is neither a path
+# nor its object is refused (22P02), and SHOW CREATE says FILE.
+statement ok
+CREATE TABLE photos (id INT, photo FILE)
+
+statement ok
+INSERT INTO photos VALUES (1, 'cams/a.jpg'), (2, '{"path": "cams/b.png", "version": "7"}'), (3, NULL), (4, '{"path": "notes/c", "content_type": "text/plain"}')
+
+query IT rowsort
+SELECT id, photo FROM photos
+----
+1 {path: cams/a.jpg, version: NULL, content_type: image/jpeg}
+2 {path: cams/b.png, version: 7, content_type: image/png}
+3 NULL
+4 {path: notes/c, version: NULL, content_type: text/plain}
+
+query TTT rowsort
+SELECT photo['path'], photo['version'], photo['content_type'] FROM photos WHERE id IN (1, 2)
+----
+cams/a.jpg NULL image/jpeg
+cams/b.png 7 image/png
+
+query T
+SELECT photo::text FROM photos WHERE id = 1
+----
+{"path": "cams/a.jpg", "version": null, "content_type": "image/jpeg"}
+
+query T
+SELECT replace(definition, chr(10), ' ') FROM pondra.objects WHERE name = 'photos'
+----
+CREATE TABLE photos ( id INT, photo FILE )
+
+# A string beside one is read as one; it sorts and groups by its path first
+query I
+SELECT id FROM photos WHERE photo = 'cams/a.jpg'
+----
+1
+
+query I
+SELECT id FROM photos WHERE photo IS NOT NULL ORDER BY photo DESC
+----
+4
+2
+1
+
+query TI rowsort
+SELECT photo['content_type'], count(*) FROM photos WHERE photo IS NOT NULL GROUP BY photo['content_type']
+----
+image/jpeg 1
+image/png 1
+text/plain 1
+
+query T
+SELECT 'docs/r.pdf'::file
+----
+{path: docs/r.pdf, version: NULL, content_type: application/pdf}
+
+query T rowsort
+SELECT TRY_CAST(t AS FILE)::text FROM (VALUES ('x.parquet'), ('')) AS v(t)
+----
+NULL
+{"path": "x.parquet", "version": null, "content_type": "application/vnd.apache.parquet"}
+
+statement error 22P02 invalid input syntax for type file: ""
+INSERT INTO photos VALUES (5, '')
+
+statement error 22P02 invalid input syntax for type file
+INSERT INTO photos VALUES (5, '{"path": "x", "size": 3}')
+
+query error 22P02 invalid input syntax for type file
+SELECT '{"version": "1"}'::file
+
+# An UPDATE's string is read as one; CREATE TABLE … AS and ADD COLUMN keep the type
+statement ok
+UPDATE photos SET photo = 'cams/d.webp' WHERE id = 3
+
+statement ok
+CREATE TABLE kept AS SELECT id, photo FROM photos WHERE id IN (1, 3)
+
+query IT rowsort
+SELECT id, photo['content_type'] FROM kept
+----
+1 image/jpeg
+3 image/webp
+
+statement ok
+ALTER TABLE kept ADD COLUMN thumb FILE
+
+statement ok
+INSERT INTO kept (id, photo, thumb) VALUES (5, 'a.mp4', 'a.gif')
+
+query TT
+SELECT photo['content_type'], thumb['content_type'] FROM kept WHERE id = 5
+----
+video/mp4 image/gif
+
+query T
+SELECT replace(definition, chr(10), ' ') FROM pondra.objects WHERE name = 'kept'
+----
+CREATE TABLE kept ( id INT, photo FILE, thumb FILE )
+
+# A part is named by its value's text, which a FILE's struct doesn't have
+statement error PARTITION BY: .*: photo is a Struct
+CREATE TABLE parted (id INT, photo FILE) WITH (partition_by = 'photo')
