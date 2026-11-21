@@ -24,6 +24,21 @@ use crate::text::object;
 /// json did (`pg_catalog.rs`).
 pub fn marked_type(f: &Field) -> Option<Ty> { crate::column_types::of(f).and_then(|t| Ty::of(t.name)) }
 
+/// Postgres's one-byte `"char"`, which its catalogs' kinds are (`pg_type.typtype`): a catalog column marked with it
+/// (`char_field`) is sent as one (`pg::field_type`). asyncpg reads a type's kind as that byte, and takes a codec for a
+/// type (`set_type_codec`: pgvector's `register_vector`) only when it is one.
+const CHAR: &str = "\"char\"";
+
+/// Whether a column is marked as a `"char"` (`char_field`).
+pub fn is_char(f: &Field) -> bool { f.metadata().get(crate::column_types::MARK).is_some_and(|m| m == CHAR) }
+
+/// `f`, a text column, marked as Postgres's `"char"` (`CHAR`).
+pub fn char_field(f: Field) -> Field {
+    let mut meta = f.metadata().clone();
+    meta.insert(crate::column_types::MARK.into(), CHAR.into());
+    f.with_metadata(meta)
+}
+
 /// What an answer's columns are, from its statement as written: which types they are (`columns`), and the
 /// names Postgres gives them (`pg_names::of`; None when they can't be read the same way as the columns).
 #[derive(Default, Clone)]

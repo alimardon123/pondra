@@ -5,12 +5,15 @@ use super::cluster::Cluster;
 use crate::terms::LEASE;
 use std::time::Duration;
 
-/// The seeds a scenario runs over: `PONDRA_SIM_SEED`'s alone, else 1 to `PONDRA_SIM_SEEDS` (2 by default).
+/// The seeds a scenario runs over: `PONDRA_SIM_SEED`'s alone, else `PONDRA_SIM_SEEDS` of them (2 by default) from
+/// `PONDRA_SIM_FROM` (1 by default). CI runs 8 a pull request, and 200 a night from one the date names (sim.yml); a
+/// failing seed is named in its failure, and `PONDRA_SIM_SEED` runs it again alone.
 fn seeds() -> Vec<u64> {
     if let Some(one) = crate::env::parse::<u64>("PONDRA_SIM_SEED") {
         return vec![one];
     }
-    (1..=crate::env::parse::<u64>("PONDRA_SIM_SEEDS").unwrap_or(2)).collect()
+    let from = crate::env::parse::<u64>("PONDRA_SIM_FROM").unwrap_or(1);
+    (from..from + crate::env::parse::<u64>("PONDRA_SIM_SEEDS").unwrap_or(2)).collect()
 }
 
 /// The rows of `answer` (a `/sql` answer: a JSON array of objects).
