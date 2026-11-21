@@ -8,7 +8,7 @@
 //! A column of one is marked on its Arrow field (`mark`, the only writer of the mark): the Postgres port sends it as that
 //! type, and a function's answer of one carries it on (`pg_functions`).
 //!
-//! A type whose storage isn't its text (INET's 16 bytes, `inet`) says how its values are read from text and shown as text
+//! A type whose storage isn't its text (INET's bytes, `inet`) says how its values are read from text and shown as text
 //! (`parse`, `show`), and each door asks it: a write fits text to it (`parsed`), a text answer shows it (`show_of`), and SQL
 //! casts to it and from it and compares a string with it (`sql`).
 pub mod inet;
@@ -82,7 +82,7 @@ pub fn named(name: &str) -> Option<&'static ColumnType> {
 /// The column type a field is marked with (`mark`), if any.
 pub fn of(field: &Field) -> Option<&'static ColumnType> { field.metadata().get(MARK).and_then(|n| named(n)) }
 
-/// What a column of the type `held` names keeps in its files, where that isn't its text (INET's FixedSizeBinary(16)): None
+/// What a column of the type `held` names keeps in its files, where that isn't its text (INET's FixedSizeBinary(17)): None
 /// for a type held as text (uuid, json, varchar(n)) and for a name that is no type's.
 pub fn stored(held: &str) -> Option<DataType> { named(held).filter(|t| t.parse.is_some()).map(|t| (t.storage)(&[])) }
 
@@ -92,6 +92,12 @@ pub fn parsed(c: &ArrayRef, field: &Field) -> Option<anyhow::Result<ArrayRef>> {
     let parse = of(field)?.parse?;
     let text = matches!(c.data_type(), DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Null);
     text.then(|| parse(&datafusion::arrow::compute::cast(c, &DataType::Utf8)?))
+}
+
+/// Each of `fields` of a type whose storage isn't its text (INET), by name and that type's name: what a table made from
+/// a query's columns holds them as (`CREATE TABLE … AS`, a materialized view's table), so it keeps their type.
+pub fn held_in(fields: &datafusion::arrow::datatypes::Fields) -> impl Iterator<Item = (String, String)> + '_ {
+    fields.iter().filter_map(|f| of(f).filter(|t| t.parse.is_some()).map(|t| (f.name().clone(), t.name.to_string())))
 }
 
 /// How a column of `field` shows as text, where it is marked with a type whose storage isn't text (`show`): what a text
@@ -161,7 +167,7 @@ mod tests {
         }
         assert_eq!(named("json").map(|t| t.extension), Some("arrow.json"));
         assert!(named("varchar(3)").is_none() && of(&Field::new("c", DataType::Utf8, true)).is_none());
-        assert_eq!((stored("inet"), stored("uuid"), stored("varchar(3)")), (Some(DataType::FixedSizeBinary(16)), None, None));
+        assert_eq!((stored("inet"), stored("uuid"), stored("varchar(3)")), (Some(DataType::FixedSizeBinary(inet::WIDTH as i32)), None, None));
     }
 
     /// A write's schema marks the columns whose storage isn't text, and text given for one is read as its type; any other
@@ -169,14 +175,14 @@ mod tests {
     #[test]
     fn text_written_into_a_typed_column_is_read_as_its_type() {
         use datafusion::arrow::array::{Array, AsArray, Int32Array, StringArray};
-        let schema = Arc::new(Schema::new(vec![Field::new("ip", DataType::FixedSizeBinary(16), true), Field::new("u", DataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("ip", DataType::FixedSizeBinary(inet::WIDTH as i32), true), Field::new("u", DataType::Utf8, true)]));
         let held = |n: &str| match n { "ip" => Some("inet"), "u" => Some("uuid"), _ => None };
         let marked = parsing(schema.clone(), held);
         assert_eq!((of(marked.field(0)).map(|t| t.name), of(marked.field(1)).map(|t| t.name)), (Some("inet"), None));
         assert!(Arc::ptr_eq(&parsing(schema.clone(), |_| None), &schema), "none marked: the same schema");
         let text: ArrayRef = Arc::new(StringArray::from(vec![Some("10.0.0.1"), None]));
         let read = parsed(&text, marked.field(0)).expect("text for an inet").expect("an address");
-        assert_eq!((read.data_type(), read.is_null(1)), (&DataType::FixedSizeBinary(16), true));
+        assert_eq!((read.data_type(), read.is_null(1)), (&DataType::FixedSizeBinary(inet::WIDTH as i32), true));
         assert_eq!(show_of(marked.field(0)).expect("inet shows")(&read).unwrap().as_string::<i32>().value(0), "10.0.0.1");
         assert!(parsed(&text, marked.field(1)).is_none() && parsed(&(Arc::new(Int32Array::from(vec![1])) as ArrayRef), marked.field(0)).is_none());
         let refused = parsed(&(Arc::new(StringArray::from(vec!["10.0.0.256"])) as ArrayRef), marked.field(0)).unwrap().unwrap_err();

@@ -19756,7 +19756,12 @@ def inets():
     described as an inet, so asyncpg sends an address too. One that isn't an address is refused in Postgres's words
     (22P02), and a network waits for CIDR (0A000). pg_type has inet (category I, its array _inet); a column of one is
     inet in pg_attribute, information_schema and format_type; COPY … TO STDOUT writes its text. A table partitioned by an
-    INET column tiers into a part per address, named as the address shows (audit 11-21 M4: its bytes were cast to text)."""
+    INET column tiers into a part per address, named as the address shows (audit 11-21 M4: its bytes were cast to text).
+    Every other write door reads an address's text too (5-TY-c3c): POST /append's JSON rows and the Postgres port's COPY …
+    FROM STDIN (CSV and text), each refusing what isn't one with 22P02 and writing nothing. A view filters by address, a
+    materialized view's table keeps the type (a filter by address, SHOW CREATE), and so does a branch (CREATE DATABASE …
+    CLONE). A table of one publishes as Delta (binary) and Iceberg (fixed[17]), which DuckDB reads as its 17 bytes, its
+    family then the address; one partitioned by an INET column is refused publishing by name."""
     import asyncio
     import ipaddress
     import psycopg
@@ -19790,6 +19795,15 @@ def inets():
             return None
         except psycopg.Error as e:
             return (e.sqlstate, str(e).splitlines()[0])
+
+    def http_err(path, body):
+        """(status, x-pondra-sqlstate, body) of a POST; (200, None, '') when it went through."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, body, {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data) if r.status != 200 else (200, None, "")
 
     try:
         node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
@@ -19836,6 +19850,59 @@ def inets():
             return [(r["id"], r.get("ip")) for r in info["parted"]] == [(1, "10.0.0.1"), (2, "2001:db8::1"), (3, None), (4, "10.0.0.1")] \
                 and q("SELECT id FROM parted WHERE ip = '10.0.0.1' ORDER BY id") == [{"id": 1}, {"id": 4}]
         check("a table partitioned by an INET column tiers, and reads back and filters by address", parted)
+
+        def appended():
+            q("CREATE TABLE doors (id INT, ip INET)")
+            call(port, "POST", "/append/doors", b'{"id": 1, "ip": "10.0.0.1"}\n{"id": 2, "ip": "2001:db8::2"}\n{"id": 3, "ip": null}\n', timeout=60)
+            info["append bad"] = http_err("/append/doors", b'{"id": 8, "ip": "10.0.0.8"}\n{"id": 9, "ip": "nope"}\n')
+            return q("SELECT id, ip FROM doors ORDER BY id") == [{"id": 1, "ip": "10.0.0.1"}, {"id": 2, "ip": "2001:db8::2"}, {"id": 3}] \
+                and info["append bad"][:2] == (400, "22P02")
+        check("POST /append reads an address's text into an INET column, and refuses what isn't one with 22P02, writing nothing", appended)
+
+        def copied():
+            with psycopg.connect(url, autocommit=True) as conn:
+                with conn.cursor().copy("COPY doors (id, ip) FROM STDIN (FORMAT csv)") as cp:
+                    cp.write("4,10.0.0.4\n5,::5\n")
+                with conn.cursor().copy("COPY doors (id, ip) FROM STDIN") as cp:
+                    cp.write("6\t10.0.0.6\n")
+                try:
+                    with conn.cursor().copy("COPY doors (id, ip) FROM STDIN (FORMAT csv)") as cp:
+                        cp.write("7,10.0.0.7\n8,10.0.0.256\n")
+                    info["copy bad"] = None
+                except psycopg.Error as e:
+                    info["copy bad"] = (e.sqlstate, str(e).splitlines()[0])
+            return q("SELECT id, ip FROM doors WHERE id >= 4 ORDER BY id") == [{"id": 4, "ip": "10.0.0.4"}, {"id": 5, "ip": "::5"}, {"id": 6, "ip": "10.0.0.6"}] \
+                and (info["copy bad"] or ("",))[0] == "22P02"
+        check("the Postgres port's COPY … FROM STDIN (CSV and text) reads addresses, and refuses what isn't one with 22P02, writing nothing", copied)
+
+        def viewed():
+            q("CREATE VIEW near AS SELECT id, ip FROM doors WHERE id < 5")
+            q("CREATE MATERIALIZED VIEW seen AS SELECT ip, count(*) AS n FROM doors GROUP BY ip")
+            info["materialized"] = q("SELECT ip, n FROM seen WHERE ip = '10.0.0.1' OR ip = '::5' ORDER BY ip")
+            info["materialized definition"] = q("SELECT replace(definition, chr(10), ' ') AS d FROM pondra.objects WHERE name = 'seen'")
+            return q("SELECT id FROM near WHERE ip = '2001:db8::2'") == [{"id": 2}] and info["materialized"] == [{"ip": "10.0.0.1", "n": 1}, {"ip": "::5", "n": 1}]
+        check("a view filters by address, and a materialized view's table keeps the type: filtered by address, shown as text", viewed)
+
+        def branched():
+            db, dev = q("SELECT current_database() AS d")[0]["d"], f"inets_{uuid.uuid4().hex[:8]}"
+            q(f'CREATE DATABASE {dev} CLONE "{db}"')
+            LAKES.append(lake.rstrip("/").rsplit("/", 1)[0] + "/" + dev)  # (its folder, beside the lake: removed with it)
+            return q(f"SELECT id FROM {dev}.doors WHERE ip = '10.0.0.4'") == [{"id": 4}]
+        check("a branch (CREATE DATABASE … CLONE) keeps the type: filtered by address", branched)
+
+        def published():
+            import open_check
+            q("CREATE TABLE pub (id INT, ip INET) WITH (publish = 'delta,iceberg')")
+            q("INSERT INTO pub VALUES (1, '10.0.0.1'), (2, '::1')")
+            call(port, "POST", "/tier", timeout=300)
+            raw = lambda b: (b[0], str(ipaddress.IPv6Address(bytes(b[1:])).ipv4_mapped or ipaddress.IPv6Address(bytes(b[1:]))))
+            d = open_check.duck(lake)
+            info["duckdb delta"] = [(i, raw(b)) for i, b in d.execute(f"SELECT id, ip FROM delta_scan('{lake}/data/pub') ORDER BY id").fetchall()]
+            info["duckdb iceberg"] = [(i, raw(b)) for i, b in d.execute(f"SELECT id, ip FROM iceberg_scan('{open_check.iceberg_metadata(lake, 'pub')}') ORDER BY id").fetchall()]
+            info["published partitioned"] = http_err("/sql", b"CREATE TABLE pubp (id INT, ip INET) WITH (publish = 'iceberg', partition_by = 'ip')")
+            want = [(1, (4, "10.0.0.1")), (2, (6, "::1"))]
+            return info["duckdb delta"] == want and info["duckdb iceberg"] == want and "partitioned by ip" in info["published partitioned"][2]
+        check("published as Delta and Iceberg, DuckDB reads each address's 17 bytes (family, address); a table partitioned by one isn't published", published)
         if asyncpg is not None:
             async def apg():
                 conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")

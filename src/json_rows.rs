@@ -63,6 +63,8 @@ fn json_decoder(schema: &SchemaRef, text: &[bool], rows: usize) -> Result<datafu
     let fields = schema.fields().iter().zip(text).map(|(f, &t)| match (f.data_type().is_integer(), t) {
         (true, true) => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
         (true, false) => Arc::new(f.as_ref().clone().with_data_type(DataType::Float64)),
+        // (a type whose storage isn't its text, INET, is given as its text: `whole_batch` reads it)
+        (false, _) if crate::column_types::of(f).is_some_and(|t| t.parse.is_some()) => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8)),
         (false, _) => f.clone(),
     });
     let read = Arc::new(Schema::new(fields.collect::<Vec<_>>()));
@@ -78,7 +80,7 @@ fn whole_batch(batch: &RecordBatch, schema: &SchemaRef, text: &mut [bool]) -> Re
     for (i, (f, c)) in schema.fields().iter().zip(batch.columns()).enumerate() {
         let t = f.data_type();
         let column = match (t.is_integer(), text[i]) {
-            (false, _) => c.clone(),
+            (false, _) => crate::column_types::parsed(c, f).transpose()?.unwrap_or_else(|| c.clone()), // (an INET's text: its bytes)
             (true, true) => text_column(c.as_string_view(), t)?,
             (true, false) => match doubles(c.as_primitive::<Float64Type>(), t) {
                 Some(whole) => whole,

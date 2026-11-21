@@ -162,11 +162,11 @@ class Exact:
 
 def as_text(field):
     """How a column of a Pondra column type whose storage isn't text shows, by its Arrow extension name, as Pondra's JSON and
-    CSV answers show it: INET (`pondra.inet`, 16 bytes) as Postgres shows a host, an IPv4-mapped address as IPv4. None for
+    CSV answers show it: INET (`pondra.inet`: its family, 4 or 6, then 16 bytes, IPv4 mapped) as Postgres shows a host. None for
     any other column, which shows as its Arrow type does."""
     import ipaddress
     if (field.metadata or {}).get(b"ARROW:extension:name") == b"pondra.inet":
-        return lambda v: str((lambda a: a.ipv4_mapped or a)(ipaddress.IPv6Address(bytes(v))))
+        return lambda v: str((lambda f, a: a.ipv4_mapped if f == 4 else a)(bytes(v)[0], ipaddress.IPv6Address(bytes(v)[1:])))
     return None
 
 

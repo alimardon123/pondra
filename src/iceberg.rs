@@ -636,6 +636,7 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
             "Binary" | "LargeBinary" => "binary".into(),
             t => match t.parse() {
                 Ok(DataType::Timestamp(TimeUnit::Microsecond, tz)) => if tz.is_some() { "timestamptz" } else { "timestamp" }.into(),
+                Ok(DataType::FixedSizeBinary(n)) => format!("fixed[{n}]"), // (an INET's bytes, as its Parquet holds them)
                 _ => crate::delta::decimal(t).map(|(p, s)| format!("decimal({p}, {s})"))?,
             },
         })

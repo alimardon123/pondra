@@ -358,12 +358,11 @@ fn vector_text(raw: &[u8]) -> anyhow::Result<String> {
 const INET4: u8 = 2;
 const INET6: u8 = 3;
 
-/// An INET's 16 bytes (`column_types::inet`, IPv4 mapped into IPv6) in Postgres's binary form, a host's full mask.
+/// An INET's bytes (`column_types::inet`: its family, then its address) in Postgres's binary form, a host's full mask.
 pub(crate) fn inet_binary(stored: &[u8]) -> Vec<u8> {
-    let v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(stored).unwrap_or_default());
-    match v6.to_ipv4_mapped() {
-        Some(v4) => [&[INET4, 32, 0, 4][..], &v4.octets()].concat(),
-        None => [&[INET6, 128, 0, 16][..], &v6.octets()].concat(),
+    match crate::column_types::inet::address(stored) {
+        std::net::IpAddr::V4(v4) => [&[INET4, 32, 0, 4][..], &v4.octets()].concat(),
+        std::net::IpAddr::V6(v6) => [&[INET6, 128, 0, 16][..], &v6.octets()].concat(),
     }
 }
 
@@ -467,7 +466,7 @@ mod tests {
         assert!(bin(Type::INET, &[2, 32, 0, 16, 10, 0, 0, 1]).starts_with("ERR 22P03"));
         assert!(bin(Type::INET, &[9, 32, 0, 4, 10, 0, 0, 1]).starts_with("ERR 22P03: invalid address family"));
         assert!(bin(Type::INET, &[2, 32]).starts_with("ERR 22P03"));
-        for given in ["10.0.0.1", "::1", "2001:db8::1", "1.2.3.4"] {
+        for given in ["10.0.0.1", "::1", "2001:db8::1", "1.2.3.4", "::ffff:1.2.3.4"] {
             let stored = crate::column_types::inet::bytes(given).unwrap();
             assert_eq!(inet_text(&inet_binary(&stored)).unwrap(), given, "sent and read back");
         }
