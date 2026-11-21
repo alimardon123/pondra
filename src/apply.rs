@@ -1004,8 +1004,7 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta, scope: &crate::r
     let list = |v: &Value| -> Vec<String> { serde_json::from_value(v.clone()).unwrap_or_default() };
     let key: Vec<String> = list(&opts["key"]);
     ensure!(key == m.key, "its key is ({}) here and ({}) in the project: another key is another table (make it, and move the rows in a migration)", m.key.join(", "), key.join(", "));
-    let partition = opts["partition_by"].as_str().map(String::from);
-    ensure!(partition == m.partition, "its partition_by can't change: each file holds one partition (make a new table in a migration)");
+    let partition = opts["partition_by"].as_str().map(|p| crate::partition::renamed(p, |c| c.to_string())).filter(|p| !p.is_empty());
     let merge: BTreeMap<String, String> = serde_json::from_value(opts["merge"].clone()).unwrap_or_default();
     ensure!(merge == m.merge, "its merge functions can't change in place");
     let not_null: Vec<String> = list(&opts["not_null"]).into_iter().chain(key.iter().cloned()).collect();
@@ -1023,6 +1022,9 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta, scope: &crate::r
     let kept = m.list().columns.iter().filter(|c| c.default.is_some()).all(|c| defaults.contains_key(c.stored_name()));
     ensure!(defaults.iter().filter(|(c, _)| !added.contains(&c.as_str())).all(|(c, v)| had(c.as_str()) == Some(v)) && kept, "its DEFAULTs differ: a migration's");
     let mut set = vec![];
+    if partition != m.partition {
+        set.push(format!("partition_by = {}", text(partition.as_deref().unwrap_or(""))));
+    }
     let publish = opts.get("publish").filter(|v| !v.is_null()).map(list).unwrap_or_else(crate::store::default_publish);
     if publish != m.publish {
         set.push(format!("publish = {}", text(&publish.join(","))));

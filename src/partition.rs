@@ -90,6 +90,15 @@ impl Spec {
     }
 }
 
+/// `text` with its columns named by `name` (stored names to SQL's), as written: `day(ts), bucket(16, id)`. A text that
+/// doesn't parse comes back as it is.
+pub fn renamed(text: &str, name: impl Fn(&str) -> String) -> String {
+    match Spec::parse(text) {
+        Ok(s) => s.fields.into_iter().map(|f| text_of(&Field { column: name(&f.column), ..f })).collect::<Vec<_>>().join(", "),
+        Err(_) => text.to_string(),
+    }
+}
+
 fn field(text: &str) -> Result<Field> {
     let unquote = |c: &str| c.trim().trim_matches('"').to_string();
     let Some((name, rest)) = text.split_once('(') else {

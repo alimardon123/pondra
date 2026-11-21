@@ -861,7 +861,14 @@ pub struct TableMeta {
     #[serde(default)]
     pub ttl: Option<(String, u64)>, // keyed tables: a row whose (timestamp) column is older than this many seconds is gone
     #[serde(default)]
-    pub partition: Option<String>, // append tables: every file holds one value of this ("col", "day(col)", "hour(col)", "month(col)")
+    pub partition: Option<String>, // append tables: every file holds one value of this ("col", "day(col)", "bucket(16, col)", …: `partition.rs`)
+    /// Append tables: the id of `partition`, which each file written under it keeps (`DataFile::spec`); ALTER TABLE … SET
+    /// (partition_by = …) raises it. 0: the table's first.
+    #[serde(default, skip_serializing_if = "is_zero_spec")]
+    pub spec: u32,
+    /// The specs the table had before, by id, for the files still split by them ("" for none): `spec_of`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub specs: BTreeMap<u32, String>,
     /// Keyed tables: of a key's rows, the one with the greatest value of this column is current
     /// (its event time: a late row doesn't replace a newer one), not the one that came last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1149,10 +1156,16 @@ impl TableMeta {
 
     /// `partition_by` under SQL's names (`day(ts)`, or a column), as `logical()` has it, without copying the entry.
     pub fn sql_partition(&self) -> Option<String> {
-        self.partition.as_ref().map(|p| match p.split_once('(') {
-            Some((f, c)) => format!("{f}({})", self.name_of(c.trim_end_matches(')'))),
-            None => self.name_of(p).to_string(),
-        })
+        self.partition.as_ref().map(|p| crate::partition::renamed(p, |c| self.name_of(c).to_string()))
+    }
+
+    /// The spec `f`'s part was split by (stored names): the table's current one, or the one it had when `f` was written.
+    /// None: `f` holds no partition.
+    pub fn spec_of(&self, f: &DataFile) -> Option<&str> {
+        match f.spec == self.spec {
+            true => self.partition.as_deref(),
+            false => self.specs.get(&f.spec).map(String::as_str).filter(|s| !s.is_empty()),
+        }
     }
 
     /// SQL's columns, as `logical()` has them, without copying the rest of the entry (its files).
@@ -1421,6 +1434,8 @@ impl Segment {
         parts + self.files.get(table).map_or(0, |f| f.added.iter().map(|d| d.rows).sum::<u64>())
     }
 }
+
+fn is_zero_spec(n: &u32) -> bool { *n == 0 }
 
 pub fn table_key(t: &str) -> String { format!("t/{t}") }
 

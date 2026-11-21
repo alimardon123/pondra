@@ -186,12 +186,13 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
         // size at a time (`class`), and all of them before they're sealed (manifests never change,
         // so they'd stay small).
         let sealing: std::collections::HashSet<&str> = crate::manifest::to_seal(&meta).iter().map(|f| f.path.as_str()).collect();
-        let mut by_part: BTreeMap<(&str, bool, u32), Vec<DataFile>> = BTreeMap::new();
+        // (and of one spec: a merge of files split by an earlier one writes them under the table's own, `run`)
+        let mut by_part: BTreeMap<(u32, &str, bool, u32), Vec<DataFile>> = BTreeMap::new();
         small.iter().for_each(|f| {
             let sealing = sealing.contains(f.path.as_str());
-            by_part.entry((f.part.as_str(), sealing, if sealing { 0 } else { class(f.bytes) })).or_default().push(f.clone())
+            by_part.entry((f.spec, f.part.as_str(), sealing, if sealing { 0 } else { class(f.bytes) })).or_default().push(f.clone())
         });
-        let mut groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing, _), g)| {
+        let mut groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, _, sealing, _), g)| {
             let (least, most) = if sealing { (2, 32) } else { (8, 8) };
             if g.len() < least {
                 return vec![];
@@ -336,10 +337,10 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
         crate::manifest::unseal(lake, table, &mut meta, list, &sealed).await?; // (a sealed file's record changes: it comes back inline)
         // A job per partition (a delete file holds one, as Iceberg asks), of bounded size.
         let mut groups: Vec<Vec<DataFile>> = vec![];
-        hit.sort_by(|a, b| a.part.cmp(&b.part));
+        hit.sort_by(|a, b| (a.spec, &a.part).cmp(&(b.spec, &b.part)));
         for f in hit.iter().cloned() {
             match groups.last_mut() {
-                Some(g) if g[0].part == f.part && g.iter().map(|f| f.bytes).sum::<u64>() + f.bytes <= MERGE_BYTES => g.push(f),
+                Some(g) if (g[0].spec, &g[0].part) == (f.spec, &f.part) && g.iter().map(|f| f.bytes).sum::<u64>() + f.bytes <= MERGE_BYTES => g.push(f),
                 _ => groups.push(vec![f]),
             }
         }
@@ -677,9 +678,15 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
                     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema.clone(), futures::TryStreamExt::try_flatten(each)))
                 }
             };
-            let (ord, part) = (files.iter().map(|f| f.ord).max().unwrap_or(0), files[0].part.clone());
-            let mut merged = write_stream(lake, &table, rows, 4_000_000, &keys, None).await?;
-            merged.iter_mut().for_each(|f| (f.ord, f.part) = (ord, part.clone()));
+            let (ord, part, spec) = (files.iter().map(|f| f.ord).max().unwrap_or(0), files[0].part.clone(), files[0].spec);
+            // (files split by an earlier spec are split again by the table's own as they merge: ALTER TABLE … SET
+            // (partition_by = …) moves the small ones over this way, and the others prune by their own spec)
+            let respec = spec != meta.spec;
+            let mut merged = write_stream(lake, &table, rows, 4_000_000, &keys, meta.partition.as_deref().filter(|_| respec)).await?;
+            merged.iter_mut().for_each(|f| match respec {
+                true => (f.ord, f.spec) = (ord, meta.spec),
+                false => (f.ord, f.part, f.spec) = (ord, part.clone(), spec),
+            });
             return Ok(merged);
         }
     };
@@ -695,7 +702,7 @@ async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<Re
     let mut files = vec![];
     for (part, batches) in parts {
         if let Some(f) = write_file(lake, table, &batches, keys).await? {
-            files.push(DataFile { ord, whole, part, ..f });
+            files.push(DataFile { ord, whole, part, spec: meta.spec, ..f });
         }
     }
     Ok(files)
