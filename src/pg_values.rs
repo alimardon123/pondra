@@ -3,6 +3,8 @@
 //! Pure, with no portal and no pgwire encoder, so the unit tests at the end run alone.
 
 use pgwire::api::Type;
+use postgres_types::Kind;
+use crate::pg_oids::VECTOR;
 use crate::pg_bytea;
 use crate::pg_text::{interval_text, time_text};
 
@@ -45,6 +47,7 @@ fn literal(t: &Type, text: &str) -> anyhow::Result<String> {
             let (months, days, micros) = interval_of(text).ok_or_else(|| bad("interval", "22007"))?;
             format!("INTERVAL '{months} months {days} days {micros} microseconds'")
         }
+        ref t if t.oid() == VECTOR => vector_literal(text)?,
         _ => quoted(text),
     })
 }
@@ -292,8 +295,59 @@ fn binary_text(t: &Type, raw: &[u8]) -> anyhow::Result<String> {
             let months = i32::from_be_bytes(b[12..16].try_into().map_err(|_| short())?);
             interval_text(months.into(), days.into(), micros)
         }
+        ref t if t.oid() == VECTOR => vector_text(raw)?,
         _ => return Err(crate::codes::coded("0A000", format!("a {} parameter in binary isn't taken: send it as text", t.name()))),
     })
+}
+
+/// pgvector's `vector` (`pg_oids::VECTOR`): a parameter's type when the client names it by its oid (`types`).
+pub(crate) fn vector_type() -> Type { Type::new("vector".into(), VECTOR, Kind::Simple, "public".into()) }
+
+/// A Parse's parameter types, as the client gave them, with pgvector's `vector` among them: pgwire knows Postgres's own
+/// types by their oids, and none of an extension's, which pgvector's drivers send theirs with (`register_vector`).
+pub(crate) fn types(given: &mut [Option<Type>], oids: &[u32]) {
+    for (t, _) in given.iter_mut().zip(oids).filter(|(t, oid)| t.is_none() && **oid == VECTOR) {
+        *t = Some(vector_type());
+    }
+}
+
+/// A `vector` in pgvector's text form, `[1,2,3]`, as a list of reals, each the float4 pgvector keeps: `CAST([1, 2,
+/// 0.10000000149011612] AS REAL[])` (a float4 written as the float8 it is exactly, so the cast gives it back). A list of
+/// the wrong length for a VECTOR(n) column is refused where it is written (22000). Refused as pgvector refuses it: what
+/// isn't a list of numbers (22P02), no element or more than 16000 (22000, 54000), NaN or an infinite one (22000).
+fn vector_literal(text: &str) -> anyhow::Result<String> {
+    let bad = || crate::codes::coded("22P02", format!("invalid input syntax for type vector: \"{text}\""));
+    let items = crate::casts::list_literal(text).map_err(|_| bad())?;
+    let floats = items.iter().map(|x| x.as_deref().and_then(|x| x.trim().parse::<f32>().ok()).ok_or_else(bad)).collect::<anyhow::Result<Vec<f32>>>()?;
+    let refused = |code: &'static str, m: &str| Err(crate::codes::coded(code, m.to_string()));
+    match floats.len() {
+        0 => return refused("22000", "vector must have at least 1 dimension"),
+        n if n > 16000 => return refused("54000", "vector cannot have more than 16000 dimensions"),
+        _ => {}
+    }
+    if floats.iter().any(|x| x.is_nan()) {
+        return refused("22000", "NaN not allowed in vector");
+    }
+    if floats.iter().any(|x| x.is_infinite()) {
+        return refused("22000", "infinite value not allowed in vector");
+    }
+    Ok(format!("CAST([{}] AS REAL[])", floats.iter().map(|x| f64::from(*x).to_string()).collect::<Vec<_>>().join(", ")))
+}
+
+/// A `vector` in pgvector's binary form, as its text form: its dimensions (int16), an int16 kept 0, then each element, a
+/// float4, all big-endian.
+fn vector_text(raw: &[u8]) -> anyhow::Result<String> {
+    let wrong = || crate::codes::coded("22P03", "the binary value of a vector parameter has the wrong length");
+    let (head, rest) = raw.split_at_checked(4).ok_or_else(wrong)?;
+    let (dim, unused) = (u16::from_be_bytes([head[0], head[1]]) as usize, u16::from_be_bytes([head[2], head[3]]));
+    if unused != 0 {
+        return Err(crate::codes::coded("22023", format!("expected unused to be 0, not {unused}")));
+    }
+    if rest.len() != dim * 4 {
+        return Err(wrong());
+    }
+    let floats = rest.chunks_exact(4).map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string()); // (Rust's text of a float reads back to it)
+    Ok(format!("[{}]", floats.collect::<Vec<_>>().join(",")))
 }
 
 /// `sql` with `$1`, `$2`… replaced by `values` (their literals, in order), each replaced once: a
@@ -360,6 +414,28 @@ mod tests {
         assert_eq!(lit(Type::TIMESTAMPTZ, "2020-01-01 13:00:00+01"), "TIMESTAMPTZ '2020-01-01T12:00:00Z'");
         assert_eq!(lit(Type::TIMESTAMPTZ, "2020-01-01T12:00:00.123456Z"), "TIMESTAMPTZ '2020-01-01T12:00:00.123456Z'");
         assert_eq!(lit(Type::TIMESTAMPTZ, "2020-01-01 12:00:00"), "TIMESTAMPTZ '2020-01-01T12:00:00Z'");
+    }
+
+    #[test]
+    fn a_vector_is_read_in_pgvectors_text_and_binary_forms_and_refused_as_it_refuses() {
+        let v = vector_type();
+        assert_eq!(lit(v.clone(), "[1,2, 3]"), "CAST([1, 2, 3] AS REAL[])");
+        assert_eq!(lit(v.clone(), "[0.1,-2.5e3]"), "CAST([0.10000000149011612, -2500] AS REAL[])"); // (the float4, exactly)
+        let binary = |dim: u16, unused: u16, xs: &[f32]| [dim.to_be_bytes(), unused.to_be_bytes()].concat().into_iter().chain(xs.iter().flat_map(|x| x.to_be_bytes())).collect::<Vec<u8>>();
+        assert_eq!(bin(v.clone(), &binary(3, 0, &[1.0, 0.1, -3.5])), "CAST([1, 0.10000000149011612, -3.5] AS REAL[])");
+        assert!(bin(v.clone(), &binary(3, 0, &[1.0, 2.0])).starts_with("ERR 22P03"), "fewer elements than it says");
+        assert!(bin(v.clone(), &binary(1, 7, &[1.0])).starts_with("ERR 22023: expected unused to be 0, not 7"));
+        assert!(bin(v.clone(), &[0, 1]).starts_with("ERR 22P03"));
+        assert!(bin(v.clone(), &binary(1, 0, &[f32::NAN])).starts_with("ERR 22000: NaN not allowed in vector"));
+        assert!(lit(v.clone(), "[1,inf]").starts_with("ERR 22000: infinite value not allowed in vector"));
+        assert!(lit(v.clone(), "[]").starts_with("ERR 22000: vector must have at least 1 dimension"));
+        assert!(lit(v.clone(), &format!("[{}]", vec!["1"; 16001].join(","))).starts_with("ERR 54000"));
+        for bad in ["[1,a]", "[1,NULL]", "1,2", "[1,2"] {
+            assert!(lit(v.clone(), bad).starts_with("ERR 22P02: invalid input syntax for type vector"), "{bad}");
+        }
+        let mut given = vec![None, Some(Type::INT4), None];
+        types(&mut given, &[VECTOR, 23, 0]);
+        assert_eq!(given.iter().map(|t| t.as_ref().map(|t| t.oid())).collect::<Vec<_>>(), [Some(VECTOR), Some(23), None]);
     }
 
     #[test]
