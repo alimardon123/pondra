@@ -79,6 +79,7 @@ mod divide;
 mod sparksql;
 mod parsed;
 mod context;
+mod mentioned;
 mod languages;
 mod dialect;
 mod passes;

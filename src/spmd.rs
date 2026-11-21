@@ -524,8 +524,7 @@ async fn shared(lake: &Lake, s: &Slice, scope: &crate::rights::Scope) -> Result<
     ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
     let views = crate::query::stored_views(lake, &s.sql, false, node).await?;
     let text = views.iter().fold(s.sql.clone(), |t, (_, v)| format!("{t} {v}"));
-    let deleted = crate::query::names_deleted(&text); // (as `session_for` decides)
-    let sys_cols = crate::sys::mentioned(&text); // (a query naming `_row_id`: its tables get their system columns, as `session_for` gives them)
+    let (sys_cols, deleted) = crate::mentioned::columns(&text); // (as `session_for` decides: a query naming `_row_id`, its tables get their system columns)
     let sys = |m: TableMeta| if sys_cols { crate::sys::with_sys(&m) } else { m };
     {
         for (t, meta) in &s.whole {
