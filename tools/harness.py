@@ -12064,6 +12064,15 @@ def row_filters():
     narrowed = pg_said(c, "SELECT id FROM orders ORDER BY id")
     checks["Postgres reads as HTTP does; an open connection reads a grant and a REVOKE … WHERE at its next statement"] = \
         before == [(i,) for i in [0, 1, 2, 3, 8]] and widened == [(i,) for i in [0, 1, 2, 3, 4, 5, 6, 8]] and narrowed == [(i,) for i in [4, 5, 6, 8]]
+    # (11-20 audit H2: a filter is read in its own dialect, never its reader's. MySQL's reads "Region" as a string, so the
+    # filter would be always true there)
+    for q in ['CREATE TABLE quoted (id BIGINT, "Region" VARCHAR)', "INSERT INTO quoted VALUES (1, 'eu'), (2, 'secret')",
+              'GRANT SELECT ON quoted TO ann WHERE "Region" <> \'secret\'']:
+        as_(boss, q)
+    said["mysql set"] = pg_said(c, "SET datafusion.sql_parser.dialect = 'mysql'")
+    said["mysql"] = pg_said(c, "SELECT id FROM quoted ORDER BY id")
+    checks["a filter is read in its own dialect, not its reader's: in a MySQL session its quoted name is still a column (11-20 audit H2)"] = \
+        said["mysql"] == [(1,)]
     c.close()
     # A writer a filter holds changes the rows it reads only: a one-key UPDATE of a key it can't read changes nothing (it
     # would be read without planning, so without the filter: `txn::point_change`)
