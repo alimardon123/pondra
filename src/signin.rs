@@ -12,7 +12,7 @@
 //!
 //! A door keeps only its own: its wire's codes, whether a password may cross a plain connection (`tls`), and what
 //! a credential that signs nobody in is where one isn't needed (an open node's caller, the shell's own). SCRAM's two
-//! messages (piece 3) and OAUTHBEARER's error round (piece 4) move in next.
+//! messages are here too (`scram_first`, `scram_last`, piece 3); OAUTHBEARER's error round (piece 4) moves in next.
 use crate::app::App;
 use crate::auth::{Credential, Principal};
 
@@ -111,6 +111,44 @@ impl Attempt<'_> {
         match crate::users::password_ok(&self.app.lake, user, password).await {
             true => Ok(()),
             false => Err(self.refuse(&credential, None).await),
+        }
+    }
+
+    /// SCRAM's first message (Postgres): refused at once when its name is locked out from this address, as `check` is;
+    /// else the exchange begun and SCRAM's answer, under the name's verifier: a built-in name's token, a user's password,
+    /// or, for a name with neither, one no password fits, so it is told what a wrong password is, at the end, and no sooner.
+    pub async fn scram_first(&self, user: &str, first: &str) -> Result<(crate::users::Scram, String), Refusal> {
+        if let Some(wait) = crate::auth::guessing(&self.app.lake, self.client, user) {
+            return Err(self.refused(Kind::Locked(wait), user, crate::auth::guessing_says(user, wait)).await);
+        }
+        let verifier = match crate::users::BUILT_IN.contains(&user) {
+            true => self.app.auth.token_for(user).filter(|t| !t.is_empty()).map(|t| crate::users::Verifier::of(&t)),
+            false => crate::users::verifier(&self.app.lake, user).await,
+        };
+        let verifier = verifier.unwrap_or_else(|| crate::users::Verifier::of(&uuid::Uuid::new_v4().to_string()));
+        match crate::users::Scram::first(verifier, first) {
+            Ok(begun) => Ok(begun),
+            Err(_) => Err(self.refused(Kind::Password, user, WRONG_PASSWORD.into()).await), // (a message that can't be read)
+        }
+    }
+
+    /// SCRAM's last message: whom it signs in, and SCRAM's final answer; a wrong proof is a wrong password, counted as
+    /// `refuse` counts one, except a built-in name's, whose password is its token, random and never guessed.
+    pub async fn scram_last(&self, begun: crate::users::Scram, user: &str, last: &str) -> Result<(Principal, String), Refusal> {
+        let built_in = crate::users::BUILT_IN.contains(&user);
+        let Ok(reply) = begun.last(last) else {
+            if !built_in {
+                crate::auth::guessed(&self.app.lake, self.client, user);
+            }
+            return Err(self.refused(Kind::Password, user, WRONG_PASSWORD.into()).await);
+        };
+        let who = match built_in {
+            true => Some(Principal::token(self.app.auth.role_of_user(user))),
+            false => crate::users::principal(&self.app.lake, user).await.ok(),
+        };
+        match who {
+            Some(p) => Ok((p, reply)),
+            None => Err(self.refused(Kind::Password, user, WRONG_PASSWORD.into()).await),
         }
     }
 

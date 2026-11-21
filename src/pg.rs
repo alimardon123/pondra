@@ -259,7 +259,6 @@ fn startup_options(options: &str) -> Result<Vec<(String, String)>, String> {
     Ok(settings)
 }
 
-/// A sign-in refused outright: FATAL, SQLSTATE 28000, with why (the connection ends with it).
 /// A refused sign-in as Postgres says it (`signin::Refusal`): a wrong password in pgwire's own words (28P01), a token
 /// that signs nobody in with why (28P01), a name locked out or a message that can't be read 28000.
 fn said_no(user: &str, r: crate::signin::Refusal) -> PgWireError {
@@ -270,16 +269,8 @@ fn said_no(user: &str, r: crate::signin::Refusal) -> PgWireError {
     }
 }
 
+/// A sign-in refused outright: FATAL, SQLSTATE 28000, with why (the connection ends with it).
 fn fatal(why: String) -> PgWireError { PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28000".into(), why))) }
-
-/// A sign-in refused for its failures from this address (`auth::guessing`), the right password too: it is
-/// audited as HTTP's is, and waits 400 ms first, as a wrong guess does.
-async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAddr>, wait: u64) -> PgWireError {
-    let why = crate::auth::guessing_says(user, wait);
-    crate::audit::refused(app, user, "postgres", from, "sign in", &why).await;
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    fatal(why)
-}
 
 impl Startup {
     /// The client's address and whether it came over TLS: its connection's, or what its host said of a client it passed on
@@ -398,11 +389,7 @@ impl StartupHandler for Startup {
         let app = &self.backend.app;
         let (at, secure) = self.peer(client); // (the client's: `peer`)
         let from = Some(at);
-        let ip = from.map(|a| a.ip()); // (failed sign-ins are counted per address and user name: `auth::guessing`)
-        let wrong = async |user: &str| {
-            crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password").await;
-            PgWireError::InvalidPassword(user.to_string())
-        };
+        let attempt = crate::signin::Attempt::at(app, "postgres", from); // (counted by the client's address: `peer`)
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
                 if !crate::tls::pg_allowed(secure, at) {
@@ -445,7 +432,7 @@ impl StartupHandler for Startup {
                 }
                 // (signed in as at every door, `signin::Attempt`: the lock, whom it signs in, the count, 400 ms, the audit)
                 let credential = crate::auth::Credential::Password { user: user.clone(), password: password.clone() };
-                let who = match crate::signin::Attempt::at(app, "postgres", from).sign_in(&credential).await {
+                let who = match attempt.sign_in(&credential).await {
                     Ok(who) => who,
                     Err(r) => return Err(said_no(&user, r)),
                 };
@@ -461,39 +448,17 @@ impl StartupHandler for Startup {
                 let mut scram = self.scram.lock().await;
                 match scram.take() {
                     None => {
-                        // (refused before SCRAM answers: a user who failed ten times in a minute from this address)
-                        if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
-                            return Err(guessing_refused(app, &user, from, wait).await);
-                        }
+                        // (signed in as at every door, `signin::Attempt`: the lock first, then SCRAM's answer)
                         let first = m.into_sasl_initial_response()?;
                         let text = String::from_utf8_lossy(first.data.as_deref().unwrap_or_default()).to_string();
-                        // (a token's role: its token as the password; a user: its verifier; nobody: one no password fits)
-                        let verifier = match crate::users::BUILT_IN.contains(&user.as_str()) {
-                            true => app.auth.token_for(&user).filter(|t| !t.is_empty()).map(|t| crate::users::Verifier::of(&t)),
-                            false => crate::users::verifier(&app.lake, &user).await,
-                        };
-                        let Ok((exchange, reply)) = crate::users::Scram::first(verifier.unwrap_or_else(|| crate::users::Verifier::of(&uuid::Uuid::new_v4().to_string())), &text) else {
-                            return Err(wrong(&user).await);
-                        };
+                        let (exchange, reply) = attempt.scram_first(&user, &text).await.map_err(|r| said_no(&user, r))?;
                         *scram = Some((exchange, user));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLContinue(reply.into_bytes().into()))).await?;
                     }
                     Some((exchange, user)) => {
                         let last = m.into_sasl_response()?;
                         let text = String::from_utf8_lossy(&last.data).to_string();
-                        let Ok(reply) = exchange.last(&text) else {
-                            // (a built-in name's password is its token, random and never guessed)
-                            if !crate::users::BUILT_IN.contains(&user.as_str()) {
-                                crate::auth::guessed(&app.lake, ip, &user);
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time)
-                            return Err(wrong(&user).await);
-                        };
-                        let who = match crate::users::BUILT_IN.contains(&user.as_str()) {
-                            true => Some(crate::auth::Principal::token(app.auth.role_of_user(&user))),
-                            false => crate::users::principal(&app.lake, &user).await.ok(),
-                        };
-                        let Some(who) = who else { return Err(wrong(&user).await) };
+                        let (who, reply) = attempt.scram_last(exchange, &user, &text).await.map_err(|r| said_no(&user, r))?;
                         let again = Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() };
                         self.backend.signed_in(who.at("postgres", from), Some(again));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
