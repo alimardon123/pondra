@@ -31,7 +31,7 @@ in TPC-H.
   but read as `Utf8View`: Parquet decodes into views without copying the bytes, and DataFusion's
   string filters, joins and grouping take their fast paths. Rows going the other way (the log,
   writes, Delta/Iceberg schemas) stay `Utf8`, so nothing outside the read path changes.
-- **LZ4 is the default Parquet codec** (`PONDRA_CODEC`, `tier::codec`). ZSTD(1) files are a
+- **LZ4 is the default Parquet codec** (`PONDRA_CODEC`, `file_formats::parquet::codec`). ZSTD(1) files are a
   third smaller but decode much more slowly: TPC-H runs 13-20% faster on LZ4. `PONDRA_CODEC=zstd`
   where storage or bandwidth costs more than CPU; `snappy` and `none` are there too.
 - **Engine settings Pondra starts from** (`optimize::config`): `0.06 + 0.01` is the exact decimal

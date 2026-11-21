@@ -1257,7 +1257,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    its rows upserts, the keys it deletes (files taken out, positions, equality deletes by the key)
    markers before them; tiered and published before the answer. `order_by` and merge tables refuse
    it. `harness.py upserts`, `formats_check.py --spark … --only commits`.
-165. **Data files carry no Arrow schema in their footers** (`tier::plain`): Parquet's own types only,
+165. **Data files carry no Arrow schema in their footers** (`file_formats::parquet::plain`): Parquet's own types only,
    so other engines' Arrow reads strings as strings, not views (PyArrow can't yet take rows of a
    `string_view`, which PyIceberg does to apply a position delete). `harness.py upserts`.
 166. **Finding Python never waits on one Python** (`python::candidates`, `probe`): every Python the

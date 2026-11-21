@@ -96,7 +96,7 @@ keep_load -> tier  1
 keep_load -> write  1
 keep_parquet -> adopt  1
 keep_parquet -> sys  1
-keep_parquet -> tier  3
+keep_parquet -> tier  1
 kv -> fetch  1
 kv -> wasm32  6
 lake_files -> ext_names  1

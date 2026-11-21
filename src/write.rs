@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::text::{first_word, head, ident, object};
+use crate::file_formats::{TableFileFormat, TableWriter};
 pub(crate) use crate::rules::fit::{by_position, implicit};
 pub(crate) use crate::rules::create::{definition, option_text};
 #[cfg(test)] pub(crate) use crate::rules::fit::fit;
@@ -2107,7 +2108,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
             if next.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 // (no rows: one file of none, so the node answers it as any INSERT of none)
                 let stored = crate::answer::storable(&RecordBatch::new_empty(schema))?.schema();
-                stage_put(lake, dir, crate::tier::writer(stored, &[])?, next).await?;
+                stage_put(lake, dir, crate::file_formats::parquet::PARQUET.writer(stored, &[])?, next).await?;
             }
             Ok(names)
         }
@@ -2138,7 +2139,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
 /// One partition's rows, written as the staged files of `dir`: each file is cut once it holds `STAGE_BYTES` and put as the next.
 async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: datafusion::execution::SendableRecordBatchStream, next: &std::sync::atomic::AtomicU64) -> Result<()> {
     use futures::StreamExt;
-    let mut open: Option<datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>> = None;
+    let mut open: Option<Box<dyn TableWriter>> = None;
     while let Some(batch) = rows.next().await.transpose()? {
         if batch.num_rows() == 0 {
             continue;
@@ -2146,11 +2147,11 @@ async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: dataf
         // (as Parquet holds it: an INTERVAL as its text, which the node's INSERT casts back exactly, as a tier file's is)
         let batch = crate::answer::storable(&RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?)?;
         if open.is_none() {
-            open = Some(crate::tier::writer(batch.schema(), &[])?); // (the properties `write_files`' files have: no system columns, no statistics kept)
+            open = Some(crate::file_formats::parquet::PARQUET.writer(batch.schema(), &[])?); // (the properties `write_files`' files have: no system columns, no statistics kept)
         }
         let w = open.as_mut().expect("a file is open");
         w.write(&batch)?;
-        if w.bytes_written() + w.in_progress_size() >= STAGE_BYTES {
+        if w.bytes() >= STAGE_BYTES {
             stage_put(lake, dir, open.take().expect("a file is open"), next).await?;
         }
     }
@@ -2165,9 +2166,8 @@ pub(crate) const STAGED_FILES_MOST: u64 = 1_000_000;
 
 /// One staged file, finished, put as the next `<n>.parquet` of `dir`: a create, so a file that is there is an earlier try's and is
 /// refused, not overwritten.
-async fn stage_put(lake: &Lake, dir: &str, mut w: datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>, next: &std::sync::atomic::AtomicU64) -> Result<()> {
-    w.finish()?;
-    let bytes = std::mem::take(w.inner_mut());
+async fn stage_put(lake: &Lake, dir: &str, w: Box<dyn TableWriter>, next: &std::sync::atomic::AtomicU64) -> Result<()> {
+    let bytes = w.finish()?.bytes;
     let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= STAGED_FILES_MOST {
         return Err(crate::codes::coded("54000", "a staged INSERT takes a million files at most")); // (Postgres's program limit exceeded)

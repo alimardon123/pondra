@@ -30,7 +30,7 @@ use datafusion::parquet::schema::types::{ColumnDescPtr, SchemaDescriptor, Type a
 use std::ops::Range;
 use std::sync::Arc;
 
-/// What a kept file may hold: `tier::FILE_BYTES` and `tier::ROW_GROUP_BYTES` (the tests: small).
+/// What a kept file may hold: `tier::FILE_BYTES` and `file_formats::parquet::ROW_GROUP_BYTES` (the tests: small).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
     pub file: usize,
@@ -91,7 +91,7 @@ pub(crate) fn plan(md: &ParquetMetaData, table: &Schema, limits: &Limits) -> Res
             return Err(format!("column {} is a decimal the file holds as bytes, which reads slower than the integers a written file holds", f.name()));
         }
     }
-    let to = crate::tier::codec();
+    let to = crate::file_formats::parquet::codec();
     let budget = limits.file.saturating_sub(room(limits.file)) as u64;
     let mut spans = Vec::with_capacity(md.num_row_groups());
     for (g, rg) in md.row_groups().iter().enumerate() {
@@ -177,7 +177,7 @@ pub(crate) struct Sys {
 }
 
 /// Writes one cut as one file of ours: its row groups' chunks copied as they are, under our schema (the table's names,
-/// types as the source's, field ids 1..n), then, with `sys`, the four system columns encoded as `tier::writer` encodes
+/// types as the source's, field ids 1..n), then, with `sys`, the four system columns encoded as `file_formats::parquet::writer` encodes
 /// them. `piece` is the source's bytes of `cut.bytes`. Err if a chunk doesn't start with a page (encrypted, or a bad
 /// cut), or if the file comes out over what `plan` leaves room for.
 pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes, sys: Option<Sys>) -> Result<Kept> {
@@ -200,7 +200,7 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
             .build()?;
         ours.push(Arc::new(field));
     }
-    let to = crate::tier::codec();
+    let to = crate::file_formats::parquet::codec();
     let mut props = WriterProperties::builder().set_compression(to);
     // A source's offset index says where each page starts, in bytes and in rows, and a reader skipping pages goes by it:
     // a page said to start 20 rows early is read 20 rows off its neighbours (11-06 audit M1). A chunk's pages written
@@ -216,7 +216,7 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
         props = props.set_offset_index_disabled(true).set_statistics_enabled(EnabledStatistics::Chunk);
     }
     if sys.is_some() {
-        // (as `tier::writer` writes them, with the ids `tier::field_ids` gives them)
+        // (as `file_formats::parquet::writer` writes them, with the ids `tier::field_ids` gives them)
         for (k, name) in NAMES.iter().enumerate() {
             let mut b = Node::primitive_type_builder(name, Physical::INT64).with_repetition(Repetition::OPTIONAL).with_id(Some(1_000_001 + k as i32));
             if *name == CREATED || *name == UPDATED {
@@ -572,7 +572,7 @@ mod tests {
 
     const BIG: Limits = Limits { file: 1 << 30, group: 1 << 30 };
 
-    fn limits() -> Limits { Limits { file: tier::FILE_BYTES, group: tier::ROW_GROUP_BYTES } }
+    fn limits() -> Limits { Limits { file: tier::FILE_BYTES, group: crate::file_formats::parquet::ROW_GROUP_BYTES } }
 
     /// The file's rows, read with no schema hint, as one batch; Utf8View as Utf8, so a source that carries Arrow's
     /// schema and a kept file that doesn't compare equal.
@@ -633,7 +633,7 @@ mod tests {
                 Arc::new(Float64Array::from_iter(n.map(|v| (v % 11 != 0).then_some(v as f64 * 0.5)))),
             ]).unwrap()
         };
-        let mut w = tier::writer(schema.clone(), &[]).unwrap();
+        let mut w = crate::file_formats::parquet::writer(schema.clone(), &[]).unwrap();
         for from in [0, 1000, 2000] {
             w.write(&batch(from)).unwrap();
             w.flush().unwrap();
@@ -657,7 +657,7 @@ mod tests {
     }
 
     /// With `sys`, a kept file carries its rows' system columns as a written file of a bulk INSERT does
-    /// (`sys::stamp_new`, `tier::writer`): ids counting up from `first` across its row groups, the commit number and time,
+    /// (`sys::stamp_new`, `file_formats::parquet::writer`): ids counting up from `first` across its row groups, the commit number and time,
     /// the same types, field ids and encodings. The table's own columns are copied as they are.
     #[test]
     fn a_kept_file_carries_its_rows_system_columns() {
@@ -668,7 +668,7 @@ mod tests {
             Arc::new(Int64Array::from_iter_values(from..from + 1000)) as ArrayRef,
             Arc::new(StringArray::from_iter((from..from + 1000).map(|v| Some(format!("s{}", v % 13))))),
         ]).unwrap();
-        let mut w = tier::writer(schema.clone(), &[]).unwrap();
+        let mut w = crate::file_formats::parquet::writer(schema.clone(), &[]).unwrap();
         for from in [0, 1000, 2000] {
             w.write(&batch(from)).unwrap();
             w.flush().unwrap();
@@ -686,7 +686,7 @@ mod tests {
 
         // What a written file of the same rows, stamped, reads as.
         let stamped: Vec<RecordBatch> = [0i64, 1000, 2000].iter().map(|&from| crate::sys::stamp_new(&batch(from), sys.first + from, reserved).unwrap()).collect();
-        let mut w = tier::writer(stamped[0].schema(), &[]).unwrap();
+        let mut w = crate::file_formats::parquet::writer(stamped[0].schema(), &[]).unwrap();
         for b in &stamped {
             w.write(b).unwrap();
         }
@@ -975,7 +975,7 @@ mod tests {
         assert!(file.len() > 900 << 10 && file.len() < 1200 << 10, "{} bytes", file.len());
         assert_eq!(footer_of(&file).num_row_groups(), 8);
 
-        let small = Limits { file: 256 << 10, group: tier::ROW_GROUP_BYTES };
+        let small = Limits { file: 256 << 10, group: crate::file_formats::parquet::ROW_GROUP_BYTES };
         let kept = keep(file.clone(), &schema, &small).unwrap().unwrap();
         assert!(kept.len() >= 2, "{} kept files", kept.len());
         for k in &kept {
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn a_chunk_whose_first_page_header_is_zeroed_is_an_error() {
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
-        let mut w = tier::writer(schema.clone(), &[]).unwrap();
+        let mut w = crate::file_formats::parquet::writer(schema.clone(), &[]).unwrap();
         w.write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(0..5000))]).unwrap()).unwrap();
         let mut bytes = w.into_inner().unwrap();
         let md = footer_of(&Bytes::from(bytes.clone()));
