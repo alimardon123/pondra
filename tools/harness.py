@@ -12539,6 +12539,16 @@ def max_rows():
     cnt = as_(boss, "SELECT count(*) AS n FROM u")
     info["insert"] = {"status": ins[0], "count": cnt}
     checks["ann's INSERT INTO u SELECT id FROM t inserts all 10 rows: boss counts 10 in u"] = cnt == [{"n": 10}]
+    # (11-20 audit H1: only a door's answer is cut. A query a write reads, beside a writing WITH or in a script's FOR loop,
+    # runs whole)
+    fed = {}
+    for name, q in [("WITH", "WITH src AS (SELECT id FROM t), ins AS (INSERT INTO u SELECT id FROM src RETURNING id) SELECT count(*) AS n FROM ins"),
+                    ("FOR", "FOR r IN (SELECT id FROM t) DO INSERT INTO u VALUES ($r.id); END FOR")]:
+        as_(boss, "DELETE FROM u")
+        fed[name] = {"said": raw(ann, q)[2][:200].decode(errors="replace"), "count": as_(boss, "SELECT count(*) AS n FROM u")}
+    info["writes fed"] = fed
+    checks["a write reads whole: ann's writing WITH and a script's FOR loop each insert all 10 rows into u (11-20 audit H1)"] = \
+        all(f["count"] == [{"n": 10}] for f in fed.values())
 
     # A superuser takes no option from a role
     sb, hb, body_b = raw(boss, "SELECT id FROM t ORDER BY id")

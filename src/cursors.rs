@@ -159,7 +159,7 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str, scope: &crat
         false => Some(txn::id().ok_or_else(|| coded("25P01", "DECLARE CURSOR can only be used in transaction blocks"))?),
     };
     free(&node, name)?; // (before the query runs: a name taken is answered at once)
-    let batches = app.query(query, None, scope).await?;
+    let batches = crate::app::answering(app.query(query, None, scope)).await?; // (its rows are what FETCH answers)
     let schema = match batches.first() {
         Some(b) => b.schema(),
         None => planned(app, query, scope).await?,
