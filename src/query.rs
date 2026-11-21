@@ -26,12 +26,13 @@ pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> { crate::a
 pub use crate::rules::fit::{conform, strict};
 
 /// A query's rows as `s`'s columns, by position, cast to its types: a view's or a task's output
-/// into its table (strings a query reads from files are views; the table holds plain ones).
+/// into its table (strings a query reads from files are views; the table holds plain ones; text into a column `s`
+/// marks as an INET is read as one: `rules::fit::strict_to`).
 pub fn cast_as(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
     // (a keyed table made in SQL has a `_deleted` column last, which a query's rows leave out)
     let marker = s.fields().last().is_some_and(|f| f.name() == "_deleted") && b.num_columns() + 1 == s.fields().len();
     anyhow::ensure!(b.num_columns() == s.fields().len() || marker, "{} columns for a table of {}", b.num_columns(), s.fields().len());
-    let mut columns = b.columns().iter().zip(s.fields()).map(|(c, f)| strict(c, f.data_type())).collect::<Result<Vec<_>>>()?;
+    let mut columns = b.columns().iter().zip(s.fields()).map(|(c, f)| crate::rules::fit::strict_to(c, f)).collect::<Result<Vec<_>>>()?;
     if marker {
         columns.push(datafusion::arrow::array::new_null_array(&DataType::Boolean, b.num_rows()));
     }
@@ -1519,7 +1520,7 @@ pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str], sc
     let state = ctx.state();
     let (dialect, catalog) = (state.config().options().sql_parser.dialect.clone(), state.config().options().catalog.clone());
     let refers = |sql: &str| -> Option<Vec<String>> {
-        let stmt = state.sql_to_statement(sql, &dialect).ok()?;
+        let stmt = crate::engine::kept_query(&state, sql).map_or_else(|| state.sql_to_statement(sql, &dialect), Ok).ok()?; // (the statement's own parse: `engine::kept_query`)
         let refs = state.resolve_table_references(&stmt).ok()?;
         // (and each name as written, not lower-cased: a caller that names a table unquoted and then looks it up by its
         // own name, as `views::join` does, finds it, as it did when every table whose name was a word of the text was read)

@@ -462,7 +462,9 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<Strin
 
 /// The columns a query will answer with, for its flight's info: bound and expanded as every door does (`$name`s from
 /// the session, macros, `FROM t`, `pondra.git_status`), then planned, not run.
-async fn plan_schema(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?, scope).await?, scope).await }
+async fn plan_schema(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> {
+    crate::context::scope(async { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?, scope).await?, scope).await }).await // (a statement of its own)
+}
 
 async fn planned(app: &App, sql: &str, scope: &crate::rights::Scope) -> anyhow::Result<Schema> { Ok(crate::with_writes::planned(app, sql, scope).await?.as_ref().clone()) }
 

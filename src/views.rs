@@ -782,7 +782,9 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     // (a uuid, json or jsonb column, as CREATE TABLE … AS keeps it; a view with a last step holds partial columns, which the query doesn't give)
     let sql_types = if finish.is_none() {
         let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-        crate::write::query_types(lake, written, &names, scope).await
+        let mut held = crate::write::query_types(lake, written, &names, scope).await;
+        held.extend(crate::column_types::held_in(crate::query::run_schema(&ctx, &plan)?.fields())); // (an INET column's: its mark)
+        held
     } else {
         Default::default()
     };
@@ -812,7 +814,8 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
         ensure!(meta.key.contains(&o.column), "EMIT FINAL: {} is the view's window, so it is one of its GROUP BY columns", o.column);
         let columns: Vec<(String, String)> = shown.iter().filter(|(c, _)| c != "_deleted").cloned().collect(); // (finished, if it is)
         let shown_names: Vec<String> = shown.iter().map(|(c, _)| c.clone()).collect();
-        let sql_types = crate::write::query_types(lake, written, &shown_names, scope).await;
+        let mut sql_types = crate::write::query_types(lake, written, &shown_names, scope).await;
+        sql_types.extend(crate::column_types::held_in(crate::query::run_schema(&ctx, &plan)?.fields()));
         puts.push((table_key(&o.into), json(&{ let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry })));
         if lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() && !puts.iter().any(|(k, _)| *k == table_key(EXPECTED)) {
             puts.push((table_key(EXPECTED), json(&expected_table(lake))));
@@ -976,7 +979,8 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns: Vec<(String, String)> = out.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-    let sql_types = crate::write::query_types(lake, &with, &names, scope).await;
+    let mut sql_types = crate::write::query_types(lake, &with, &names, scope).await;
+    sql_types.extend(crate::column_types::held_in(out.fields()));
     let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry };
     let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
@@ -2016,11 +2020,13 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
             ensure!(timestamp(&meta, c), "time: {c} isn't a timestamp column of {t}");
         }
     }
-    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, &plan)?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+    let planned = crate::query::run_schema(&ctx, &plan)?;
+    let columns: Vec<(String, String)> = planned.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
     j.tables = tables;
     let now = lake.visible();
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-    let sql_types = crate::write::query_types(lake, sql, &names, scope).await;
+    let mut sql_types = crate::write::query_types(lake, sql, &names, scope).await;
+    sql_types.extend(crate::column_types::held_in(planned.fields()));
     let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = now; entry };
     let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await

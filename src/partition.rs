@@ -174,10 +174,18 @@ pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String,
     ctx.register_batch("t", all.clone())?;
     let exprs = spec.fields.iter().map(|f| Ok(expr(f, all.schema().field_with_name(&f.column)?.data_type()))).collect::<Result<Vec<_>>>()?;
     let values = ctx.sql(&format!("SELECT {} FROM t", exprs.join(", "))).await?.collect().await?;
+    // (a value whose storage isn't its text, an INET's bytes, is its part as its type shows it: `column_types::show_of`)
+    let shows: Vec<_> = spec.fields.iter().map(|f| match f.transform {
+        Transform::Identity => all.schema().field_with_name(&f.column).ok().and_then(crate::column_types::show_of),
+        _ => None,
+    }).collect();
     let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     let mut i = 0u32;
     for b in &values {
-        let texts = b.columns().iter().map(|c| cast(c, &DataType::Utf8)).collect::<Result<Vec<_>, _>>()?;
+        let texts = b.columns().iter().zip(&shows).map(|(c, show)| match show {
+            Some(show) => show(c),
+            None => Ok(cast(c, &DataType::Utf8)?),
+        }).collect::<Result<Vec<_>>>()?;
         for row in 0..b.num_rows() {
             let each: Vec<&str> = texts.iter().map(|t| { let t = t.as_string::<i32>(); if t.is_null(row) { "null" } else { t.value(row) } }).collect();
             groups.entry(part(&each)).or_default().push(i);
@@ -361,5 +369,17 @@ mod tests {
         let p = parts("bucket(4, id)").await;
         assert_eq!(p.iter().map(|(_, n)| n).sum::<usize>(), 4);
         assert!(p.iter().all(|(b, _)| b == "null" || b.parse::<i32>().is_ok_and(|b| (0..4).contains(&b))));
+    }
+
+    /// An INET column's part is its address as the type shows it, never its bytes cast to text (which Arrow refuses).
+    #[tokio::test]
+    async fn an_inet_column_splits_by_its_address() {
+        use datafusion::arrow::datatypes::{Field as F, Schema};
+        let field = crate::column_types::mark(F::new("ip", DataType::FixedSizeBinary(crate::column_types::inet::WIDTH as i32), true), &crate::column_types::INET);
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some("10.0.0.1"), Some("2001:db8::1"), None, Some("10.0.0.1")]));
+        let ip = crate::column_types::parsed(&text, &field).expect("a type with parse").unwrap();
+        let b = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![ip]).unwrap();
+        let parts = split("ip", vec![b]).await.unwrap().into_iter().map(|(p, r)| (p, r[0].num_rows())).collect::<Vec<_>>();
+        assert_eq!(parts, [("10.0.0.1".into(), 2), ("2001:db8::1".into(), 1), ("null".into(), 1)]);
     }
 }

@@ -302,7 +302,8 @@ page   ms
 
 **A table's layout is published for writers to follow:** its `partition_by` as the Iceberg partition
 spec (so PyIceberg and Spark write a file per day, here), a `cluster_by` on one column as its sort
-order, and a keyed table's key as its identifier fields.
+order, and a keyed table's key as its identifier fields. After `ALTER TABLE … SET (partition_by = …)`,
+every spec the table's files were written under is listed, and each file is under its own.
 
 <Aside type="caution">
 Write through Pondra or through the REST catalog, never into the `_delta_log` or `metadata` folders

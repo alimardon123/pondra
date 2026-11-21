@@ -157,7 +157,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
             bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
         }
-        let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its 16 bytes)
+        let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its bytes)
         if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && *ty == holds(t))) {
             bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, and an INET its address (a column of the table, of type {})", holds(t));
         }
@@ -216,9 +216,6 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 if !m.key.is_empty() {
                     return Err(crate::codes::coded("0A000", format!("{name} has a key: its partition_by can't change (an append table's can), since its newer rows shadow older ones file by file")));
                 }
-                if !m.publish.is_empty() {
-                    return Err(crate::codes::coded("0A000", format!("{name} is published ({}): its partition_by can't change yet", m.publish.join(", "))));
-                }
                 crate::format::require(lake, crate::format::SPECS, "a table's partition_by changed").await?;
             }
             // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
@@ -226,10 +223,6 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let (old, new) = (l.columns().len(), columns.len());
             ensure!(columns[..new.min(old)].iter().map(|(c, t)| (c.as_str(), t.as_str())).eq(l.columns().take(new.min(old))), "{name} exists with other columns (only new ones can be added, at the end)");
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
-            if republish && publish.as_ref().is_some_and(|p| !p.is_empty()) && !m.specs.is_empty() {
-                // (I3-d publishes every spec; until then a file's record is its own spec's, which the table's doesn't name)
-                return Err(crate::codes::coded("0A000", format!("{name}'s partition_by changed, and its files are split by more than one spec: it can't be published yet")));
-            }
             // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
             ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
             if publish.iter().flatten().any(|f| !m.publish.contains(f)) {
@@ -897,10 +890,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
                     let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
                     sql_types.extend(query_types(from, &sql, &names, scope).await);
                     // (a column of a type whose storage isn't text keeps its type: an INET column's query gives it marked)
-                    for f in &fields {
-                        if let Some(t) = crate::column_types::of(f).filter(|t| t.parse.is_some()) {
-                            sql_types.entry(f.name().clone()).or_insert_with(|| t.name.to_string());
-                        }
+                    for (n, t) in crate::column_types::held_in(&fields.iter().cloned().collect()) {
+                        sql_types.entry(n).or_insert(t);
                     }
                     fields
                 }
@@ -914,7 +905,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
     };
     let fixed = crate::format::fixed(from).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
     let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::fixed_name(f.data_type(), fixed))).collect();
-    // (a column type whose storage isn't text holds that storage, INET's 16 bytes: declared as text above, it is read into it)
+    // (a column type whose storage isn't text holds that storage, INET's bytes: declared as text above, it is read into it)
     for (c, t) in columns.iter_mut() {
         if let Some(s) = sql_types.get(c.as_str()).and_then(|held| crate::column_types::stored(held)) {
             *t = crate::answer::type_name(&s);
@@ -1023,7 +1014,7 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.to_columns();
             let planned = match held.as_deref().and_then(crate::column_types::stored) {
-                Some(s) => crate::answer::type_name(&s), // (INET: its 16 bytes)
+                Some(s) => crate::answer::type_name(&s), // (INET: its bytes)
                 None => crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed),
             };
             columns.push((column.to_string(), planned));

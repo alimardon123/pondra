@@ -1,5 +1,6 @@
-# INET (IPADDRESS inside), Postgres's inet and DuckDB's INET: one IPv4 or IPv6 address, held in 16 bytes (FixedSizeBinary(16),
-# IPv4 mapped into IPv6), so it compares, sorts, groups and joins by its bytes, IPv4 before IPv6 as Postgres sorts them. It is
+# INET (IPADDRESS inside), Postgres's inet and DuckDB's INET: one IPv4 or IPv6 address, held in 17 bytes (FixedSizeBinary(17):
+# its family, then IPv4 mapped into IPv6), so it compares, sorts, groups and joins by its bytes, every IPv4 address before
+# every IPv6 one, as Postgres and DuckDB sort them, and an IPv4-mapped IPv6 address apart from its IPv4 one. It is
 # shown as Postgres shows a host, and SHOW CREATE says INET. A string beside one is read as one; one that isn't an address is
 # refused in Postgres's words (22P02), and a network (CIDR) waits for its own type (0A000).
 statement ok
@@ -15,12 +16,12 @@ SELECT id, ip FROM hosts
 2 2001:db8::1
 3 10.0.0.2
 4 NULL
-5 192.168.1.1
+5 ::ffff:192.168.1.1
 
 query T
 SELECT arrow_typeof(ip) FROM hosts WHERE id = 1
 ----
-FixedSizeBinary(16)
+FixedSizeBinary(17)
 
 query I
 SELECT id FROM hosts WHERE ip = '10.0.0.2'
@@ -52,6 +53,12 @@ SELECT id FROM hosts WHERE ip IS NOT NULL ORDER BY ip
 3
 5
 2
+
+# Every IPv4 address before every IPv6 one, and a mapped address apart from its IPv4 one, as Postgres has them
+query BBB
+SELECT '10.0.0.1'::inet < '::1'::inet, '255.255.255.255'::inet < '::'::inet, '::ffff:1.2.3.4'::inet = '1.2.3.4'::inet
+----
+true true false
 
 query T
 SELECT ip::text FROM hosts WHERE id = 2

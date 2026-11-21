@@ -633,12 +633,12 @@ def until(what, secs, step=0.5):
 
 LISTS = 6  # every table's columns kept as one list (`format::LISTS`): an older lake moves there by itself
 BOUNDS = 8  # files' ranges kept typed (`format::BOUNDS`): a new lake starts there, an older one moves there by itself
-FORMAT = 8  # this build's format (`format::FORMAT`; 7: a view of averages keeps its query's own state, `fvar::PARTS_FORMAT`)
+FORMAT = 9  # this build's format (`format::FORMAT`; 7: a view of averages keeps its query's own state, `fvar::PARTS_FORMAT`; 9: a file's partition spec, which a lake moves to only when a table's spec changes)
 
 
 def format_check(new_bin, work, port, old=None):
-    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=9:
-    this build's format, 8, plus one); and the writes that need formats 2 to 5 (ADR-055, ADR-058, ADR-074)
+    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=10:
+    this build's format, 9, plus one); and the writes that need formats 2 to 5 (ADR-055, ADR-058, ADR-074)
     against `old`, the release before (version, binary), this build posing as one that knows only format 5
     (so the lake doesn't move on to its column lists by itself)."""
     checks, info = {}, {}
@@ -653,13 +653,14 @@ def format_check(new_bin, work, port, old=None):
     first.q("INSERT INTO s VALUES ('a', 1), ('a', 2)")
     first.q("CREATE MATERIALIZED VIEW means AS SELECT k, avg(x) AS m FROM s GROUP BY k")  # (grouped: a view of one row keeps its query otherwise)
     checks["…and a view of averages keeps its query's own state there (format 7's)"] = \
-        until(lambda: fmt(first) == FORMAT, 3, step=0.1) and until(lambda: first.q("SELECT m FROM means") == [{"m": 1.5}], 10)
+        until(lambda: fmt(first) == BOUNDS, 3, step=0.1) and until(lambda: first.q("SELECT m FROM means") == [{"m": 1.5}], 10)
     first.stop()
-    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 9
-    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 8
+    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 10
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 9
     time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
-    checks["a lake moves on only to the newest format every node knows"] = fmt(a) == FORMAT and fmt(b) == FORMAT
+    # (by itself as far as `BOUNDS`; 9 waits for a table's spec to change, and the leader's 10 for the follower to go)
+    checks["a lake moves on only to the newest format every node knows"] = fmt(a) == BOUNDS and fmt(b) == BOUNDS
     checks["…and reads as it did"] = all(z.q("SELECT count(*) AS n FROM t") == [{"n": 2}] and z.q("SELECT m FROM means") == [{"m": 1.5}] for z in (a, b))
     b.stop()
     checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == FORMAT + 1, 40)

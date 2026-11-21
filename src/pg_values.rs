@@ -43,6 +43,8 @@ fn literal(t: &Type, text: &str) -> anyhow::Result<String> {
         Type::TIMESTAMPTZ => format!("TIMESTAMPTZ '{}'", instant_of(text).ok_or_else(|| bad("timestamp with time zone", "22007"))?.format("%Y-%m-%dT%H:%M:%S%.fZ")),
         Type::FLOAT4 | Type::FLOAT8 => float_literal(text, t)?,
         Type::UUID => format!("'{}'", uuid::Uuid::parse_str(text).map_err(|_| bad("uuid", "22P02"))?.hyphenated()),
+        // (read here, so a bad one is refused at its Bind in Postgres's words; sent on as the INET it is, typed where nothing beside it says)
+        Type::INET => format!("CAST('{}' AS INET)", crate::column_types::inet::text(&crate::column_types::inet::bytes(text)?)),
         Type::INTERVAL => {
             let (months, days, micros) = interval_of(text).ok_or_else(|| bad("interval", "22007"))?;
             format!("INTERVAL '{months} months {days} days {micros} microseconds'")
@@ -296,6 +298,7 @@ fn binary_text(t: &Type, raw: &[u8]) -> anyhow::Result<String> {
             interval_text(months.into(), days.into(), micros)
         }
         ref t if t.oid() == VECTOR => vector_text(raw)?,
+        Type::INET => inet_text(raw)?,
         _ => return Err(crate::codes::coded("0A000", format!("a {} parameter in binary isn't taken: send it as text", t.name()))),
     })
 }
@@ -348,6 +351,38 @@ fn vector_text(raw: &[u8]) -> anyhow::Result<String> {
     }
     let floats = rest.chunks_exact(4).map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string()); // (Rust's text of a float reads back to it)
     Ok(format!("[{}]", floats.collect::<Vec<_>>().join(",")))
+}
+
+/// Postgres's binary `inet`: its family (2 IPv4, 3 IPv6: `PGSQL_AF_INET`, `PGSQL_AF_INET6`), its mask's bits, whether it
+/// is a cidr (0), its address's length in bytes, then the address.
+const INET4: u8 = 2;
+const INET6: u8 = 3;
+
+/// An INET's bytes (`column_types::inet`: its family, then its address) in Postgres's binary form, a host's full mask.
+pub(crate) fn inet_binary(stored: &[u8]) -> Vec<u8> {
+    match crate::column_types::inet::address(stored) {
+        std::net::IpAddr::V4(v4) => [&[INET4, 32, 0, 4][..], &v4.octets()].concat(),
+        std::net::IpAddr::V6(v6) => [&[INET6, 128, 0, 16][..], &v6.octets()].concat(),
+    }
+}
+
+/// An `inet` in Postgres's binary form, as its text form (`10.0.0.1`, `10.0.0.0/8`: what the INET then takes or refuses).
+fn inet_text(raw: &[u8]) -> anyhow::Result<String> {
+    let wrong = || crate::codes::coded("22P03", "invalid length in external \"inet\" value");
+    let [family, bits, cidr, n, address @ ..] = raw else { return Err(wrong()) };
+    let (ip, host): (std::net::IpAddr, u8) = match (*family, *n, address.len()) {
+        (INET4, 4, 4) => (<[u8; 4]>::try_from(address).map_err(|_| wrong())?.into(), 32),
+        (INET6, 16, 16) => (<[u8; 16]>::try_from(address).map_err(|_| wrong())?.into(), 128),
+        (INET4 | INET6, ..) => return Err(wrong()),
+        _ => return Err(crate::codes::coded("22P03", "invalid address family in external \"inet\" value")),
+    };
+    if *bits > host {
+        return Err(crate::codes::coded("22P03", "invalid bits in external \"inet\" value"));
+    }
+    if *cidr != 0 {
+        return Err(crate::codes::coded("0A000", format!("{ip}/{bits}: an INET holds one address, a host: a network comes with CIDR, later")));
+    }
+    Ok(if *bits == host { ip.to_string() } else { format!("{ip}/{bits}") })
 }
 
 /// `sql` with `$1`, `$2`… replaced by `values` (their literals, in order), each replaced once: a
@@ -414,6 +449,28 @@ mod tests {
         assert_eq!(lit(Type::TIMESTAMPTZ, "2020-01-01 13:00:00+01"), "TIMESTAMPTZ '2020-01-01T12:00:00Z'");
         assert_eq!(lit(Type::TIMESTAMPTZ, "2020-01-01T12:00:00.123456Z"), "TIMESTAMPTZ '2020-01-01T12:00:00.123456Z'");
         assert_eq!(lit(Type::TIMESTAMPTZ, "2020-01-01 12:00:00"), "TIMESTAMPTZ '2020-01-01T12:00:00Z'");
+    }
+
+    #[test]
+    fn an_inet_is_read_in_postgres_text_and_binary_forms_and_sent_in_its_binary_one() {
+        assert_eq!(lit(Type::INET, "10.0.0.1/32"), "CAST('10.0.0.1' AS INET)");
+        assert_eq!(lit(Type::INET, "2001:DB8::1"), "CAST('2001:db8::1' AS INET)");
+        assert!(lit(Type::INET, "10.0.0.256").starts_with("ERR 22P02: invalid input syntax for type inet: \"10.0.0.256\""));
+        assert!(lit(Type::INET, "10.0.0.0/8").starts_with("ERR 0A000"));
+        assert_eq!(bin(Type::INET, &[2, 32, 0, 4, 10, 0, 0, 1]), "CAST('10.0.0.1' AS INET)");
+        let v6 = [&[3, 128, 0, 16][..], &"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets()].concat();
+        assert_eq!(bin(Type::INET, &v6), "CAST('2001:db8::1' AS INET)");
+        assert!(bin(Type::INET, &[2, 8, 0, 4, 10, 0, 0, 0]).starts_with("ERR 0A000"), "a network");
+        assert!(bin(Type::INET, &[2, 32, 1, 4, 10, 0, 0, 1]).starts_with("ERR 0A000"), "a cidr");
+        assert!(bin(Type::INET, &[2, 33, 0, 4, 10, 0, 0, 1]).starts_with("ERR 22P03"));
+        assert!(bin(Type::INET, &[2, 32, 0, 16, 10, 0, 0, 1]).starts_with("ERR 22P03"));
+        assert!(bin(Type::INET, &[9, 32, 0, 4, 10, 0, 0, 1]).starts_with("ERR 22P03: invalid address family"));
+        assert!(bin(Type::INET, &[2, 32]).starts_with("ERR 22P03"));
+        for given in ["10.0.0.1", "::1", "2001:db8::1", "1.2.3.4", "::ffff:1.2.3.4"] {
+            let stored = crate::column_types::inet::bytes(given).unwrap();
+            assert_eq!(inet_text(&inet_binary(&stored)).unwrap(), given, "sent and read back");
+        }
+        assert_eq!(inet_binary(&crate::column_types::inet::bytes("10.0.0.1").unwrap()), [2, 32, 0, 4, 10, 0, 0, 1]);
     }
 
     #[test]
@@ -490,10 +547,10 @@ mod tests {
 
     #[test]
     fn a_binary_type_without_a_decoder_is_refused_by_name_never_read_as_text() {
-        let e = value(&Type::INET, Some(&[10, 0, 0, 1]), true).unwrap_err();
+        let e = value(&Type::POINT, Some(&[10, 0, 0, 1]), true).unwrap_err();
         assert_eq!(crate::codes::of(&e), "0A000");
-        assert!(e.to_string().contains("a inet parameter in binary isn't taken: send it as text"));
-        assert_eq!(value(&Type::INET, Some(&b"10.0.0.1"[..]), false).unwrap(), Some("'10.0.0.1'".to_string()));
+        assert!(e.to_string().contains("a point parameter in binary isn't taken: send it as text"));
+        assert_eq!(value(&Type::POINT, Some(&b"(1,2)"[..]), false).unwrap(), Some("'(1,2)'".to_string()));
         assert_eq!(value(&Type::TEXT, None, true).unwrap(), None);
     }
 

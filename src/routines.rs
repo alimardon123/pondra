@@ -847,6 +847,10 @@ pub fn split(text: &str) -> Vec<String> {
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
 pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    crate::context::scope(one_in(app, sql, who, job)).await // (each statement of a script or a procedure: read in a context of its own)
+}
+
+async fn one_in(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
     let by = who.by.clone(); // (its log lines' and history's: `audit::statement`)
     if let Some(word) = crate::text::control(sql) {
         // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)

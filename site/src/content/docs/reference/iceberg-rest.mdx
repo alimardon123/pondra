@@ -131,7 +131,7 @@ files, not the rows.
 - **Followed in the same commit:** views and streaming tasks that follow the table take the new rows
   from the files, and the change feed, `/watch` and Kafka topics read them there.
 - **Copied, not recorded as written:** when the table has a renamed or dropped column (Delta readers
-  match columns by name). Then the node writes the rows as the table's own, as a bulk `INSERT` does,
+  match columns by name), or a bucket in its `partition_by` (no file's footer says its bucket). Then the node writes the rows as the table's own, as a bulk `INSERT` does,
   and deletes the engine's files. A keyed table's rows go through the log as upserts (below).
 - **The layout the metadata publishes is the one to follow:** the table's `partition_by` as its
   partition spec, a `cluster_by` on one column as its sort order, a key as its identifier fields.
