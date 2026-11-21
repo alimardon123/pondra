@@ -161,11 +161,16 @@ pub trait Carry: Send + 'static {
 pub struct Tasks {
     life: crate::lifecycle::Life, // (what a vital panic stops: the node's host's, or a page's member)
     started: std::sync::Arc<std::sync::Mutex<Started>>,
+    /// Does its work all stay on the runtime it runs on, none of it started on the queries' runtime (`Given::one_runtime`)?
+    one_runtime: bool,
 }
 
 impl Tasks {
     /// What a node with this lifecycle starts: nothing yet.
-    pub fn new(life: crate::lifecycle::Life) -> Tasks { Tasks { life, started: Default::default() } }
+    pub fn new(life: crate::lifecycle::Life) -> Tasks { Tasks { life, started: Default::default(), one_runtime: false } }
+
+    /// The same, its work all kept on the runtime it runs on when `one` (`Given::one_runtime`: the sim's member).
+    pub(crate) fn kept_on_one_runtime(self, one: bool) -> Tasks { Tasks { one_runtime: one, ..self } }
 
     /// Start the node's own work (no request asked for it), as [`as_node`]. A panic in it stops the node (its lifecycle's
     /// `stop`) when `vital` is [`Vital::Stop`], and ends only the task otherwise.
@@ -199,9 +204,12 @@ impl Tasks {
     pub fn aside<T: Send + 'static>(&self, who: impl Carry, f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
         let f = who.carry(f);
         #[cfg(not(target_arch = "wasm32"))]
-        let task = queries().spawn(f);
+        let task = if self.one_runtime { tokio::task::spawn(f) } else { queries().spawn(f) }; // (the sim's member: on its test's runtime)
         #[cfg(target_arch = "wasm32")]
-        let task = tokio::task::spawn(f); // (a page has one loop, and no queries' runtime: the work runs on it)
+        let task = {
+            let _ = self.one_runtime; // (all its work is on its one loop anyway)
+            tokio::task::spawn(f) // (a page has one loop, and no queries' runtime: the work runs on it)
+        };
         self.track(task)
     }
 

@@ -1720,7 +1720,7 @@ def tiering():
         if r == 8:
             first = listed()
     wide = listed()
-    # A wide table's row groups hold at most 64 MB as Parquet's writer counts them (`tier::writer`):
+    # A wide table's row groups hold at most 64 MB as Parquet's writer counts them (`file_formats::parquet::writer`):
     # a scan holds a row group's columns while it decodes them, and a million rows of 105 columns
     # held a node's memory 1.9 GB deep for a top-10 of them.
     import pyarrow.parquet as pq

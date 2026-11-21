@@ -75,6 +75,7 @@ scan catalog
 sketch catalog
 store catalog
 column_types catalog
+file_formats catalog
 frozen catalog
 naming catalog
 pins catalog
