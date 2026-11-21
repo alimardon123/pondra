@@ -96,7 +96,7 @@ pub fn wanted(sql: &str) -> bool {
 /// pick a type's binary format by its `typreceive`; newer types' names have an underscore).
 fn type_function(t: &PgType, f: &str) -> String {
     match t.1 {
-        "json" | "jsonb" | "date" | "time" | "timestamp" | "timestamptz" | "interval" | "numeric" | "uuid" | "void" | "record" | "bit" | "vector" => format!("{}_{f}", t.1),
+        "json" | "jsonb" | "date" | "time" | "timestamp" | "timestamptz" | "interval" | "numeric" | "uuid" | "void" | "record" | "bit" | "vector" | "inet" => format!("{}_{f}", t.1),
         _ => format!("{}{f}", t.1),
     }
 }
@@ -330,13 +330,14 @@ fn table_columns(l: &TableMeta) -> Vec<(String, DataType, bool, Option<String>)>
     }).collect()
 }
 
-/// The columns whose type their Arrow type doesn't say: a uuid, JSON, JSONB or VARCHAR(n) column (`types.rs`), as
+/// The columns whose type their Arrow type doesn't say: a uuid, JSON, JSONB, INET or VARCHAR(n) column (`types.rs`), as
 /// Postgres types them. Enum columns are the lake's own (`lakes`).
 fn held_types(l: &TableMeta) -> impl Iterator<Item = (String, (u32, i32))> + '_ {
     l.list().columns.iter().filter_map(|c| Some((c.name.clone(), c.held.as_deref()?))).filter_map(|(c, t)| match t {
         "uuid" => Some((c, (UUID, -1))),
         "json" => Some((c, (JSON, -1))),
         "jsonb" => Some((c, (JSONB, -1))),
+        "inet" => Some((c, (crate::pg_oids::INET, -1))),
         t => crate::rules::typed::length(t).map(|n| (c, (1043, n as i32 + 4))),
     })
 }

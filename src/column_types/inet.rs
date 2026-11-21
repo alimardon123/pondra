@@ -15,7 +15,7 @@ fn storage(_: &[u64]) -> DataType { DataType::FixedSizeBinary(16) }
 
 /// An address's 16 bytes, from its text, refused as Postgres refuses it (22P02); a network, a mask shorter than a host's, is
 /// refused as one INET doesn't hold yet (0A000).
-fn bytes(text: &str) -> anyhow::Result<[u8; 16]> {
+pub fn bytes(text: &str) -> anyhow::Result<[u8; 16]> {
     let refused = || crate::codes::coded("22P02", format!("invalid input syntax for type inet: \"{text}\""));
     let (address, mask) = match text.split_once('/') {
         Some((a, m)) => (a, Some(m)),
@@ -37,7 +37,7 @@ fn bytes(text: &str) -> anyhow::Result<[u8; 16]> {
 }
 
 /// An address's text, from its 16 bytes.
-fn text(bytes: &[u8]) -> String {
+pub fn text(bytes: &[u8]) -> String {
     let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(bytes).unwrap_or_default());
     match v6.to_ipv4_mapped() {
         Some(v4) => v4.to_string(),
