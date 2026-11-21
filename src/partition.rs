@@ -7,9 +7,11 @@
 use anyhow::{anyhow, bail, ensure, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int32Array, RecordBatch, UInt32Array};
 use datafusion::arrow::compute::{cast, concat_batches, take_record_batch};
-use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Int32Type, Int64Type, Schema, TimeUnit};
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 /// What a field takes of its column.
@@ -145,6 +147,14 @@ fn part(values: &[&str]) -> String {
     }
 }
 
+/// A part's values, one a field of a spec of `n`: `part` read back.
+pub fn values(part: &str, n: usize) -> Vec<String> {
+    match n {
+        1 => vec![part.to_string()],
+        _ => part.split('/').map(|v| v.replace("%2F", "/").replace("%25", "%")).collect(),
+    }
+}
+
 /// A partitioned table's rows, one group per part (`day(ts)`: the day, `col`: the value).
 pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
     let Some(first) = batches.first() else { return Ok(vec![]) };
@@ -168,6 +178,47 @@ pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String,
     groups.into_iter().map(|(p, rows)| Ok((p, vec![take_record_batch(&all, &UInt32Array::from(rows))?]))).collect()
 }
 
+/// Which parts a scan with `filters` may read, as a test of a file's part. A bucket field whose column the filters pin
+/// to values (`c = v`, `c IN (…)`) keeps the parts of those values' buckets. Ranges prune every other field, since a file
+/// of one day or one value has narrow ones; a bucket isn't in order with its column, so only the part says. `name`: a
+/// stored column's name as the filters and `schema` say it. None: nothing to skip.
+pub fn wanted(spec: &str, filters: &[Expr], name: impl Fn(&str) -> Option<String>, schema: &Schema) -> Option<Box<dyn Fn(&str) -> bool + Send + Sync>> {
+    let spec = Spec::parse(spec).ok()?;
+    let n = spec.fields.len();
+    let mut need: Vec<(usize, HashSet<String>)> = vec![];
+    for (i, f) in spec.fields.iter().enumerate() {
+        let Transform::Bucket(n) = f.transform else { continue };
+        let Some(col) = name(&f.column) else { continue };
+        let Ok(t) = schema.field_with_name(&col).map(|f| f.data_type().clone()) else { continue };
+        let Some(values) = filters.iter().find_map(|e| pinned(e, &col)) else { continue };
+        let Ok(b) = ScalarValue::iter_to_array(values).map_err(anyhow::Error::from).and_then(|a| Ok(cast(&a, &t)?)).and_then(|a| buckets(&a, n as i32)) else { continue };
+        need.push((i, b.as_primitive::<Int32Type>().iter().flatten().map(|v| v.to_string()).collect()));
+    }
+    (!need.is_empty()).then(move || -> Box<dyn Fn(&str) -> bool + Send + Sync> {
+        Box::new(move |part: &str| {
+            let values = values(part, n);
+            need.iter().all(|(i, set)| values.get(*i).is_none_or(|v| set.contains(v)))
+        })
+    })
+}
+
+/// The values a filter pins column `col` to: `col = v`, `v = col`, `col IN (v, …)`; an AND, what either side pins.
+fn pinned(e: &Expr, col: &str) -> Option<Vec<ScalarValue>> {
+    use datafusion::logical_expr::{expr::InList, BinaryExpr, Operator};
+    let is_col = |e: &Expr| matches!(e, Expr::Column(c) if c.name == col);
+    let lit = |e: &Expr| match e {
+        Expr::Literal(v, _) if !v.is_null() => Some(v.clone()),
+        _ => None,
+    };
+    match e {
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) if is_col(left) => lit(right).map(|v| vec![v]),
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) if is_col(right) => lit(left).map(|v| vec![v]),
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => pinned(left, col).or_else(|| pinned(right, col)),
+        Expr::InList(InList { expr, list, negated: false }) if is_col(expr) => list.iter().map(lit).collect(),
+        _ => None,
+    }
+}
+
 /// Iceberg's bucket of a value: murmur3 (x86, 32 bits, seed 0) of its bytes as Iceberg's spec gives them (Appendix B),
 /// `(hash & i32::MAX) % n`.
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -183,7 +234,7 @@ impl ScalarUDFImpl for Bucket {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::common::Result<ColumnarValue> {
         let n = match &args.args[0] {
             ColumnarValue::Scalar(v) => match v.cast_to(&DataType::Int64)? {
-                datafusion::common::ScalarValue::Int64(Some(n)) => i32::try_from(n).unwrap_or(0),
+                ScalarValue::Int64(Some(n)) => i32::try_from(n).unwrap_or(0),
                 _ => 0,
             },
             _ => 0,

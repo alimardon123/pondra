@@ -1,0 +1,9 @@
++32_500
+
+The Postgres door's vector (#836, step 5, 5-TY-c2b) on the page as in every form. Its own page code is small:
+pg_oids' two types, pg_catalog's "char" marks on pg_type's kinds, and pg_types' two helpers for them. Merged with main
+4b03d1e7 on CI, the module measured wasm 59,464,771 and brotli 9,432,577. That is 21 KB of wasm and 74 KB of brotli over
+#835's run (59,443,428 and 9,358,568), which was measured before #833 and #834 joined main. Main's own runs skip the
+page, so main's module at 4b03d1e7 has no measurement of its own. The rest of the brotli is code order, as with #798's:
+brotli's window finds fewer matches when the same code lands in another order. This raise keeps 3 KB of room above the
+measured module, as the README asks.

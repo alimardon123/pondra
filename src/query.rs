@@ -860,13 +860,11 @@ pub async fn facts(lake: &Lake, meta: &Arc<TableMeta>, sys: bool) -> Result<Arc<
 
 /// `facts` worked out for this call (`sys`: with the system columns, as `sys::with_sys` gives them).
 pub async fn facts_once(lake: &Lake, meta: &TableMeta, sys: bool) -> Result<Facts> {
-    let columns = match sys {
-        true => crate::sys::with_sys(meta).into_columns(),
-        false => meta.to_columns(),
+    // (marked as the table's own read is: `doc['k']` and `doc.k` on a JSON column plan from the mark, `TableMeta::read_schema`)
+    let schema = match sys {
+        true => crate::sys::with_sys(meta).read_schema()?,
+        false => meta.read_schema()?,
     };
-    // (a column whose storage isn't text, INET, is marked as its type where queries plan over it: a string compared with it
-    // is read as one, `column_types::sql`)
-    let schema = crate::column_types::parsing(read_schema(&columns)?, |n| meta.held_of(n));
     let manifests = crate::manifest::list(lake, meta).await?;
     let ranges = crate::manifest::ranges(&manifests, &meta.files, &schema);
     let statistics = count(meta, &schema, &ranges, None);

@@ -98,100 +98,136 @@ struct Avro {
 }
 
 /// A table's layout as Iceberg says it, for writers to follow (ADR-029 §6): its partition spec
-/// (`partition_by`: identity, or year, month, day or hour of a time; spec 1, since spec 0, no
-/// partitions, is what manifests written before said), its sort order (`cluster_by` on one
-/// column; two or more follow a Hilbert curve, which Iceberg can't say), and its key as the
-/// schema's identifier fields (required, as Iceberg asks; a key is NOT NULL).
+/// (`partition_by`, read by `partition::Spec`: identity, year, month, day or hour of a time, bucket and
+/// truncate, as Iceberg names them; spec 1, since spec 0, no partitions, is what manifests written before
+/// said), its sort order (`cluster_by` on one column; two or more follow a Hilbert curve, which Iceberg
+/// can't say), and its key as the schema's identifier fields (required, as Iceberg asks; a key is NOT NULL).
 pub struct Layout {
-    partition: Option<(usize, String, DataType)>, // the stored column's place, the transform, its type
-    name: String,                                 // the partition field's name
+    partition: Option<Vec<Part>>, // None: unpartitioned, or a field Iceberg's records here can't hold (spec 0's files)
     sort: Option<usize>,
     keys: Vec<usize>,
 }
 
+/// A partition field as published: its column's place, the transform, the column's type and the field's name.
+struct Part {
+    at: usize,
+    transform: crate::partition::Transform,
+    dt: DataType,
+    name: String,
+}
+
 impl Layout {
     pub fn of(meta: &TableMeta) -> Layout {
+        use crate::partition::Transform;
         // (a column's place: its id - 1, so `all()[i]` is the column)
         let list = meta.column_list();
         let at = |c: &str| list.of_stored(c).map(|c| c.id as usize - 1);
         let partition = meta.partition.as_deref().and_then(|p| {
-            let (transform, col) = match p.split_once('(') {
-                Some((f, c)) => (f.trim().to_string(), c.trim_end_matches(')').trim()),
-                None => ("identity".to_string(), p.trim()),
-            };
-            let i = at(col)?;
-            let t = crate::answer::dtype(&list.all()[i].dtype).ok()?;
-            let time = matches!(t, DataType::Date32 | DataType::Timestamp(TimeUnit::Microsecond, _));
-            let fits = match transform.as_str() {
-                "identity" => time || matches!(t, DataType::Int32 | DataType::Int64 | DataType::Utf8 | DataType::Boolean),
-                _ => time,
-            };
-            fits.then_some((i, transform, t))
-        });
-        let name = partition.as_ref().map_or(String::new(), |(i, t, _)| match t.as_str() {
-            "identity" => list.all()[*i].name.clone(),
-            t => format!("{}_{t}", list.all()[*i].name),
+            let mut parts: Vec<Part> = vec![];
+            for f in crate::partition::Spec::parse(p).ok()?.fields {
+                let i = at(&f.column)?;
+                let dt = crate::answer::dtype(&list.all()[i].dtype).ok()?;
+                let time = matches!(dt, DataType::Date32 | DataType::Timestamp(TimeUnit::Microsecond, _));
+                let fits = match f.transform {
+                    Transform::Identity => time || matches!(dt, DataType::Int32 | DataType::Int64 | DataType::Utf8 | DataType::Boolean),
+                    Transform::Time(_) => time,
+                    Transform::Bucket(_) => true, // (an int, whatever its column)
+                    Transform::Truncate(_) => matches!(dt, DataType::Int32 | DataType::Int64 | DataType::Utf8),
+                };
+                if !fits {
+                    return None;
+                }
+                let column = &list.all()[i].name;
+                let mut name = match f.transform {
+                    Transform::Identity => column.clone(),
+                    Transform::Time(u) => format!("{column}_{u}"),
+                    Transform::Bucket(_) => format!("{column}_bucket"),
+                    Transform::Truncate(_) => format!("{column}_trunc"),
+                };
+                if parts.iter().any(|p| p.name == name) {
+                    name = format!("{name}_{}", parts.len() + 1); // (bucket(4, c), bucket(16, c): two fields, two names)
+                }
+                parts.push(Part { at: i, transform: f.transform, dt, name });
+            }
+            Some(parts)
         });
         let sort = (meta.cluster.len() == 1 && meta.key.is_empty()).then(|| at(&meta.cluster[0])).flatten();
-        Layout { partition, name, sort, keys: meta.key.iter().filter_map(|k| at(k)).collect() }
+        Layout { partition, sort, keys: meta.key.iter().filter_map(|k| at(k)).collect() }
     }
 
     /// Does the table publish its partitions (or have none)? A writer lays out its files so only then.
     pub fn followable(meta: &TableMeta) -> bool { meta.partition.is_none() || Layout::of(meta).partition.is_some() }
 
+    fn parts(&self) -> &[Part] { self.partition.as_deref().unwrap_or_default() }
+
     fn spec(&self) -> Value {
-        match &self.partition {
-            Some((i, t, _)) => json!([{"source-id": i + 1, "field-id": 1000, "name": self.name, "transform": t}]),
-            None => json!([]),
-        }
+        use crate::partition::Transform;
+        let transform = |t: &Transform| match t {
+            Transform::Identity => "identity".to_string(),
+            Transform::Time(u) => u.to_string(),
+            Transform::Bucket(n) => format!("bucket[{n}]"),
+            Transform::Truncate(w) => format!("truncate[{w}]"),
+        };
+        json!(self.parts().iter().enumerate().map(|(k, p)| json!({"source-id": p.at + 1, "field-id": 1000 + k, "name": p.name, "transform": transform(&p.transform)})).collect::<Vec<_>>())
     }
 
     /// The partition record's Avro fields, as manifests carry them.
     fn avro(&self) -> Vec<Value> {
-        let Some((_, t, dt)) = &self.partition else { return vec![] };
-        let kind = match (t.as_str(), dt) {
-            ("identity", DataType::Int32) => json!("int"),
-            ("identity", DataType::Int64) => json!("long"),
-            ("identity", DataType::Utf8) => json!("string"),
-            ("identity", DataType::Boolean) => json!("boolean"),
-            ("identity", DataType::Date32) => json!({"type": "int", "logicalType": "date"}),
-            ("identity", _) => json!({"type": "long", "logicalType": "timestamp-micros", "adjust-to-utc": matches!(dt, DataType::Timestamp(_, Some(_)))}),
-            _ => json!("int"),
-        };
-        vec![opt(&self.name, 1000, kind)]
+        use crate::partition::Transform;
+        self.parts().iter().enumerate().map(|(k, p)| {
+            let kind = match (&p.transform, &p.dt) {
+                (Transform::Identity | Transform::Truncate(_), DataType::Int32) => json!("int"),
+                (Transform::Identity | Transform::Truncate(_), DataType::Int64) => json!("long"),
+                (Transform::Identity | Transform::Truncate(_), DataType::Utf8) => json!("string"),
+                (Transform::Identity, DataType::Boolean) => json!("boolean"),
+                (Transform::Identity, DataType::Date32) => json!({"type": "int", "logicalType": "date"}),
+                (Transform::Identity, dt) => json!({"type": "long", "logicalType": "timestamp-micros", "adjust-to-utc": matches!(dt, DataType::Timestamp(_, Some(_)))}),
+                _ => json!("int"), // (year, month, day, hour and bucket)
+            };
+            opt(&p.name, 1000 + k as u32, kind)
+        }).collect()
     }
 
     /// A file's partition record, Avro-encoded, from its partition value (`DataFile::part`: the
-    /// text `partition::split` gives it).
+    /// text `partition::split` gives it, a value a field).
     fn record(&self, part: &str) -> Result<Vec<u8>> {
+        use crate::partition::Transform;
         use datafusion::arrow::array::{AsArray, StringArray};
-        use datafusion::arrow::datatypes::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType};
-        let Some((_, t, dt)) = &self.partition else { return Ok(vec![]) };
-        if part == "null" {
-            return Ok(vec![0]); // (the union's null)
+        use datafusion::arrow::datatypes::{Date32Type, TimestampMicrosecondType};
+        let parts = self.parts();
+        if parts.is_empty() {
+            return Ok(vec![]);
         }
+        let values = crate::partition::values(part, parts.len());
+        anyhow::ensure!(values.len() == parts.len(), "a file's part {part} holds {} values, its spec {} fields", values.len(), parts.len());
         let mut b = vec![];
-        long(&mut b, 1);
-        let text: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(StringArray::from(vec![part]));
-        let micros = |a: datafusion::arrow::array::ArrayRef| a.as_primitive::<TimestampMicrosecondType>().value(0);
-        let as_time = || -> Result<i64> { Ok(micros(datafusion::arrow::compute::cast(&text, &DataType::Timestamp(TimeUnit::Microsecond, None))?)) };
-        match (t.as_str(), dt) {
-            ("identity", DataType::Utf8) => bytes(&mut b, part.as_bytes()),
-            ("identity", DataType::Boolean) => b.push((part == "true") as u8),
-            ("identity", DataType::Int32) => long(&mut b, datafusion::arrow::compute::cast(&text, dt)?.as_primitive::<Int32Type>().value(0) as i64),
-            ("identity", DataType::Int64) => long(&mut b, datafusion::arrow::compute::cast(&text, dt)?.as_primitive::<Int64Type>().value(0)),
-            ("identity", DataType::Date32) => long(&mut b, datafusion::arrow::compute::cast(&text, dt)?.as_primitive::<Date32Type>().value(0) as i64),
-            ("identity", _) => long(&mut b, micros(datafusion::arrow::compute::cast(&text, dt)?)),
-            (unit, _) => {
-                use chrono::Datelike;
-                let us = as_time()?;
-                let d = chrono::DateTime::from_timestamp_micros(us).context("a time out of range")?.naive_utc();
-                long(&mut b, match unit {
-                    "year" => d.year() as i64 - 1970,
-                    "month" => (d.year() as i64 - 1970) * 12 + d.month0() as i64,
-                    "day" => us.div_euclid(86_400_000_000),
-                    _ => us.div_euclid(3_600_000_000),
-                });
+        for (p, v) in parts.iter().zip(&values) {
+            if v == "null" {
+                b.push(0); // (the union's null)
+                continue;
+            }
+            long(&mut b, 1);
+            let text: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(StringArray::from(vec![v.as_str()]));
+            let micros = |a: datafusion::arrow::array::ArrayRef| a.as_primitive::<TimestampMicrosecondType>().value(0);
+            let whole = || -> Result<i64> { v.parse::<i64>().with_context(|| format!("a part's value {v} is not a whole number")) };
+            match (&p.transform, &p.dt) {
+                (Transform::Identity | Transform::Truncate(_), DataType::Utf8) => bytes(&mut b, v.as_bytes()),
+                (Transform::Identity, DataType::Boolean) => b.push((v == "true") as u8),
+                (Transform::Identity | Transform::Truncate(_), DataType::Int32 | DataType::Int64) | (Transform::Bucket(_), _) => long(&mut b, whole()?),
+                (Transform::Identity, DataType::Date32) => long(&mut b, datafusion::arrow::compute::cast(&text, &p.dt)?.as_primitive::<Date32Type>().value(0) as i64),
+                (Transform::Identity, _) => long(&mut b, micros(datafusion::arrow::compute::cast(&text, &p.dt)?)),
+                (Transform::Time(unit), _) => {
+                    use chrono::Datelike;
+                    let us = micros(datafusion::arrow::compute::cast(&text, &DataType::Timestamp(TimeUnit::Microsecond, None))?);
+                    let d = chrono::DateTime::from_timestamp_micros(us).context("a time out of range")?.naive_utc();
+                    long(&mut b, match *unit {
+                        "year" => d.year() as i64 - 1970,
+                        "month" => (d.year() as i64 - 1970) * 12 + d.month0() as i64,
+                        "day" => us.div_euclid(86_400_000_000),
+                        _ => us.div_euclid(3_600_000_000),
+                    });
+                }
+                (Transform::Truncate(_), _) => anyhow::bail!("truncate of a {} isn't published", p.dt),
             }
         }
         Ok(b)
@@ -478,7 +514,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{folder}")),
         "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * n, // (list elements take ids after the columns')
         "current-schema-id": 0, "schemas": [schema],
-        "default-spec-id": layout.partition.is_some() as i32, "last-partition-id": if layout.partition.is_some() { 1000 } else { 999 },
+        "default-spec-id": layout.partition.is_some() as i32, "last-partition-id": 999 + layout.parts().len(),
         "partition-specs": std::iter::once(json!({"spec-id": 0, "fields": []})).chain(layout.partition.as_ref().map(|_| json!({"spec-id": 1, "fields": layout.spec()}))).collect::<Vec<_>>(),
         "default-sort-order-id": layout.sort.is_some() as i32,
         "sort-orders": std::iter::once(json!({"order-id": 0, "fields": []})).chain(layout.sort.map(|i| json!({"order-id": 1, "fields": [{"transform": "identity", "source-id": i + 1, "direction": "asc", "null-order": "nulls-last"}]}))).collect::<Vec<_>>(),
@@ -1217,7 +1253,35 @@ mod tests {
         let got: Vec<(u64, &str)> = f.iter().map(|f| (f["id"].as_u64().unwrap(), f["name"].as_str().unwrap())).collect();
         assert_eq!(got, [(4, "d"), (1, "a"), (2, "bee")]);
         let layout = Layout::of(&{ let mut entry = moved(); entry.partition = Some("b".into()); entry });
-        assert_eq!((layout.spec()[0]["source-id"].as_u64(), layout.name.as_str()), (Some(2), "bee"));
+        assert_eq!((layout.spec()[0]["source-id"].as_u64(), layout.parts()[0].name.as_str()), (Some(2), "bee"));
+    }
+
+    /// Several partition fields publish as one spec of Iceberg's, each field its transform's name and each file's record a
+    /// value a field (audit 11-20 H3: `region, day(ts)` was read as one field, and its records failed every round).
+    #[test]
+    fn several_fields_publish_as_one_spec() {
+        let columns = vec![("region".into(), "Utf8".into()), ("d".into(), "Date32".into()), ("id".into(), "Int64".into())];
+        let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, ..Default::default() }); entry.partition = Some("region, day(d), bucket(4, id), truncate(2, region)".into()); entry };
+        let layout = Layout::of(&meta);
+        let spec = layout.spec();
+        let spec: Vec<(u64, u64, &str, &str)> = spec.as_array().unwrap().iter().map(|f| (f["source-id"].as_u64().unwrap(), f["field-id"].as_u64().unwrap(), f["name"].as_str().unwrap(), f["transform"].as_str().unwrap())).collect();
+        assert_eq!(spec, [(1, 1000, "region", "identity"), (2, 1001, "d_day", "day"), (3, 1002, "id_bucket", "bucket[4]"), (1, 1003, "region_trunc", "truncate[2]")]);
+        assert_eq!(layout.avro().len(), 4);
+        let mut want = vec![];
+        long(&mut want, 1);
+        bytes(&mut want, b"u/s");
+        long(&mut want, 1);
+        long(&mut want, 19_723); // (2024-01-01, in days)
+        want.push(0); // (a null's bucket)
+        long(&mut want, 1);
+        bytes(&mut want, b"u/");
+        assert_eq!(layout.record("u%2Fs/2024-01-01T00:00:00/null/u%2F").unwrap(), want);
+        assert!(Layout::followable(&meta));
+        // (a field Iceberg's records here can't hold publishes no partitions, as before: spec 0's files)
+        let mut floats = meta.clone();
+        floats.add_column("f", "Float64", None, None);
+        floats.partition = Some("region, f".into());
+        assert!(Layout::of(&floats).partition.is_none() && Layout::of(&floats).record("x/1.5").unwrap().is_empty());
     }
 
     /// A version lets go of a file only when none of its own is that file: a file moved between our manifests and the

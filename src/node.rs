@@ -1070,6 +1070,14 @@ mod tests {
             let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
             let b = q("SELECT count(*), sum(id) FROM p").await.unwrap();
             assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (40, 820));
+            // (I3-b: a point lookup reads its value's bucket's file, not its day's other buckets', whose ids span it)
+            let scanned = || lake.node.metrics.files_scanned.load(std::sync::atomic::Ordering::Relaxed);
+            for (sql, rows, files) in [("SELECT count(*) FROM p WHERE id = 7", 1, 1), ("SELECT count(*) FROM p WHERE id IN (7, 8)", 2, 2), ("SELECT count(*) FROM p WHERE id = 7 AND s = 's7'", 1, 1)] {
+                let before = scanned();
+                let b = q(sql).await.unwrap();
+                assert_eq!(b[0].column(0).as_primitive::<Int64Type>().value(0), rows, "{sql}");
+                assert!(scanned() - before <= files, "{sql}: {} files read", scanned() - before);
+            }
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })

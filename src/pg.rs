@@ -1161,8 +1161,11 @@ fn each_row<T>(b: &RecordBatch, types: &[DataType], mut row: impl FnMut(&[ArrayR
 }
 
 /// A column's Postgres type and the Arrow type its values are sent as: a uuid's, json's or jsonb's
-/// (`pg_types::typed` marks one), else its Arrow type's.
+/// (`pg_types::typed` marks one), a catalog's `"char"`, else its Arrow type's.
 fn field_type(f: &datafusion::arrow::datatypes::Field, format: FieldFormat) -> (Type, DataType) {
+    if crate::pg_types::is_char(f) {
+        return (Type::CHAR, DataType::Utf8); // (a catalog's kind: `pg_catalog::CHARS`)
+    }
     match crate::pg_types::marked_type(f) {
         Some(Ty::Uuid) => (Type::UUID, DataType::Utf8),
         Some(Ty::Json) => (Type::JSON, DataType::Utf8),
@@ -1862,7 +1865,10 @@ impl ExtendedQueryHandler for Backend {
         let mut message = message;
         message.query = self.in_language(self.language(), &message.query)?; // (its `$1`s are placeholders in the language's grammar too)
         match StoredStatement::parse(client, &message, self.query_parser()).await? {
-            Some(stmt) => client.portal_store().put_statement(Arc::new(stmt)),
+            Some(mut stmt) => {
+                crate::pg_values::types(&mut stmt.parameter_types, &message.type_oids); // (pgvector's `vector` too)
+                client.portal_store().put_statement(Arc::new(stmt))
+            }
             None => client.portal_store().put_empty_statement(&name),
         }
         client.feed(PgWireBackendMessage::ParseComplete(ParseComplete::new())).await?;
