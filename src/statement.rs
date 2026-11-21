@@ -53,8 +53,13 @@ pub enum Answer<O> {
     Sent,
 }
 
-/// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it.
-pub async fn run<W: Wire>(app: &App, mut req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+/// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it. It is read in
+/// a context of its own (`context::scope`), and a script's statements each in theirs (`routines::one`).
+pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+    crate::context::scope(run_in(app, req, how, who, wire)).await
+}
+
+async fn run_in<W: Wire>(app: &App, mut req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
     in_its_language(crate::set::language(), &mut req)?; // (the session's language read once, as the request arrives: what follows reads Pondra's SQL)
     if let Some(seg) = how.after {
         let mut hwm = app.lake.hwm.subscribe();

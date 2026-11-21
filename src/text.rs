@@ -538,18 +538,13 @@ impl Tokens {
     pub(crate) fn word(&self, i: usize, k: Keyword) -> bool { matches!(self.toks.get(i), Some(Token::Word(w)) if w.keyword == k && w.quote_style.is_none()) }
 }
 
-// (the last texts' tokens: kept as the parses are, `parsed::kept`; a pure function of the text, so the process's, the same for
-// any lake here. An interim: the redesign's step 8 has the statement's own context carry its parse and tokens through the
-// pipeline's phases, and this static and `parsed::LAST` go then)
-static TOKENS: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<(String, Option<std::sync::Arc<Tokens>>)>>> = std::sync::LazyLock::new(Default::default);
-
-/// `sql`'s tokens (None: the tokenizer refuses it, an unclosed string), tokenized once while it is among the last few
-/// texts asked for: the front's passes over one statement, and the looks after them, share them.
+/// `sql`'s tokens (None: the tokenizer refuses it, an unclosed string), tokenized once in the statement's context
+/// (`context::tokens`): the front's passes over one statement, and the looks after them, share them.
 pub(crate) fn tokens(sql: &str) -> Option<std::sync::Arc<Tokens>> {
     if sql.len() > crate::parsed::LONGEST {
         return tokenized(sql).map(std::sync::Arc::new); // (a bulk INSERT's rows: tokenized each time, as they are parsed)
     }
-    crate::parsed::kept(&TOKENS, sql, |sql| tokenized(sql).map(std::sync::Arc::new))
+    crate::context::tokens(sql, |sql| tokenized(sql).map(std::sync::Arc::new))
 }
 
 /// Where MySQL's executable comment `/*! … */` starts in `sql`, when the tokenizer reads one. sqlparser reads its words as

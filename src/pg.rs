@@ -1660,6 +1660,9 @@ pub struct Prepared {
 
 #[derive(Default)]
 struct Found {
+    /// The statement's context (`context.rs`): each message on it (a Describe, a portal's, an Execute) reads its texts in
+    /// it, so a portal's bound text a Describe planned is not parsed again to run.
+    context: Arc<crate::context::Context>,
     types: tokio::sync::OnceCell<Vec<Type>>, // ($1, $2…: `param_types`, the first time they are asked for)
     columns: std::sync::Mutex<Columns>,
 }
@@ -1795,11 +1798,14 @@ impl SimpleQueryHandler for Backend {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let mut out = vec![];
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
-            let q = &self.in_language(self.language(), q)?; // (each read in the language the session has when it comes to it: a SET language before it counts)
-            out.push(match Copy::of(q) {
-                Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await?,
-                _ => self.told(client, &user, q, &Format::UnifiedText).await?,
-            });
+            let one = async {
+                let q = &self.in_language(self.language(), q)?; // (each read in the language the session has when it comes to it: a SET language before it counts)
+                PgWireResult::Ok(match Copy::of(q) {
+                    Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await?,
+                    _ => self.told(client, &user, q, &Format::UnifiedText).await?,
+                })
+            };
+            out.push(crate::context::scope(one).await?); // (each statement in a context of its own)
         }
         Ok(out)
     }
@@ -1901,8 +1907,11 @@ impl ExtendedQueryHandler for Backend {
             return crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await;
         }
         let who = self.signed().await?; // (a key lookup's and a plan's types, of what it may read: as whoever signed in)
-        let inferred = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, self.types(statement))).await;
-        let out = self.told(client, &user, &bind(portal, inferred)?, &portal.result_column_format).await?;
+        let run = async {
+            let inferred = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, self.types(statement))).await;
+            self.told(client, &user, &bind(portal, inferred)?, &portal.result_column_format).await
+        };
+        let out = crate::context::carried(statement.found.context.clone(), run).await?;
         match statement.answered(&out, &portal.result_column_format) {
             Ok(()) => Ok(out),
             Err(e) => {
@@ -1923,7 +1932,7 @@ impl ExtendedQueryHandler for Backend {
             Err(e) => return self.noted(&stmt.statement.sql, Err(e)).await,
         };
         let described = async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) };
-        let out = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, described)).await; // (its temporary tables too)
+        let out = crate::context::carried(stmt.statement.found.context.clone(), crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, described))).await; // (its temporary tables too)
         self.noted(&stmt.statement.sql, out).await
     }
 
@@ -1947,7 +1956,7 @@ impl ExtendedQueryHandler for Backend {
             statement.keep(columns);
             Ok(DescribePortalResponse::new(fields))
         };
-        let out = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, described)).await; // (as whoever signed in, as above)
+        let out = crate::context::carried(statement.found.context.clone(), crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, described))).await; // (as whoever signed in, as above)
         self.noted(&sent, out).await
     }
 }
