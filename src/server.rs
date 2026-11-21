@@ -880,7 +880,7 @@ struct AppendParams {
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, who: Option<axum::Extension<crate::auth::Principal>>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let who = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0);
-    let (start, scope) = (std::time::Instant::now(), who.scope.clone());
+    let (start, scope) = (crate::clock::Instant::now(), who.scope.clone());
     let (out, unseen) = crate::rights::noting(append_rows(&app, &name, p, headers, body)).await;
     crate::audit::rows(&app, &who, "/append", &name, out.as_ref().err().map(|e| e.told(&scope)), unseen, start.elapsed()); // (the audit log's line for the rows: S23)
     out
@@ -932,7 +932,7 @@ struct InsertParams {
 /// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, who: Option<axum::Extension<crate::auth::Principal>>, body: String) -> Result<Json<Value>, E> {
     let who = who.map_or_else(|| crate::auth::Principal::of(crate::auth::Role::None), |w| w.0);
-    let (start, scope) = (std::time::Instant::now(), who.scope.clone());
+    let (start, scope) = (crate::clock::Instant::now(), who.scope.clone());
     let (out, unseen) = crate::rights::noting(async {
         match p.staged {
             Some(1) => insert_staged(&app, &name, &p.job, &body, &who).await,

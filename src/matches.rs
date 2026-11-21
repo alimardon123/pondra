@@ -304,7 +304,7 @@ fn most_held() -> u64 { crate::env::value::<u64>("PONDRA_MATCH_HELD_ROWS").max(1
 /// One run of a matches view (leader only, `views::emit_all`): steps of about `most_rows()` new rows each, back to back
 /// for `STEPS_FOR` while a step has more to do.
 pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>, view: &str, v: &View, m: &Matches) -> Result<()> {
-    let started = datafusion::common::instant::Instant::now(); // (a page's clock too: std's Instant has none there)
+    let started = crate::clock::Instant::now(); // (a page's clock too: std's Instant has none there)
     while step(lake, _log, seq, lock, view, v, m).await? && started.elapsed() < STEPS_FOR {}
     Ok(())
 }

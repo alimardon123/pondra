@@ -620,7 +620,7 @@ impl Backend {
         }
         if reader && !crate::txn::open() && !crate::temp::mentioned(sql) {
             // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it (of what its caller may read).
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::Instant::now();
             if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';'), &self.who().scope).await.map_err(self.err())? {
                 let t1 = t0.elapsed();
                 if let Some(b) = p.rows(&self.app.lake).await.map_err(self.err())? {
@@ -738,7 +738,7 @@ impl Backend {
     /// a write each, a DO that printed 8 lines took 9 writes, and a connection idle a while sends its first ones slowly
     /// (TCP's slow start after idle).
     async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        let t0 = std::time::Instant::now();
+        let t0 = crate::clock::Instant::now();
         let me = self.me.upgrade().expect("its connection holds it");
         let (u, q, f) = (user.to_string(), sql.to_string(), format.clone());
         let who = self.signed().await?;

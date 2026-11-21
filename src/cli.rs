@@ -688,7 +688,7 @@ async fn run() -> anyhow::Result<()> {
                 write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(first)), &here).await?;
             }
             let (token, hash) = users::new_token(&user);
-            let name = name.unwrap_or_else(|| format!("token-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())));
+            let name = name.unwrap_or_else(|| format!("token-{}", crate::clock::wall_ms() / 1000));
             let change = users::Change::CreateToken { name: name.clone(), user: user.clone(), expires_secs: None, hash: Some(hash) };
             write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(change)), &here).await?; // (only the hash goes)
             println!("{token}"); // (alone on stdout: `T=$(pondra token --dir lake)`)

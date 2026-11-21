@@ -19,7 +19,7 @@
 use crate::log::now_ms;
 use crate::store::Lake;
 use anyhow::Result;
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};

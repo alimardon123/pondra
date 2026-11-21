@@ -239,7 +239,7 @@ impl HttpService for Turns {
         let gate = if urgent { &self.urgent } else { &self.gate };
         let turn = gate.take().await;
         let (method, path) = (req.method().to_string(), req.uri().path().to_string());
-        let began = datafusion::common::instant::Instant::now(); // (web-time in a page)
+        let began = crate::clock::Instant::now(); // (web-time in a page)
         let answer = self.inner.execute(req).await;
         let now = crate::log::now_ms();
         gate.slow(&self.root, &method, &path, began.elapsed(), &answer, now);

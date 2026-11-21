@@ -1174,8 +1174,8 @@ async fn seen_node_commit(lake: &crate::store::Lake) {
         Ok(upto) => upto,
         Err(e) => return eprintln!("the node's commit number didn't read, so the page may not hold the write yet: {e:#}"),
     };
-    let deadline = datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(5);
-    while !matches!(lake.cat.get::<u64>("c").await, Ok(Some(c)) if c >= upto) && datafusion::common::instant::Instant::now() < deadline {
+    let deadline = crate::clock::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(lake.cat.get::<u64>("c").await, Ok(Some(c)) if c >= upto) && crate::clock::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

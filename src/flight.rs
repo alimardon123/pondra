@@ -455,7 +455,7 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<Strin
     let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| w.status(crate::query::too_big(&pool)))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let answers = lake.state::<Kept>().map_err(w.err())?;
-    answers.0.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
+    answers.0.lock().unwrap().insert(id.clone(), (batches, crate::clock::Instant::now(), reserved));
     let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
     info(w, &schema, ticket.as_any().encode_to_vec(), descriptor)
 }
@@ -639,7 +639,7 @@ fn piece_stream(w: Worded, h: crate::query::Handed, busy: crate::node_state::Bus
 /// A script's or CALL's answer, run when its flight was asked for, until its ticket reads it (`KEPT_FOR`), with the query
 /// memory its batches hold while it is kept. One lake's: a ticket read at another lake's door finds none (`answer`).
 #[derive(Default)]
-pub struct Kept(std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant, MemoryReservation)>>);
+pub struct Kept(std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, crate::clock::Instant, MemoryReservation)>>);
 
 impl crate::lake_state::LakeState for Kept {
     const NAME: &'static str = "flight_answers";

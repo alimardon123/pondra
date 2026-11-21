@@ -923,14 +923,14 @@ pub struct SignIns {
     /// Read as signed (`signed`): kept for good, since a lake that was served with tokens stays so.
     signed: std::sync::atomic::AtomicBool,
     /// Read as unsigned, and when (as `any` remembers its answers).
-    unsigned: Mutex<Option<(Option<u64>, datafusion::common::instant::Instant)>>,
+    unsigned: Mutex<Option<(Option<u64>, crate::clock::Instant)>>,
     /// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
     /// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
-    verified: Mutex<HashMap<String, datafusion::common::instant::Instant>>,
+    verified: Mutex<HashMap<String, crate::clock::Instant>>,
     /// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
-    access: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant, Arc<Access>, bool)>>,
+    access: Mutex<HashMap<String, (Option<u64>, crate::clock::Instant, Arc<Access>, bool)>>,
     /// Whether the lake has a user who signs in, or an identity provider, as of a catalog version (`any`).
-    any: Mutex<Option<(Option<u64>, datafusion::common::instant::Instant, bool)>>,
+    any: Mutex<Option<(Option<u64>, crate::clock::Instant, bool)>>,
 }
 
 impl crate::lake_state::LakeState for SignIns {
@@ -1095,7 +1095,7 @@ pub async fn signed(lake: &Lake) -> bool {
         }
         Ok(None) => {
             if let Some(s) = &signs {
-                *s.unsigned.lock().unwrap() = Some((version, datafusion::common::instant::Instant::now()));
+                *s.unsigned.lock().unwrap() = Some((version, crate::clock::Instant::now()));
             }
             false
         }
@@ -1225,7 +1225,7 @@ pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
             if all.len() > 10_000 {
                 all.clear();
             }
-            all.insert(key, datafusion::common::instant::Instant::now());
+            all.insert(key, crate::clock::Instant::now());
         }
     }
     ok
@@ -1442,7 +1442,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
             }
             let access = Arc::new(Access { grants, names: seen, limits, ..Default::default() });
             if let Some(s) = &signs {
-                s.access.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
+                s.access.lock().unwrap().insert(id, (version, crate::clock::Instant::now(), access.clone(), superuser));
             }
             (access, superuser)
         }
@@ -1567,7 +1567,7 @@ impl Quota {
 /// Is what was worked out at catalog version `then` (at `at`) still so? On the leader, until the
 /// catalog changes; elsewhere (a follower's version may not move with every commit it is sent), a
 /// second at most.
-pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: datafusion::common::instant::Instant) -> bool {
+pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: crate::clock::Instant) -> bool {
     (lake.cat.is_writer() && now.is_some() && now == then) || at.elapsed() < std::time::Duration::from_secs(1)
 }
 
@@ -1625,7 +1625,7 @@ pub async fn any(lake: &Lake) -> bool {
         Err(_) => return true, // (users that can't be read are taken for ones who sign in, and read again next time: open only when surely so)
     };
     if let Some(s) = &signs {
-        *s.any.lock().unwrap() = Some((version, datafusion::common::instant::Instant::now(), yes));
+        *s.any.lock().unwrap() = Some((version, crate::clock::Instant::now(), yes));
     }
     yes
 }

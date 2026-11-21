@@ -15,7 +15,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
 use std::borrow::Borrow;
 use std::hash::Hash;
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError, Weak};
 

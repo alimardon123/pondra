@@ -51,7 +51,7 @@ use datafusion::physical_plan::{empty::EmptyExec, execution_plan::replace_childr
 use datafusion::physical_plan::projection::{all_alias_free_columns, new_projections_for_columns};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 const IDLE: Duration = Duration::from_secs(60); // unread this long: may make room for others

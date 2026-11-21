@@ -28,7 +28,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use std::sync::{Arc, Mutex, OnceLock};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 pub const TABLE: &str = crate::records::HISTORY; // (commits only to it are quiet: `store::quiet`)
@@ -110,7 +110,7 @@ pub fn parsed(stmt: &crate::write::Stmt) { with(|_, note| note.wrote = Some(Wrot
 /// A part of its work on `node`, which began at `began`, has ended.
 pub fn span(what: impl Into<String>, node: &str, began: Instant) {
     with(|start, note| {
-        let (at, ms) = (began.saturating_duration_since(start), began.elapsed());
+        let (at, ms) = (began.duration_since(start), began.elapsed());
         note.trace.push(Span { what: what.into(), node: node.to_string(), at: at.as_secs_f64() * 1e3, ms: ms.as_secs_f64() * 1e3 });
     });
 }

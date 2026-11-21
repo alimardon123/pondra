@@ -38,7 +38,8 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::clock::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -1274,7 +1275,7 @@ fn encode_batch(base: i64, ts: i64, recs: &[(Option<Vec<u8>>, Option<Vec<u8>>)])
     b
 }
 
-fn now_ms() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64) }
+fn now_ms() -> i64 { crate::clock::wall_ms() as i64 }
 
 // ---------------------------------------------------------------- consumer groups
 //
@@ -1327,7 +1328,7 @@ struct Group {
 struct Member {
     protocols: Vec<(String, Bytes)>,
     session: Duration,
-    seen: std::time::Instant,
+    seen: crate::clock::Instant,
     joined: bool,
     assignment: Bytes,
 }
@@ -1351,7 +1352,7 @@ impl Group {
         }
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
-        let (kept, group, round, start) = (kept.clone(), group.to_string(), self.round, std::time::Instant::now());
+        let (kept, group, round, start) = (kept.clone(), group.to_string(), self.round, crate::clock::Instant::now());
         tasks.spawn_node(crate::spawns::Vital::Own, async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1519,8 +1520,8 @@ async fn join_group(app: &App, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static
             return Ok(async move { answer(Joined { error: UNKNOWN_MEMBER_ID, member, ..Default::default() }) }.boxed());
         }
         let id = if member.is_empty() { format!("pondra-{}", uuid::Uuid::new_v4()) } else { member };
-        let m = g.members.entry(id.clone()).or_insert(Member { protocols: vec![], session, seen: std::time::Instant::now(), joined: false, assignment: Bytes::new() });
-        (m.protocols, m.session, m.seen) = (protocols, session, std::time::Instant::now());
+        let m = g.members.entry(id.clone()).or_insert(Member { protocols: vec![], session, seen: crate::clock::Instant::now(), joined: false, assignment: Bytes::new() });
+        (m.protocols, m.session, m.seen) = (protocols, session, crate::clock::Instant::now());
         g.rebalance(&kept, &group, rebalance, &app.lake.node.tasks);
         g.members.get_mut(&id).expect("just added").joined = true;
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1557,7 +1558,7 @@ async fn sync_group(app: &App, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static
     if error != 0 {
         return Ok(async move { answer(error, Bytes::new()) }.boxed());
     }
-    g.members.get_mut(&member).expect("checked").seen = std::time::Instant::now();
+    g.members.get_mut(&member).expect("checked").seen = crate::clock::Instant::now();
     if member == g.leader {
         for (id, a) in assignments {
             if let Some(m) = g.members.get_mut(&id) {
@@ -1594,7 +1595,7 @@ fn heartbeat(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
             let g = groups.entry(group.clone()).or_default();
             g.expire(&kept, &group, &app.lake.node.tasks);
             if let Some(m) = g.members.get_mut(&member) {
-                m.seen = std::time::Instant::now();
+                m.seen = crate::clock::Instant::now();
             }
             g.check(&member, generation)
         }
