@@ -788,7 +788,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
     } else {
         Default::default()
     };
-    let mut meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types: sql_types.clone(), ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.history = history; entry.finish = finish.clone(); entry };
+    let mut meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types: sql_types.clone(), ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = default_publish(); entry.ids = true; entry.struct_ids = true; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.history = history; entry.finish = finish.clone(); entry };
     meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect(); // (said by `ddl`: `delta::left_out`)
     if !expect.is_empty() {
         expectations(lake, name, &source, &planned, &meta, &expect, scope).await?;
@@ -806,7 +806,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
         e.time = event_time(&plan, &e.window).filter(|t| timestamp(&src, t));
         ensure!(e.time.is_some(), "emit: the window must be cut from a timestamp column of {source}: date_bin(INTERVAL '1 minute', ts) AS {}", e.window);
         let columns = meta.columns().filter(|(c, _)| *c != "_deleted").map(|(c, t)| (c.to_string(), t.to_string())).collect();
-        puts.push((table_key(&format!("{name}_final")), json(&{ let mut entry = TableMeta::made(crate::store::Made { columns, sql_types: sql_types.clone(), ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry })));
+        puts.push((table_key(&format!("{name}_final")), json(&{ let mut entry = TableMeta::made(crate::store::Made { columns, sql_types: sql_types.clone(), ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.struct_ids = true; entry.tiered = lake.visible(); entry })));
     }
     if let Some(o) = &keep {
         // (`EMIT FINAL`: its groups kept here, as any GROUP BY view's; each once in `o.into`, made with it)
@@ -816,7 +816,7 @@ pub(crate) async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o
         let shown_names: Vec<String> = shown.iter().map(|(c, _)| c.clone()).collect();
         let mut sql_types = crate::write::query_types(lake, written, &shown_names, scope).await;
         sql_types.extend(crate::column_types::held_in(crate::query::run_schema(&ctx, &plan)?.fields()));
-        puts.push((table_key(&o.into), json(&{ let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry })));
+        puts.push((table_key(&o.into), json(&{ let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.struct_ids = true; entry.tiered = lake.visible(); entry })));
         if lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() && !puts.iter().any(|(k, _)| *k == table_key(EXPECTED)) {
             puts.push((table_key(EXPECTED), json(&expected_table(lake))));
         }
@@ -981,7 +981,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let mut sql_types = crate::write::query_types(lake, &with, &names, scope).await;
     sql_types.extend(crate::column_types::held_in(out.fields()));
-    let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry };
+    let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.struct_ids = true; entry.tiered = lake.visible(); entry };
     let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
@@ -2027,7 +2027,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let mut sql_types = crate::write::query_types(lake, sql, &names, scope).await;
     sql_types.extend(crate::column_types::held_in(planned.fields()));
-    let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.tiered = now; entry };
+    let meta = { let mut entry = TableMeta::made(crate::store::Made { columns, sql_types, ..Default::default() }); entry.publish = default_publish(); entry.ids = true; entry.struct_ids = true; entry.tiered = now; entry };
     let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written, rerun: None, matches: None, from, authored: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }

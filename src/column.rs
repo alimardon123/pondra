@@ -11,9 +11,45 @@
 /// the new column: audit 11-20 H4). Columns' ids stay below it, and the system columns' are past 1,000,000 (`tier::field_ids`).
 pub const ELEMENTS: u32 = 500_000;
 
-/// The highest field id a schema of columns with these ids gives (`list`: does the column hold a list?): Iceberg's
-/// `last-column-id`.
-pub fn last_id(columns: impl Iterator<Item = (u32, bool)>) -> u32 { columns.map(|(id, list)| if list { ELEMENTS + id } else { id }).max().unwrap_or(0) }
+/// The field ids of a struct column's fields (a FILE's path, version and content type), in its files, Iceberg's schema and
+/// Delta's column mapping: field `k` of column `c` is `FIELDS + c × WIDTH + k`. Like `ELEMENTS`, it comes from what the
+/// column record keeps (its id, and its type's fields in order), so ADD COLUMN, a rename or a drop never moves it, and it
+/// meets no column's, no list's elements' and no system column's (past 1,000,000). Iceberg's ids are ints: column 500,000's
+/// last field is 502,000,999.
+pub const FIELDS: u32 = 2_000_000;
+
+/// The most fields a struct column's files give ids to (`FIELDS`).
+pub const WIDTH: u32 = 1_000;
+
+/// The field id of field `k` of column `column`, a struct (`FIELDS`).
+pub fn field_id(column: u32, k: usize) -> u32 { FIELDS + column * WIDTH + k as u32 }
+
+/// A struct type's fields, where each has an id of its own (`field_id`): one level, at most `WIDTH` of them, none a struct,
+/// list or map itself (one of those waits for ids a level down). None for any other type.
+pub fn struct_fields(t: &datafusion::arrow::datatypes::DataType) -> Option<&datafusion::arrow::datatypes::Fields> {
+    match t {
+        datafusion::arrow::datatypes::DataType::Struct(fs) if fs.len() <= WIDTH as usize && !fs.iter().any(|f| f.data_type().is_nested()) => Some(fs),
+        _ => None,
+    }
+}
+
+/// A struct column's fields by its stored type's text (`Column::dtype`): each one's name, type's text and whether it may be
+/// NULL (`struct_fields`).
+pub fn struct_fields_of(dtype: &str) -> Option<Vec<(String, String, bool)>> {
+    let t = dtype.starts_with("Struct(").then(|| dtype.parse::<datafusion::arrow::datatypes::DataType>().ok()).flatten()?;
+    Some(struct_fields(&t)?.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()), f.is_nullable())).collect())
+}
+
+/// The highest field id a schema of columns with these ids and stored types gives (a list's elements', a struct's fields'
+/// too): Iceberg's `last-column-id`.
+pub fn last_id<'a>(columns: impl Iterator<Item = (u32, &'a str)>) -> u32 {
+    let last = |id: u32, t: &str| match (crate::answer::list_item(t), struct_fields_of(t)) {
+        (Some(_), _) => ELEMENTS + id,
+        (None, Some(fs)) if !fs.is_empty() => field_id(id, fs.len() - 1),
+        _ => id,
+    };
+    columns.map(|(id, t)| last(id, t)).max().unwrap_or(0)
+}
 
 /// One column of a table.
 #[derive(Clone, Debug, PartialEq, Eq)]

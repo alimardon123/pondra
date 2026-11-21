@@ -1880,7 +1880,11 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                 } else if old == new {
                     return Ok(j!({"table": name, "unchanged": true}));
                 }
-                ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
+                if !(old == new || widens(&old, &new)) {
+                    // (a type of the types section by its own name, a FILE's not its struct: `column_types`)
+                    let shown = held.as_deref().filter(|h| crate::column_types::stored(h).is_some()).map_or_else(|| old.to_string(), str::to_uppercase);
+                    return Err(crate::codes::coded("42804", format!("{column} is {shown}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as")));
+                }
                 ensure!(old == new || !partition.contains(&stored), "{column} is {name}'s partition_by column: its type stays");
                 m.retype_column(&stored, crate::answer::type_name(&new));
                 j!({"column": column, "type": m.col(&stored).map(|c| c.dtype.as_str())})
@@ -2361,7 +2365,9 @@ async fn outputs_over(lake: &Lake, sql: &str, over: &[(String, Vec<(String, Stri
     Ok(df.schema().fields().iter().map(|f| f.name().clone()).collect())
 }
 
-/// Does every value of type `old` read as `new`, exactly? The widenings Iceberg and Delta allow.
+/// Does every value of type `old` read as `new`, exactly? The widenings Iceberg and Delta allow. No struct is one: a struct's
+/// fields are known in its files and the formats by their places (`column::field_id`), so a change to one could only ever
+/// add a field at its end, never put one in its middle, drop one or reorder them.
 pub(crate) fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafusion::arrow::datatypes::DataType) -> bool {
     use datafusion::arrow::datatypes::DataType::*;
     let int = |t: &datafusion::arrow::datatypes::DataType| match t {
