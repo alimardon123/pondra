@@ -184,7 +184,7 @@ pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String,
 /// stored column's name as the filters and `schema` say it. None: nothing to skip.
 pub fn wanted(spec: &str, filters: &[Expr], name: impl Fn(&str) -> Option<String>, schema: &Schema) -> Option<Box<dyn Fn(&str) -> bool + Send + Sync>> {
     let spec = Spec::parse(spec).ok()?;
-    let many = spec.fields.len() > 1;
+    let n = spec.fields.len();
     let mut need: Vec<(usize, HashSet<String>)> = vec![];
     for (i, f) in spec.fields.iter().enumerate() {
         let Transform::Bucket(n) = f.transform else { continue };
@@ -196,10 +196,7 @@ pub fn wanted(spec: &str, filters: &[Expr], name: impl Fn(&str) -> Option<String
     }
     (!need.is_empty()).then(move || -> Box<dyn Fn(&str) -> bool + Send + Sync> {
         Box::new(move |part: &str| {
-            let values: Vec<String> = match many {
-                true => part.split('/').map(|v| v.replace("%2F", "/").replace("%25", "%")).collect(),
-                false => vec![part.to_string()],
-            };
+            let values = values(part, n);
             need.iter().all(|(i, set)| values.get(*i).is_none_or(|v| set.contains(v)))
         })
     })
