@@ -6,7 +6,6 @@
 //! files are merged 8 at a time, and keyed tables are compacted into one file once 8 pile up.
 use crate::query::{latest_sql, raw};
 use crate::answer::schema;
-use datafusion::prelude::ParquetReadOptions;
 use crate::store::*;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -461,7 +460,7 @@ async fn dead_rows(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Res
     let within = col(crate::text::VERSION).between(lit(after as i64 + 1), lit(upto as i64));
     Ok(match paths.is_empty() {
         true => ctx.read_empty()?.select(vec![lit(0i64).alias("__id"), lit(0i64).alias("__v")])?.limit(0, Some(0))?,
-        false => ctx.read_parquet(paths, ParquetReadOptions::default()).await?.filter(within)?.select(vec![col(crate::text::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
+        false => crate::file_formats::read(&ctx, crate::file_formats::default(), paths, None).await?.filter(within)?.select(vec![col(crate::text::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
     })
 }
 

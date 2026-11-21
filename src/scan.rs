@@ -9,7 +9,6 @@ use datafusion::arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, ScalarValue};
-use datafusion::datasource::file_format::{parquet::ParquetFormat, FileFormat};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -130,7 +129,7 @@ pub(crate) fn own(full: impl Fn(&str) -> String, files: &[&crate::data_file::Dat
         }
         Ok(File { key: key_of(&full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range: None, only: None, stats: Arc::new(stats), modified: None })
     }).collect::<Result<Vec<_>>>()?;
-    Ok(Files { store, file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None })
+    Ok(Files { store, file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None, format: crate::file_formats::default() })
 }
 
 /// Another engine's files (`files`, of one table) read as `schema` says: its columns in its
@@ -173,7 +172,7 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::da
         out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats, modified: f.modified });
     }
     let adapter = (!ids.is_empty()).then(|| Arc::new(ById { ids: ids.clone(), mapping: table.and_then(|t| t.name_mapping.as_deref()).map(name_mapping).unwrap_or_default() }) as _);
-    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter, row: None }))?;
+    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter, row: None, format: &crate::file_formats::parquet::PARQUET }))?;
     let df = if equality { without_equal(ctx, df, files).await? } else { df };
     Ok(df.select(schema.fields().iter().map(|f| cast(ident(f.name()), f.data_type().clone()).alias(f.name())).collect::<Vec<_>>())?)
 }
@@ -440,6 +439,7 @@ pub struct Files {
     pub files: Vec<File>,
     pub adapter: Option<Arc<dyn datafusion::physical_expr_adapter::PhysicalExprAdapterFactory>>, // (columns matched by field id)
     pub row: Option<FieldRef>, // Parquet's row number, last, under this name (`adopted`)
+    pub format: &'static dyn crate::file_formats::TableFileFormat, // what they are written in (`file_formats.rs`)
 }
 
 #[derive(Debug, Clone)]
@@ -479,7 +479,7 @@ impl TableProvider for Files {
             };
             return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(projected)));
         }
-        let format = ParquetFormat::default().with_options(state.default_table_options().parquet);
+        let format = self.format.reader(state);
         let table = datafusion::datasource::table_schema::TableSchema::builder(self.file_schema.clone()).with_table_partition_cols(self.partition.clone()).with_virtual_columns(self.row.clone().into_iter().collect::<Vec<_>>()).build();
         let source = format.file_source(table);
         // Files dealt to the partitions by size, each partition a run of them.
@@ -501,7 +501,8 @@ impl TableProvider for Files {
                 pf = pf.with_statistics(f.stats.clone()); // (a NULL folder's value would be taken for one without NULLs)
             }
             if f.deleted.is_some() || f.range.is_some() || f.only.is_some() {
-                pf = pf.with_extension(datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selected(&f)));
+                let rows = crate::file_formats::Rows { count: f.rows, gone: f.deleted.as_deref().map_or(&[], |g| g.as_slice()), range: f.range, only: f.only.as_deref().map(|o| o.as_slice()) };
+                pf = self.format.select(pf, &rows).ok_or_else(|| datafusion::common::DataFusionError::NotImplemented(format!("{}: its rows are read by their places (deleted rows, or a part of it), which this build's {} can't", f.key, self.format.name())))?;
             }
             let least = groups.iter_mut().min_by_key(|g| g.0).expect("a partition");
             least.0 += f.size;
@@ -516,38 +517,6 @@ impl TableProvider for Files {
         let config = FileScanConfigBuilder::new(self.store.clone(), source).with_file_groups(groups).with_statistics(stats).with_projection_indices(projection.cloned())?.with_limit(limit).with_expr_adapter(self.adapter.clone()).build();
         format.create_physical_plan(state, config).await
     }
-}
-
-/// The rows of a file a scan reads: those its deletes leave, in its range; or those at its places.
-fn selected(f: &File) -> datafusion::parquet::arrow::arrow_reader::RowSelection {
-    use datafusion::parquet::arrow::arrow_reader::RowSelection;
-    if let Some(at) = &f.only {
-        return RowSelection::from_consecutive_ranges(at.iter().filter(|p| **p < f.rows).map(|p| *p as usize..*p as usize + 1), f.rows as usize);
-    }
-    let kept = kept(f.deleted.as_deref().map_or(&[], |g| g.as_slice()), f.rows);
-    match f.range {
-        Some((from, to)) => kept.intersection(&RowSelection::from_consecutive_ranges(std::iter::once(from as usize..to.min(f.rows) as usize), f.rows as usize)),
-        None => kept,
-    }
-}
-
-/// The rows a file keeps, as a row selection: all of its `rows` but the positions `gone`.
-fn kept(gone: &[u64], rows: u64) -> datafusion::parquet::arrow::arrow_reader::RowSelection {
-    use datafusion::parquet::arrow::arrow_reader::RowSelector;
-    let (mut out, mut at) = (vec![], 0u64);
-    for &g in gone.iter().filter(|g| **g < rows) {
-        if g > at {
-            out.push(RowSelector::select((g - at) as usize));
-        }
-        if g >= at {
-            out.push(RowSelector::skip(1));
-            at = g + 1;
-        }
-    }
-    if rows > at {
-        out.push(RowSelector::select((rows - at) as usize));
-    }
-    out.into()
 }
 
 // ---------------------------------------------------------------- deletion vectors
