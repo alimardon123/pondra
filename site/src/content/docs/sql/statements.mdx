@@ -1196,7 +1196,7 @@ text is the node's own, it is shown in code:
 | `INSERT` into an external table whose `LOCATION` is one file | refused: a view of a folder takes `INSERT`s |
 | `UPDATE`, `DELETE` and `ALTER` on an external table | refused |
 | a merge table with a non-key column that has no merge function | refused at `CREATE`: `a merge table combines every column but its key: a needs a merge function too` |
-| `ALTER TABLE t SET (partition_by = …)` | refused; each file holds one partition |
+| `ALTER TABLE t SET (partition_by = …)` on a keyed or published table | refused (`0A000`); an append table's changes, its earlier files keeping their spec |
 | `UPDATE` or `DELETE` on a merge table | refused: its rows combine as they are read, so `INSERT` the change instead and the key's rows take it in |
 | `UPDATE` that sets a key column | refused: `UPDATE sets existing non-key columns`; the key names the row |
 | a column called `_row_id`, `_version`, `_created_at` or `_updated_at` | refused: every table has them already |

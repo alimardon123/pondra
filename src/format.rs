@@ -52,6 +52,11 @@ pub const BOUNDS: u32 = 8;
 /// node from before reads as a list: format 8's, with `BOUNDS`.
 pub const FIXED: u32 = 8;
 
+/// The format whose files keep the id of the partition spec they were split by (`DataFile::spec`), which ALTER TABLE … SET
+/// (partition_by = …) needs: a node from before drops it when it writes the entry again, and reads every file's part under
+/// the table's current spec.
+pub const SPECS: u32 = 8;
+
 /// Does a table made in this lake now keep a fixed-size list's size (`FIXED`)? A lake this process made does from its first
 /// statement: no release before has read it, and it starts at `FIXED` (`first`), which `raise` or `alone` commits as it
 /// opens, a moment after a program's or a page's first CREATE TABLE may come.

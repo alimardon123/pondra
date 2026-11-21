@@ -661,7 +661,10 @@ pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
     parts.extend(m.constraints.iter().map(|c| c.sql(&ident)));
     let mut s = format!("CREATE TABLE {name} (\n  {}\n)", parts.join(",\n  "));
     if let Some(p) = &m.partition {
-        s += &format!("\nPARTITION BY {p}");
+        match crate::partition::Spec::parse(p).is_ok_and(|s| s.fields.len() > 1) {
+            true => s += &format!("\nPARTITION BY ({p})"),
+            false => s += &format!("\nPARTITION BY {p}"),
+        }
     }
     if !m.cluster.is_empty() {
         s += &format!("\nCLUSTER BY ({})", list_sql(&m.cluster));
@@ -1037,7 +1040,10 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str, scope: &Scope, alter: &Alt
     ensure!(key == old.key, "{table}'s PRIMARY KEY can't change ({} now): CREATE OR REPLACE TABLE makes it anew", if old.key.is_empty() { "none".to_string() } else { old.key.join(", ") });
     let merge: BTreeMap<String, String> = serde_json::from_value(s["merge"].clone()).unwrap_or_default();
     ensure!(was.iter().all(|(c, _)| merge.get(c) == old.merge.get(c)), "{table}'s MERGE functions can't change: CREATE OR REPLACE TABLE makes it anew");
-    ensure!(s["partition_by"].as_str() == old.partition.as_deref(), "{table}'s PARTITION BY can't change: each of its files holds one partition");
+    // (another PARTITION BY, or none, splits the files written from now on: the ones before keep their spec, `create_table`)
+    if s["partition_by"].is_null() && old.partition.is_some() {
+        s["partition_by"] = j!("");
+    }
     ensure!(old.order.is_none() || s["order_by"].as_str().is_some(), "{table}'s SEQUENCE BY can't be taken away: CREATE OR REPLACE TABLE makes it anew");
     let not_null: Vec<String> = strings(&s["not_null"]).into_iter().chain(key.iter().cloned()).collect();
     let defaults: BTreeMap<String, String> = serde_json::from_value(s["defaults"].clone()).unwrap_or_default();
