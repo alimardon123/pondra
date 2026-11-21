@@ -104,6 +104,9 @@ impl Visitor for Names {
 
     fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
         self.every |= matches!(s, Statement::ShowTables { .. } | Statement::ShowColumns { .. });
+        if let Statement::Call(f) = s {
+            self.functions.extend(last(&f.name)); // (`CALL p(…)`: its function is no expression)
+        }
         ControlFlow::Continue(())
     }
 
@@ -164,6 +167,7 @@ mod tests {
         let m = of("SELECT upper(s), count(*), row_number() OVER () FROM read_parquet('f.parquet'), generate_series(1, 3) WHERE pondra.my_fn(x)");
         assert_eq!(m.functions, set(&["upper", "count", "row_number", "read_parquet", "generate_series", "my_fn"].map(String::from)));
         assert!(of("SELECT 'upper(s)' -- lower(t)").functions.is_empty(), "a string's and a comment's words call nothing");
+        assert_eq!(of("CALL s.refresh(1)").functions, set(&["refresh".to_string()]), "a procedure called");
     }
 
     #[test]
