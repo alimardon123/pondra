@@ -19716,6 +19716,118 @@ def bytea():
     return f"{sum(checks.values())} of {len(checks)} bytea checks"
 
 
+def inets():
+    """INET at the Postgres port (step 5, E1, 5-TY-c3b): an INET column is sent as Postgres's `inet` (oid 869), in its
+    text form (`10.0.0.1`, `2001:db8::1`) or its binary one (family, mask bits, 0, the address's length, the address), so
+    psycopg and asyncpg hand each value over as an `ipaddress` address. A parameter psycopg sends as an inet (an
+    `ipaddress` value, in text or binary) is read into a column or compared with one; one compared with an INET column is
+    described as an inet, so asyncpg sends an address too. One that isn't an address is refused in Postgres's words
+    (22P02), and a network waits for CIDR (0A000). pg_type has inet (category I, its array _inet); a column of one is
+    inet in pg_attribute, information_schema and format_type; COPY … TO STDOUT writes its text. A table partitioned by an
+    INET column tiers into a part per address, named as the address shows (audit 11-21 M4: its bytes were cast to text)."""
+    import asyncio
+    import ipaddress
+    import psycopg
+    try:
+        import asyncpg
+    except ImportError:
+        asyncpg = None
+
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    ip = ipaddress.ip_address
+    checks, info = {}, {}
+    node = None
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def refused(conn, sql, args):
+        """(SQLSTATE, message) psycopg's statement is refused with; None when it went through."""
+        try:
+            conn.execute(sql, args)
+            return None
+        except psycopg.Error as e:
+            return (e.sqlstate, str(e).splitlines()[0])
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        q("CREATE TABLE hosts (id INT, ip INET)")
+        q("INSERT INTO hosts VALUES (1, '10.0.0.1'), (2, '2001:db8::1'), (3, NULL)")
+        with psycopg.connect(url, autocommit=True) as conn:
+            info["pg_type inet"] = conn.execute("SELECT oid, typname, typcategory, typarray, format_type(oid, -1), to_regtype('inet')::oid FROM pg_type WHERE typname IN ('inet', '_inet') ORDER BY oid").fetchall()
+            check("pg_type has inet (869, category I, its array 1041, _inet); format_type and to_regtype know it",
+                  lambda: [tuple(r[:4]) for r in info["pg_type inet"]] == [(869, "inet", "I", 1041), (1041, "_inet", "A", 0)] and info["pg_type inet"][0][4:] == ("inet", 869))
+            info["columns"] = conn.execute("SELECT a.atttypid, format_type(a.atttypid, a.atttypmod), c.data_type FROM pg_attribute a JOIN pg_class t ON t.oid = a.attrelid "
+                                           "JOIN information_schema.columns c ON c.table_name = t.relname AND c.column_name = a.attname WHERE t.relname = 'hosts' AND a.attname = 'ip'").fetchall()
+            check("an INET column is inet in pg_attribute and information_schema", lambda: info["columns"] == [(869, "inet", "inet")])
+            rows = conn.execute("SELECT id, ip FROM hosts ORDER BY id").fetchall()
+            info["text rows"] = rows
+            check("psycopg reads an INET column as addresses (text results)", lambda: rows == [(1, ip("10.0.0.1")), (2, ip("2001:db8::1")), (3, None)])
+            binary = conn.cursor(binary=True).execute("SELECT id, ip FROM hosts ORDER BY id").fetchall()
+            info["binary rows"] = binary
+            check("…and in binary results too", lambda: binary == rows)
+            check("the column's type is sent as inet (869)", lambda: [d.type_code for d in conn.execute("SELECT ip FROM hosts").description] == [869])
+            conn.execute("INSERT INTO hosts VALUES (%s, %t)", (4, ip("192.168.1.4")))
+            conn.execute("INSERT INTO hosts VALUES (%s, %b)", (5, ip("fe80::5")))
+            conn.execute("INSERT INTO hosts VALUES (%s, %s)", (6, "10.0.0.6"))
+            check("psycopg's address parameters, text and binary, and a string, go into the column",
+                  lambda: conn.execute("SELECT id, ip FROM hosts WHERE id >= 4 ORDER BY id").fetchall() == [(4, ip("192.168.1.4")), (5, ip("fe80::5")), (6, ip("10.0.0.6"))])
+            found = lambda fmt, v: conn.execute(f"SELECT id FROM hosts WHERE ip = {fmt}", (v,)).fetchall()
+            check("an address parameter, text or binary, is compared with the column", lambda: (found("%t", ip("10.0.0.1")), found("%b", ip("2001:db8::1"))) == ([(1,)], [(2,)]))
+            check("…and an address in a query's text, and a cast of one", lambda: conn.execute("SELECT id FROM hosts WHERE ip = '192.168.1.4' OR ip = '::1'::inet").fetchall() == [(4,)])
+            info["refusals"] = {
+                "not an address": refused(conn, "INSERT INTO hosts VALUES (%s, %s)", (7, "10.0.0.256")),
+                "a network": refused(conn, "INSERT INTO hosts VALUES (%s, %b)", (7, ipaddress.ip_interface("10.0.0.0/8"))),
+                "compared": refused(conn, "SELECT id FROM hosts WHERE ip = %s", ("nope",)),
+            }
+            check("what isn't an address is refused in Postgres's words, 22P02",
+                  lambda: info["refusals"]["not an address"] == ("22P02", 'invalid input syntax for type inet: "10.0.0.256"') and info["refusals"]["compared"][0] == "22P02")
+            check("…and a network waits for CIDR, 0A000", lambda: info["refusals"]["a network"][0] == "0A000")
+            with conn.cursor().copy("COPY (SELECT ip FROM hosts WHERE id IN (1, 2) ORDER BY id) TO STDOUT") as copy:
+                info["copy"] = b"".join(bytes(b) for b in copy).decode()
+            check("COPY … TO STDOUT writes each address's text", lambda: info["copy"] == "10.0.0.1\n2001:db8::1\n")
+        def parted():
+            q("CREATE TABLE parted (id INT, ip INET) PARTITION BY ip")
+            q("INSERT INTO parted VALUES (1, '10.0.0.1'), (2, '2001:db8::1'), (3, NULL), (4, '10.0.0.1')")
+            call(port, "POST", "/tier", timeout=300)
+            info["parted"] = q("SELECT id, ip FROM parted ORDER BY id")
+            return [(r["id"], r.get("ip")) for r in info["parted"]] == [(1, "10.0.0.1"), (2, "2001:db8::1"), (3, None), (4, "10.0.0.1")] \
+                and q("SELECT id FROM parted WHERE ip = '10.0.0.1' ORDER BY id") == [{"id": 1}, {"id": 4}]
+        check("a table partitioned by an INET column tiers, and reads back and filters by address", parted)
+        if asyncpg is not None:
+            async def apg():
+                conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")
+                try:
+                    rows = await conn.fetch("SELECT id, ip FROM hosts WHERE id <= 3 ORDER BY id")
+                    by = await conn.fetchval("SELECT id FROM hosts WHERE ip = $1", ip("2001:db8::1"))
+                    stmt = await conn.prepare("SELECT id FROM hosts WHERE ip = $1")
+                    return [tuple(r) for r in rows], by, [p.name for p in stmt.get_parameters()]
+                finally:
+                    await conn.close()
+            got = {}
+            check("asyncpg reads addresses (binary results), and a parameter compared with the column is an inet it sends one as",
+                  lambda: got.setdefault("asyncpg", asyncio.run(apg())) == ([(1, ip("10.0.0.1")), (2, ip("2001:db8::1")), (3, None)], 2, ["inet"]))
+            info.update(got)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"inets": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} inets checks"
+
+
 def vectors():
     """pgvector's drivers at the Postgres port (step 5, E1, 5-TY-c2b): a VECTOR(n) column is sent as real[] (a list to
     every driver), and the port has pgvector's `vector` type in pg_type, in public, so `register_vector` finds it. psycopg's
@@ -31905,7 +32017,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, row_filters, read_only, max_rows, max_memory, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, vectors, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents, diffs, otherviews)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, behind, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, row_filters, read_only, max_rows, max_memory, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, pooled, prepared, returning, withwrites, objects, registry, connections, find, listings, rejects, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, vectors, inets, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, onerow, jsonfns, recursive, extensions, synced, agents, diffs, otherviews)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -32106,7 +32218,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "diffs", "otherviews", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "row_filters", "read_only", "max_rows", "max_memory", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "vectors", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "behind", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "diffs", "otherviews", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "row_filters", "read_only", "max_rows", "max_memory", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "pooled", "prepared", "returning", "withwrites", "objects", "registry", "connections", "find", "listings", "rejects", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "vectors", "inets", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "onerow", "jsonfns", "recursive", "extensions", "synced", "agents"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -32119,7 +32231,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "diffs": diffs, "otherviews": otherviews, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "row_filters": row_filters, "read_only": read_only, "max_rows": max_rows, "max_memory": max_memory, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "vectors": vectors, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "behind": behind, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "diffs": diffs, "otherviews": otherviews, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "row_filters": row_filters, "read_only": read_only, "max_rows": max_rows, "max_memory": max_memory, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "pooled": pooled, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "connections": connections, "find": find, "listings": listings, "rejects": rejects, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "vectors": vectors, "inets": inets, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "onerow": onerow, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced, "agents": agents}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

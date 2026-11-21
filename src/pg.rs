@@ -1161,10 +1161,13 @@ fn each_row<T>(b: &RecordBatch, types: &[DataType], mut row: impl FnMut(&[ArrayR
 }
 
 /// A column's Postgres type and the Arrow type its values are sent as: a uuid's, json's or jsonb's
-/// (`pg_types::typed` marks one), a catalog's `"char"`, else its Arrow type's.
+/// (`pg_types::typed` marks one), an INET's (its 16 bytes, `PgInet`), a catalog's `"char"`, else its Arrow type's.
 fn field_type(f: &datafusion::arrow::datatypes::Field, format: FieldFormat) -> (Type, DataType) {
     if crate::pg_types::is_char(f) {
         return (Type::CHAR, DataType::Utf8); // (a catalog's kind: `pg_catalog::CHARS`)
+    }
+    if crate::column_types::of(f).is_some_and(|t| t.name == crate::column_types::INET.name) {
+        return (Type::INET, DataType::FixedSizeBinary(16));
     }
     match crate::pg_types::marked_type(f) {
         Some(Ty::Uuid) => (Type::UUID, DataType::Utf8),
@@ -1268,6 +1271,8 @@ macro_rules! field {
             $row.encode_field(&PgUuid(c.as_string::<i32>().value(i).to_string()))
         } else if *t == Type::JSON || *t == Type::JSONB {
             $row.encode_field(&PgJson(c.as_string::<i32>().value(i).to_string()))
+        } else if *t == Type::INET {
+            $row.encode_field(&PgInet(c.as_fixed_size_binary().value(i).to_vec()))
         } else {
             encode!($row, c, i)
         }
@@ -1427,6 +1432,27 @@ impl postgres_types::ToSql for PgJson {
 impl pgwire::types::ToSqlText for PgJson {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         out.extend_from_slice(self.0.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// An INET's 16 bytes (`column_types::inet`) as Postgres sends an `inet`: a host's text (`10.0.0.1`), or its binary form
+/// (`pg_values::inet_binary`).
+#[derive(Debug)]
+struct PgInet(Vec<u8>);
+
+impl postgres_types::ToSql for PgInet {
+    fn to_sql(&self, _: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(&crate::pg_values::inet_binary(&self.0));
+        Ok(postgres_types::IsNull::No)
+    }
+    fn accepts(ty: &Type) -> bool { *ty == Type::INET }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgInet {
+    fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(crate::column_types::inet::text(&self.0).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -2010,10 +2036,14 @@ impl Backend {
                 let sql = crate::routines::expand(&self.app.lake, sql, &self.who().scope).await.ok()?;
                 crate::engine::sql(&self.session(&sql, "").await.ok()?, &crate::sys::planned(&sql).ok()?).await.ok()
             }.await;
-            for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
-                if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {
+            // (by its field, so one compared with an INET is an inet, which asyncpg then sends as one)
+            for (name, f) in plan.and_then(|df| df.logical_plan().get_parameter_fields().ok()).unwrap_or_default() {
+                if let (Some(i @ 1..), Some(f)) = (name.trim_start_matches('$').parse::<usize>().ok(), f) {
                     if i <= n {
-                        types[i - 1] = pg_type(&t, FieldFormat::Text).0;
+                        types[i - 1] = match field_type(&f, FieldFormat::Text).0 {
+                            Type::INET => Type::INET,
+                            _ => pg_type(f.data_type(), FieldFormat::Text).0,
+                        };
                     }
                 }
             }

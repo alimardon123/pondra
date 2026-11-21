@@ -11,7 +11,7 @@
 //! A type whose storage isn't its text (INET's 16 bytes, `inet`) says how its values are read from text and shown as text
 //! (`parse`, `show`), and each door asks it: a write fits text to it (`parsed`), a text answer shows it (`show_of`), and SQL
 //! casts to it and from it and compares a string with it (`sql`).
-mod inet;
+pub mod inet;
 pub mod sql;
 
 use datafusion::arrow::array::ArrayRef;
