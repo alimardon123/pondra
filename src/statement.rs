@@ -409,7 +409,8 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, by: crate::aut
     };
     let vars = crate::auth::lent_vars(&app.lake, crate::auth::Credential::of_headers(&headers).token()); // (Python code a run lent a connection to: the run's variables)
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
-    let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, by, headers, body));
+    // (the request's context from its door on: what its checks read before it runs, its statement finds, `context.rs`)
+    let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), crate::context::scope(sql_as(app, p, role, by, headers, body)));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
     let go = crate::query::HELD.scope(Default::default(), scoped(named, vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
