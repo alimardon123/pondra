@@ -12,6 +12,8 @@ use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::{ExprSchemable, Volatility};
+use datafusion::config::Dialect;
+use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart, Value, ValueWithSpan};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -21,6 +23,7 @@ use datafusion::sql::sqlparser::tokenizer::Token;
 /// The filter `text` on `table`'s rows (`schema`: its columns), if a grant may hold it: as it is kept (written again from
 /// what was parsed), or why not. `ctx` names the functions it may call: the lake's own session's.
 pub fn check(ctx: &SessionContext, table: &str, schema: &Schema, text: &str) -> Result<String> {
+    let ctx = &filters_ctx(ctx);
     let e = parsed(text)?;
     let state = ctx.state();
     let mut refused = None;
@@ -57,6 +60,7 @@ pub fn filled(text: &str, reader: Option<&str>) -> String {
 /// CHECK, which is a policy's USING when it gives none. NULL fails it, as in a WHERE. `ctx` names the functions it may
 /// call: the lake's own session's, as `check`'s.
 pub async fn holds(ctx: &SessionContext, table: &str, new: &[RecordBatch], filter: &str, privilege: &str) -> Result<()> {
+    let ctx = &filters_ctx(ctx);
     let id = format!("\"{}\"", crate::text::ROW_ID);
     for b in new.iter().filter(|b| b.num_rows() > 0) {
         let which = match (privilege == "UPDATE", b.column_by_name(crate::text::ROW_ID).is_some()) {
@@ -72,6 +76,27 @@ pub async fn holds(ctx: &SessionContext, table: &str, new: &[RecordBatch], filte
         ensure!(!failed?, coded("42501", format!("new row violates the filter on {table}'s rows of your {privilege} grant")));
     }
     Ok(())
+}
+
+/// `state` reading SQL as a filter is kept and read: in Postgres's dialect (`parsed`), or Pondra's own, which reads it the
+/// same. A session may read its own statements in another (`SET datafusion.sql_parser.dialect`, or a node's
+/// `PONDRA_SQL_OPTIONS`), where MySQL's would read a quoted `"Status"` as a string and a filter on it as always true: so a
+/// filter is planned here, never in its reader's dialect (11-20 audit H2). None: `state`'s already reads it so.
+pub(crate) fn in_filters_dialect(state: &SessionState) -> Option<SessionState> {
+    if matches!(state.config().options().sql_parser.dialect, Dialect::Generic | Dialect::PostgreSQL) {
+        return None;
+    }
+    let mut own = state.clone();
+    own.config_mut().options_mut().sql_parser.dialect = Dialect::PostgreSQL;
+    Some(own)
+}
+
+/// `ctx`, or a copy of it reading SQL in a filter's dialect (`in_filters_dialect`).
+fn filters_ctx(ctx: &SessionContext) -> SessionContext {
+    match in_filters_dialect(&ctx.state()) {
+        Some(own) => SessionContext::new_with_state(own),
+        None => ctx.clone(),
+    }
 }
 
 /// The filter `text` as a grant keeps it (`check` gives the same): its parse printed, so spacing, keyword case and the
@@ -205,6 +230,21 @@ mod tests {
         assert_eq!(inserted(vec![batch(&[Some("x"), Some("y")], None)]).await, "42501: new row violates the filter on t's rows of your INSERT grant");
         assert_eq!(inserted(vec![batch(&[Some("y")], Some(&[None]))]).await, "42501: new row violates the filter on t's rows of your INSERT grant", "a MERGE's insert");
         assert!(ctx.table_exist("__pondra_written").is_ok_and(|e| !e), "the check's table goes with it");
+    }
+
+    /// 11-20 audit H2: a filter is read in its own dialect, never its reader's. MySQL's reads `"Dept"` as a string, so
+    /// `"Dept" <> 'secret'` would be always true there, and every row would meet it.
+    #[tokio::test]
+    async fn a_filter_is_read_in_its_own_dialect_whatever_its_reader_reads() {
+        use datafusion::arrow::array::{ArrayRef, StringArray};
+        let ctx = SessionContext::new();
+        ctx.sql("SET datafusion.sql_parser.dialect = 'mysql'").await.unwrap().collect().await.unwrap();
+        let state = in_filters_dialect(&ctx.state()).expect("a MySQL session reads a filter in another");
+        assert!(matches!(state.config().options().sql_parser.dialect, Dialect::PostgreSQL));
+        assert!(in_filters_dialect(&SessionContext::new().state()).is_none(), "Pondra's own reads it as it is kept");
+        let secret = RecordBatch::try_from_iter(vec![("Dept", std::sync::Arc::new(StringArray::from(vec![Some("secret")])) as ArrayRef)]).unwrap();
+        let e = holds(&ctx, "t", &[secret], r#""Dept" <> 'secret'"#, "INSERT").await.expect_err("a row its filter doesn't hold, in a MySQL session");
+        assert_eq!(format!("{}", crate::codes::of(&e)), "42501");
     }
 
     fn t() -> Schema { Schema::new(vec![Field::new("dept", DataType::Utf8, true), Field::new("owner", DataType::Utf8, true), Field::new("n", DataType::Int64, true)]) }

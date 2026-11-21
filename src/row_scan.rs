@@ -71,6 +71,8 @@ pub async fn scan(state: &dyn Session, inner: &Arc<dyn TableProvider>, table: &s
 /// reader's name that names someone else is FALSE by now).
 fn planned(state: &dyn Session, schema: &SchemaRef, sql: &str) -> Result<Expr> {
     let Some(session) = state.as_any().downcast_ref::<SessionState>() else { return internal_err!("a filter on rows is planned in a session") };
+    let own = crate::row_filter::in_filters_dialect(session); // (in a filter's dialect, never its reader's: 11-20 audit H2)
+    let session = own.as_ref().unwrap_or(session);
     let df = DFSchema::try_from(schema.as_ref().clone())?;
     let e = session.create_logical_expr(sql, &df)?;
     let simplifier = ExprSimplifier::new(SimplifyContext::builder().with_schema(Arc::new(df.clone())).build());
