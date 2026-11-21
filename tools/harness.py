@@ -19723,7 +19723,8 @@ def inets():
     `ipaddress` value, in text or binary) is read into a column or compared with one; one compared with an INET column is
     described as an inet, so asyncpg sends an address too. One that isn't an address is refused in Postgres's words
     (22P02), and a network waits for CIDR (0A000). pg_type has inet (category I, its array _inet); a column of one is
-    inet in pg_attribute, information_schema and format_type; COPY … TO STDOUT writes its text."""
+    inet in pg_attribute, information_schema and format_type; COPY … TO STDOUT writes its text. A table partitioned by an
+    INET column tiers into a part per address, named as the address shows (audit 11-21 M4: its bytes were cast to text)."""
     import asyncio
     import ipaddress
     import psycopg
@@ -19795,6 +19796,14 @@ def inets():
             with conn.cursor().copy("COPY (SELECT ip FROM hosts WHERE id IN (1, 2) ORDER BY id) TO STDOUT") as copy:
                 info["copy"] = b"".join(bytes(b) for b in copy).decode()
             check("COPY … TO STDOUT writes each address's text", lambda: info["copy"] == "10.0.0.1\n2001:db8::1\n")
+        def parted():
+            q("CREATE TABLE parted (id INT, ip INET) PARTITION BY ip")
+            q("INSERT INTO parted VALUES (1, '10.0.0.1'), (2, '2001:db8::1'), (3, NULL), (4, '10.0.0.1')")
+            call(port, "POST", "/tier", timeout=300)
+            info["parted"] = q("SELECT id, ip FROM parted ORDER BY id")
+            return [(r["id"], r.get("ip")) for r in info["parted"]] == [(1, "10.0.0.1"), (2, "2001:db8::1"), (3, None), (4, "10.0.0.1")] \
+                and q("SELECT id FROM parted WHERE ip = '10.0.0.1' ORDER BY id") == [{"id": 1}, {"id": 4}]
+        check("a table partitioned by an INET column tiers, and reads back and filters by address", parted)
         if asyncpg is not None:
             async def apg():
                 conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")
