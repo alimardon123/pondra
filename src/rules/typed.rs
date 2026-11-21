@@ -137,8 +137,8 @@ pub fn check(t: &Table, rows: &RecordBatch, sql_names: bool, marker: &dyn Fn(usi
     for column in &t.columns {
         let Some(h) = column.held.as_deref() else { continue };
         let Some(c) = rows.column_by_name(in_rows(column, sql_names)) else { continue };
-        if !held(h) || c.null_count() == c.len() {
-            continue; // (a type a newer release keeps: its own nodes check it)
+        if !held(h) || c.null_count() == c.len() || crate::column_types::stored(h).is_some() {
+            continue; // (a type a newer release keeps: its own nodes check it; INET's values were read from text, `fit`)
         }
         let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
         let text = text.as_string::<i32>();

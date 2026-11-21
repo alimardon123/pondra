@@ -688,10 +688,10 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
 /// (`query::strict`: a fraction into an integer rounds, a value that won't go is an error), and (`ids`) the rows'
 /// `_row_id`, `_created_at` (and, for old versions, `_version`) after them.
 fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<RecordBatch> {
-    let target = meta.schema()?;
+    let target = crate::column_types::parsing(meta.schema()?, |n| meta.held_of(n)); // (an INET column's text is read as one: `fit::strict_to`)
     let get = |name: &str| all.column_by_name(name).cloned().with_context(|| format!("{name}?"));
     let mut fields: Vec<Arc<Field>> = target.fields().to_vec();
-    let mut columns = target.fields().iter().map(|f| crate::query::strict(&get(&format!("{prefix}{}", f.name()))?, f.data_type())).collect::<Result<Vec<ArrayRef>>>()?;
+    let mut columns = target.fields().iter().map(|f| crate::rules::fit::strict_to(&get(&format!("{prefix}{}", f.name()))?, f)).collect::<Result<Vec<ArrayRef>>>()?;
     if ids {
         let old = if prefix == "__o_" { vec![crate::text::VERSION] } else { vec![] };
         for c in [ROW_ID, crate::text::CREATED].into_iter().chain(old) {
