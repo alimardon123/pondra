@@ -280,14 +280,14 @@ pub(crate) fn typed(columns: Vec<ArrayRef>, schema: &SchemaRef) -> anyhow::Resul
     Ok(RecordBatch::try_new(schema.clone(), cols)?)
 }
 
-/// `column` as `field`'s type, by `query::strict` (the write cast, which refuses a value as Postgres does: its
-/// SQLSTATE kept), with the column named as Postgres names it in a COPY's CONTEXT.
+/// `column` as `field`'s type, by `rules::fit::strict_to` (the write cast, which refuses a value as Postgres does: its
+/// SQLSTATE kept; an INET's text read as one), with the column named as Postgres names it in a COPY's CONTEXT.
 fn as_type(column: &ArrayRef, field: &Field) -> anyhow::Result<ArrayRef> {
     let target = field.data_type();
     if column.data_type() == target {
         return Ok(column.clone());
     }
-    crate::query::strict(column, target).map_err(|e| {
+    crate::rules::fit::strict_to(column, field).map_err(|e| {
         let e = anyhow::Error::from(e);
         coded(crate::codes::of(&e), format!("{} (column {})", crate::codes::words(&e), field.name()))
     })

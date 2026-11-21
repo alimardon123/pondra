@@ -94,6 +94,12 @@ pub fn parsed(c: &ArrayRef, field: &Field) -> Option<anyhow::Result<ArrayRef>> {
     text.then(|| parse(&datafusion::arrow::compute::cast(c, &DataType::Utf8)?))
 }
 
+/// Each of `fields` of a type whose storage isn't its text (INET), by name and that type's name: what a table made from
+/// a query's columns holds them as (`CREATE TABLE … AS`, a materialized view's table), so it keeps their type.
+pub fn held_in(fields: &datafusion::arrow::datatypes::Fields) -> impl Iterator<Item = (String, String)> + '_ {
+    fields.iter().filter_map(|f| of(f).filter(|t| t.parse.is_some()).map(|t| (f.name().clone(), t.name.to_string())))
+}
+
 /// How a column of `field` shows as text, where it is marked with a type whose storage isn't text (`show`): what a text
 /// answer asks (`answer::Shown`).
 pub fn show_of(field: &Field) -> Option<fn(&ArrayRef) -> anyhow::Result<ArrayRef>> { of(field)?.show }

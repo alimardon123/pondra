@@ -198,6 +198,11 @@ pub fn refused(meta: &TableMeta, format: &str) -> Option<String> {
         "delta" => schema_string(&[(String::new(), t.to_string())]).is_some(),
         _ => crate::iceberg::carries(t),
     };
+    // (a part is named by the value as its type shows it, an INET's address, which neither format's partition values hold)
+    let parted = meta.partition.as_deref().and_then(|p| crate::partition::Spec::parse(p).ok()).map_or(vec![], |s| s.columns().into_iter().map(str::to_string).collect());
+    if let Some((_, name, held)) = meta.live().filter(|(s, _, _)| parted.iter().any(|p| p == s)).find_map(|(s, n, _)| Some((s, n, meta.held_of(s).filter(|h| crate::column_types::stored(h).is_some())?))) {
+        return Some(format!("it is partitioned by {name}, an {}, whose parts {format} doesn't name yet", held.to_uppercase()));
+    }
     let (_, name, t) = meta.live().filter(|(s, _, _)| !meta.marker(s)).find(|(_, _, t)| !carried(t))?;
     Some(format!("{format} has no type for {name} ({t})"))
 }
@@ -592,6 +597,8 @@ pub fn schema_string(columns: &[(String, String)]) -> Option<String> {
             "Boolean" => "boolean",
             "Date32" => "date",
             "Binary" | "LargeBinary" => "binary",
+            // (Delta has no fixed width: an INET's 17 bytes are binary to its readers, as Parquet's fixed-length bytes read)
+            t if t.starts_with("FixedSizeBinary(") => "binary",
             // (Delta's `timestamp` is an instant; `timestamp_ntz` a wall-clock time)
             t => match t.parse() {
                 Ok(DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, tz)) => if tz.is_some() { "timestamp" } else { "timestamp_ntz" },

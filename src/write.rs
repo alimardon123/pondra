@@ -897,10 +897,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
                     let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
                     sql_types.extend(query_types(from, &sql, &names, scope).await);
                     // (a column of a type whose storage isn't text keeps its type: an INET column's query gives it marked)
-                    for f in &fields {
-                        if let Some(t) = crate::column_types::of(f).filter(|t| t.parse.is_some()) {
-                            sql_types.entry(f.name().clone()).or_insert_with(|| t.name.to_string());
-                        }
+                    for (n, t) in crate::column_types::held_in(&fields.iter().cloned().collect()) {
+                        sql_types.entry(n).or_insert(t);
                     }
                     fields
                 }
