@@ -293,6 +293,86 @@ impl ScalarUDFImpl for Whole {
     }
 }
 
+/// A list's text: Postgres's array literal (`{a,"b,c",NULL}`), or pgvector's and DuckDB's list in brackets (`[1,2,3]`): a bare NULL
+/// is a NULL element, a quoted one is text, a bare element is trimmed of its spaces, and `{}` has no elements. Nested
+/// ones are refused by name (0A000) for now.
+pub fn list_literal(s: &str) -> anyhow::Result<Vec<Option<String>>> {
+    let malformed = || crate::codes::coded("22P02", format!("malformed array literal: \"{s}\""));
+    let t = s.trim();
+    let body = t.strip_prefix('{').and_then(|b| b.strip_suffix('}')).or_else(|| t.strip_prefix('[').and_then(|b| b.strip_suffix(']'))).ok_or_else(malformed)?;
+    let mut rest = body.trim_start();
+    let mut items = Vec::new();
+    if rest.is_empty() {
+        return Ok(items);
+    }
+    loop {
+        if rest.starts_with('{') || rest.starts_with('[') {
+            return Err(crate::codes::coded("0A000", format!("nested array literals are not supported yet: \"{s}\"")));
+        }
+        let (item, after) = if rest.starts_with('"') { quoted_item(rest) } else { bare_item(rest) }.ok_or_else(malformed)?;
+        items.push(item);
+        let after = after.trim_start();
+        if after.is_empty() {
+            return Ok(items);
+        }
+        rest = after.strip_prefix(',').ok_or_else(malformed)?.trim_start();
+    }
+}
+
+/// A quoted element at the start of `s`, its escapes undone, and the text after its closing quote.
+fn quoted_item(s: &str) -> Option<(Option<String>, &str)> {
+    let mut out = String::new();
+    let mut chars = s[1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((Some(out), &s[2 + i..])),
+            '\\' => out.push(chars.next()?.1),
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// A bare element at the start of `s`: up to the next comma, trimmed, with `\x` read as `x`. A bare NULL is NULL,
+/// and an empty element (`{a,,b}`) is malformed.
+fn bare_item(s: &str) -> Option<(Option<String>, &str)> {
+    let mut end = s.len();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            ',' => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let raw = s[..end].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let item = if raw.eq_ignore_ascii_case("NULL") { None } else { Some(unescaped(raw)) };
+    Some((item, &s[end..]))
+}
+
+/// `s` with each `\x` read as `x`.
+fn unescaped(s: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in s.chars() {
+        if c == '\\' && !escaped {
+            escaped = true;
+        } else {
+            out.push(c);
+            escaped = false;
+        }
+    }
+    out
+}
+
 /// Registers `pondra_whole` and `pondra_truncate` in a session (`engine.rs`), for plans that name them.
 pub fn register(ctx: &SessionContext) {
     for f in WHOLE.iter() {
@@ -303,7 +383,7 @@ pub fn register(ctx: &SessionContext) {
 /// Puts `pondra_whole` in every cast (and `TRY_CAST`) of a decimal with places or a float to an
 /// integer. It runs after type coercion, so the casts coercion
 /// adds round too. `arrow_cast(x, 'Int64')` becomes the cast it stands for here (the optimizer's
-/// simplifier would make it one later, past this rule).
+/// simplifier would make it one later, past this rule). A fixed-size list cast to text is cast as a list first (`listed`).
 #[derive(Debug)]
 pub struct Rounds;
 
@@ -317,7 +397,7 @@ impl AnalyzerRule for Rounds {
             // (most plans cast nothing to an integer: their inputs' schemas aren't merged for nothing)
             let mut any = false;
             plan.apply_expressions(|e| {
-                any = e.exists(|e| Ok(to_integer(e).is_some()))?;
+                any = e.exists(|e| Ok(to_integer(e).is_some() || to_text(e)))?;
                 Ok(if any { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
             })?;
             if !any {
@@ -330,7 +410,7 @@ impl AnalyzerRule for Rounds {
             let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan);
             plan.map_expressions(|e| {
                 let name = names.save(&e);
-                let e = e.transform_up(|e| rounded(e, &schema))?;
+                let e = e.transform_up(|e| rounded(e, &schema)?.transform_data(|e| listed(e, &schema)))?;
                 Ok(e.update_data(|e| name.restore(e)))
             })
         })
@@ -349,6 +429,31 @@ fn to_integer(e: &Expr) -> Option<DataType> {
         _ => return None,
     };
     t.is_integer().then_some(t)
+}
+
+/// Is `e` a cast to text?
+fn to_text(e: &Expr) -> bool {
+    match e {
+        Expr::Cast(Cast { field, .. }) | Expr::TryCast(TryCast { field, .. }) => matches!(field.data_type(), DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8),
+        _ => false,
+    }
+}
+
+/// A fixed-size list cast to text (a `VECTOR(3)`'s `v::text`) as a cast of the list it is: Arrow casts a list to its text
+/// (`[1.0, 2.0, 3.0]`), and refuses a fixed-size one (one of size 1 it casts as its one value).
+fn listed(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    let value = match &e {
+        Expr::Cast(c) if to_text(&e) => c.expr.as_ref(),
+        Expr::TryCast(c) if to_text(&e) => c.expr.as_ref(),
+        _ => return Ok(Transformed::no(e)),
+    };
+    let Ok(DataType::FixedSizeList(item, _)) = value.get_type(schema) else { return Ok(Transformed::no(e)) };
+    let list = |v: Expr| Box::new(Expr::Cast(Cast::new(Box::new(v), DataType::List(item))));
+    Ok(Transformed::yes(match e {
+        Expr::Cast(c) => Expr::Cast(Cast::new_from_field(list(*c.expr), c.field)),
+        Expr::TryCast(c) => Expr::TryCast(TryCast::new_from_field(list(*c.expr), c.field)),
+        e => e,
+    }))
 }
 
 /// Is `e` a call of one of these functions: a value already cut, as `spark_sql('…')`'s casts arrive. Its

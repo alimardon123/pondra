@@ -7,7 +7,7 @@
 //! Every object keeps its oid from one query to the next (a hash of its name), so a client that
 //! looks a table up and then asks about its columns by oid gets the same table.
 use crate::pg_functions::{int_arg, text_arg, texts_out};
-use crate::pg_oids::{arrays, format_type, pg_of, PgType, TYPES};
+use crate::pg_oids::{arrays, format_type, pg_of, schema, PgType, TYPES};
 use crate::store::{Lake, TableMeta};
 use crate::users::On;
 use anyhow::Result;
@@ -96,7 +96,7 @@ pub fn wanted(sql: &str) -> bool {
 /// pick a type's binary format by its `typreceive`; newer types' names have an underscore).
 fn type_function(t: &PgType, f: &str) -> String {
     match t.1 {
-        "json" | "jsonb" | "date" | "time" | "timestamp" | "timestamptz" | "interval" | "numeric" | "uuid" | "void" | "record" => format!("{}_{f}", t.1),
+        "json" | "jsonb" | "date" | "time" | "timestamp" | "timestamptz" | "interval" | "numeric" | "uuid" | "void" | "record" | "bit" | "vector" => format!("{}_{f}", t.1),
         _ => format!("{}{f}", t.1),
     }
 }
@@ -539,7 +539,11 @@ fn table(columns: &[(&str, DataType)], rows: Vec<Vec<ScalarValue>>) -> Result<Ar
         let names: Vec<&str> = columns.iter().map(|(n, _)| *n).collect();
         anyhow::bail!("a catalog table's rows don't match its columns: {} columns ({}), a row of {}", columns.len(), names.join(", "), bad.len());
     }
-    let schema = Arc::new(Schema::new(columns.iter().map(|(n, t)| Field::new(*n, t.clone(), true)).collect::<Vec<_>>()));
+    let field = |n: &str, t: &DataType| match CHARS.contains(&n) && *t == TEXT {
+        true => crate::pg_types::char_field(Field::new(n, t.clone(), true)),
+        false => Field::new(n, t.clone(), true),
+    };
+    let schema = Arc::new(Schema::new(columns.iter().map(|(n, t)| field(n, t)).collect::<Vec<_>>()));
     let arrays = columns.iter().enumerate().map(|(i, (_, t))| {
         let values = rows.iter().map(|r| match &r[i] {
             ScalarValue::Null => ScalarValue::try_from(t),
@@ -582,6 +586,9 @@ fn texts(v: &[String]) -> ScalarValue { ScalarValue::List(ScalarValue::new_list_
 
 const OID: DataType = DataType::UInt32;
 const TEXT: DataType = DataType::Utf8;
+/// The catalog's columns of Postgres's `"char"`, sent as one (`pg_types::char_field`): pg_type's, which asyncpg reads as
+/// bytes. (Other catalogs' kinds, `relkind` among them, go as text: no driver has needed them otherwise.)
+const CHARS: &[&str] = &["typtype", "typcategory", "typdelim", "typalign", "typstorage"];
 const BOOL: DataType = DataType::Boolean;
 const INT2: DataType = DataType::Int16;
 const INT4: DataType = DataType::Int32;
@@ -693,10 +700,10 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
     // its `typreceive`. Newer types' names have an underscore.)
     let fun = |t: &PgType, f: &str| s(type_function(t, f));
     // (the subscript, modifier and analyze functions are `-`: none, as Postgres says of a type without one)
-    let mut types: Vec<Vec<ScalarValue>> = TYPES.iter().map(|t| vec![o(t.0), s(t.1), o(11), o(owner), i2(t.3), b(t.3 > 0 && t.3 <= 8), s(if t.4 == 'P' { "p" } else { "b" }), s(t.4.to_string()),
+    let mut types: Vec<Vec<ScalarValue>> = TYPES.iter().map(|t| vec![o(t.0), s(t.1), o(schema(t.0)), o(owner), i2(t.3), b(t.3 > 0 && t.3 <= 8), s(if t.4 == 'P' { "p" } else { "b" }), s(t.4.to_string()),
         b(false), b(true), s(","), o(0), s("-"), o(0), o(t.5), fun(t, "in"), fun(t, "out"), fun(t, "recv"), fun(t, "send"), s("-"), s("-"), s("-"), o(0), i4(-1), b(false), i4(0),
         o(if matches!(t.0, 25 | 1043 | 1042 | 19) { 100 } else { 0 }), n(), n(), s("i"), s("p"), n()]).collect();
-    types.extend(arrays().map(|(oid, name, _, elem)| vec![o(oid), s(name), o(11), o(owner), i2(-1), b(false), s("b"), s("A"), b(false), b(true), s(","), o(0), s("-"), o(elem), o(0), s("array_in"),
+    types.extend(arrays().map(|(oid, name, _, elem)| vec![o(oid), s(name), o(schema(oid)), o(owner), i2(-1), b(false), s("b"), s("A"), b(false), b(true), s(","), o(0), s("-"), o(elem), o(0), s("array_in"),
         s("array_out"), s("array_recv"), s("array_send"), s("-"), s("-"), s("-"), o(0), i4(-1), b(false), i4(0), o(0), n(), n(), s("i"), s("x"), n()]));
     // Enum types: a row of type 'e' and its array's, and a row in pg_enum for each label, in order.
     let mut labels = vec![];

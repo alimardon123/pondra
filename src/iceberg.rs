@@ -162,7 +162,7 @@ impl Layout {
     }
 
     /// A file's partition record, Avro-encoded, from its partition value (`DataFile::part`: the
-    /// text `tier::split` gives it).
+    /// text `partition::split` gives it).
     fn record(&self, part: &str) -> Result<Vec<u8>> {
         use datafusion::arrow::array::{AsArray, StringArray};
         use datafusion::arrow::datatypes::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType};
@@ -464,7 +464,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
     // (a renamed column by both names: Pondra's files keep the stored one, other writers write SQL's)
     let known = |c: &crate::column::Column| if c.name == c.stored { json!([c.stored]) } else { json!([c.name, c.stored]) };
-    let mut names: Vec<Value> = list.all().iter().map(|c| match c.dtype.ends_with("[]") {
+    let mut names: Vec<Value> = list.all().iter().map(|c| match crate::answer::list_item(&c.dtype).is_some() {
         true => json!({"field-id": c.id, "names": known(c), "fields": [{"field-id": n + c.id, "names": ["item", "element"]}]}),
         false => json!({"field-id": c.id, "names": known(c)}),
     }).collect();
@@ -531,8 +531,8 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
     };
     let n = list.all().len() as u32;
     // A list column (an embedding, say) needs an id for its elements too: they follow the columns'.
-    let kind = |id: u32, t: &str| match t.strip_suffix("[]") {
-        Some(item) => Some(json!({"type": "list", "element-id": n + id, "element": iceberg(item)?, "element-required": false})),
+    let kind = |id: u32, t: &str| match crate::answer::list_item(t) {
+        Some(item) => Some(json!({"type": "list", "element-id": n + id, "element": iceberg(&item)?, "element-required": false})),
         None => Some(Value::String(iceberg(t)?)),
     };
     // (listed in SQL's order: a field is known by its id, wherever it is listed; a key's are required, as identifier fields)

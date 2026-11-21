@@ -413,6 +413,14 @@ impl Scope {
     /// A user's own quota (`users::quota`); None: whole, which has none.
     pub fn limits(&self) -> Option<crate::users::Limits> { self.access.as_ref().map(|a| a.limits) }
 
+    /// The rows an answer sent to it may have (`MAX_ROWS`, the tightest of its own and its roles': step 6 piece 6b). None:
+    /// no limit, as for a superuser and the node.
+    pub fn max_rows(&self) -> Option<u64> { self.limits().and_then(|l| l.max_rows).filter(|n| *n > 0) }
+
+    /// What its running statements on a node may hold of the query memory together, in bytes (`MAX_MEMORY`, the tightest
+    /// of its own and its roles': step 6 piece 6c, `users::capped_session`). None: no limit, as for a superuser and the node.
+    pub fn max_memory(&self) -> Option<u64> { self.limits().and_then(|l| l.max_memory).filter(|n| *n > 0) }
+
     /// Everything: no grants narrow it.
     pub fn whole(&self) -> bool { self.access.is_none() }
 

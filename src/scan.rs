@@ -93,6 +93,46 @@ fn file_url(_: &str) -> Option<url::Url> {
     None
 }
 
+/// Whether `own` may plan a file: its entry keeps every variable-width column's size. One written before entries kept them
+/// is planned from its footer (`Metrics::footers_planned`): without them a plan would size its text by its rows alone, and
+/// pick other sides for its joins.
+pub(crate) fn sized(f: &crate::data_file::DataFile, schema: &Schema) -> bool {
+    schema.fields().iter().all(|c| c.data_type().primitive_width().is_some() || f.sizes.contains_key(c.name()))
+}
+
+/// A lake's own files with nothing to leave out (no deletes, no lineage to add), as one scan planned from their entries
+/// alone: each file's size, rows and ranges are the catalog's, so planning reads no footer (step 5 piece 14b). `full`: a
+/// file's place (`Lake::full`). Its ranges are exact (the writer's own, `bounds::kept`, or a footer's that says so:
+/// `manifest::from_footer`), so an aggregate the statistics answer (`max(x)`, `count(*)`) is answered from them, as it
+/// was from the footers; but a float's, which leaves NaN out, isn't.
+pub(crate) fn own(full: impl Fn(&str) -> String, files: &[&crate::data_file::DataFile], schema: &SchemaRef) -> Result<Files> {
+    use datafusion::common::stats::Precision::{Absent, Exact, Inexact};
+    let first = full(&files.first().context("no files")?.path);
+    let url = url_of(&first)?;
+    let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
+    let files = files.iter().map(|f| {
+        let mut stats = statistics(f, f.rows, true, 0, true, schema);
+        // (sizes as a footer gives them: a fixed-width column's its rows times its width, another's its bytes before
+        // compression; and no total, which is the file's compressed size here and would be taken for any projection of it:
+        // joins pick their sides by it)
+        stats.total_byte_size = Absent;
+        for (c, field) in stats.column_statistics.iter_mut().zip(schema.fields()) {
+            c.byte_size = match field.data_type().primitive_width() {
+                Some(w) => Exact(w * f.rows as usize),
+                None => f.sizes.get(field.name()).map_or(Absent, |b| Inexact(*b as usize)),
+            };
+            if !field.data_type().is_floating() {
+                (c.min_value, c.max_value) = (exact(&c.min_value), exact(&c.max_value));
+            }
+        }
+        fn exact(v: &datafusion::common::stats::Precision<datafusion::common::ScalarValue>) -> datafusion::common::stats::Precision<datafusion::common::ScalarValue> {
+            match v { Inexact(x) => Exact(x.clone()), v => v.clone() }
+        }
+        Ok(File { key: key_of(&full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range: None, only: None, stats: Arc::new(stats), modified: None })
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(Files { store, file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None })
+}
+
 /// Another engine's files (`files`, of one table) read as `schema` says: its columns in its
 /// order, matched by field id where `table` gives them, partition values from each file's place,
 /// deleted rows left out.

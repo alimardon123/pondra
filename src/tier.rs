@@ -689,7 +689,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
 /// A job's rows as files, one a partition.
 async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<RecordBatch>, keys: &[String], ord: u64, whole: bool) -> Result<Vec<DataFile>> {
     let parts = match &meta.partition {
-        Some(spec) => split(spec, batches).await?,
+        Some(spec) => crate::partition::split(spec, batches).await?,
         None => vec![(String::new(), batches)],
     };
     let mut files = vec![];
@@ -711,46 +711,6 @@ pub async fn fold_into(from: &Lake, to: &Lake, table: &str, meta: &TableMeta, af
         false => (meta.key.clone(), latest(from, table, &{ let mut entry = meta.clone(); entry.files = vec![]; entry.tiered = after; entry }, upto, true, scope).await?),
     };
     write_parts(to, table, &meta, batches, &keys, upto, false).await
-}
-
-/// A partitioned table's rows, one group per partition value (`day(ts)`: the day, `col`: the value).
-pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
-    use datafusion::arrow::{array::{AsArray, UInt32Array}, compute::{concat_batches, take_record_batch}};
-    let Some(first) = batches.first() else { return Ok(vec![]) };
-    let all = concat_batches(&first.schema(), &batches)?;
-    let ctx = datafusion::prelude::SessionContext::new();
-    ctx.register_batch("t", all.clone())?;
-    let values = ctx.sql(&format!("SELECT {} FROM t", partition_expr(spec))).await?.collect().await?;
-    let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    let mut i = 0u32;
-    for b in &values {
-        let text = datafusion::arrow::compute::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
-        for v in text.as_string::<i32>().iter() {
-            groups.entry(v.unwrap_or("null").to_string()).or_default().push(i);
-            i += 1;
-        }
-    }
-    groups.into_iter().map(|(p, rows)| Ok((p, vec![take_record_batch(&all, &UInt32Array::from(rows))?]))).collect()
-}
-
-/// A partition spec as SQL: `day(ts)` → `date_trunc('day', "ts")`; a plain column → itself.
-pub fn partition_expr(spec: &str) -> String {
-    match spec.split_once('(').map(|(f, c)| (f.trim(), c.trim_end_matches(')').trim())) {
-        Some((unit @ ("year" | "month" | "day" | "hour"), col)) => format!("date_trunc('{unit}', \"{col}\")"),
-        _ => format!("\"{}\"", spec.trim()),
-    }
-}
-
-/// A partition spec is a column, or year/month/day/hour of a timestamp or date column.
-pub fn check_partition(spec: &str, columns: &[(String, String)]) -> Result<()> {
-    let (unit, col) = match spec.split_once('(') {
-        Some((f, c)) => (Some(f.trim()), c.trim_end_matches(')').trim()),
-        None => (None, spec.trim()),
-    };
-    let t = columns.iter().find(|(n, _)| n == col).map(|(_, t)| t.as_str());
-    let time = t.is_some_and(|t| t.starts_with("Timestamp") || t.starts_with("Date"));
-    anyhow::ensure!(t.is_some() && (unit.is_none() || (matches!(unit, Some("year" | "month" | "day" | "hour")) && time)), "PARTITION BY: a column, or year/month/day/hour(a timestamp column)");
-    Ok(())
 }
 
 /// Append tables with `cluster_by`: every file's rows sorted by that column (folds and merges
@@ -1330,7 +1290,8 @@ impl Encoding {
         let buf = std::mem::take(w.inner_mut());
         let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(&footer), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
         let bytes = buf.len() as u64;
-        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, nulls, sketch, sys, ..Default::default() }))
+        let sizes = crate::manifest::sizes(&footer);
+        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, sizes, nulls, sketch, sys, ..Default::default() }))
     }
 
     /// The file finished and put in the table's folder, and its hot columns held there (a table whose
@@ -1356,6 +1317,7 @@ impl Encoding {
 /// among the stored ones (a renamed column keeps it), the rows' system columns 1,000,001 on.
 /// Readers that match a file's columns to the table's by id (Polars' `scan_iceberg`) need them.
 fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::SchemaRef) -> datafusion::arrow::datatypes::SchemaRef {
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY as ID;
     // (a table's: its column list's ids; a table an INSERT makes: its columns will be these, in this order)
     let list = meta.map(|m| m.column_list());
@@ -1367,11 +1329,24 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
         };
         own.or_else(|| crate::text::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i))
     };
+    // A list's elements have an id too, after every column's (`iceberg.rs`: `element-id`): a reader that matches a
+    // file's fields by id alone (DuckDB's `iceberg_scan`) reads a list whose elements have none as NULLs.
+    let columns = list.as_ref().map_or(made.len(), |l| l.all().len());
+    let element = |t: &DataType, id: usize| {
+        let with = |f: &FieldRef| std::sync::Arc::new(f.as_ref().clone().with_metadata([(ID.to_string(), id.to_string())].into()));
+        match t {
+            DataType::List(f) => DataType::List(with(f)),
+            DataType::LargeList(f) => DataType::LargeList(with(f)),
+            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(with(f), *n),
+            t => t.clone(),
+        }
+    };
     let fields: Vec<_> = schema.fields().iter().map(|f| match id(f.name()) {
         Some(i) => {
             let mut m = f.metadata().clone();
             m.insert(ID.to_string(), i.to_string());
-            std::sync::Arc::new(f.as_ref().clone().with_metadata(m))
+            let t = if i <= columns { element(f.data_type(), columns + i) } else { f.data_type().clone() };
+            std::sync::Arc::new(f.as_ref().clone().with_metadata(m).with_data_type(t))
         }
         None => f.clone(),
     }).collect();
@@ -1443,7 +1418,7 @@ async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatc
             pending.push(b);
         }
         if n >= chunk || (end && n > 0) {
-            for (part, batches) in split(spec, std::mem::take(&mut pending)).await? {
+            for (part, batches) in crate::partition::split(spec, std::mem::take(&mut pending)).await? {
                 files.extend(write_file(lake, table, &batches, keys).await?.map(|f| DataFile { part, ..f }));
             }
             n = 0;

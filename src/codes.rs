@@ -100,6 +100,7 @@ pub fn words(e: &anyhow::Error) -> String {
         }
     }
     let out = SPILL_SAYS.iter().chain(POSTGRES_SAYS).fold(out, |out, (from, to)| out.replace(from, to));
+    let out = dimensions(out);
     crate::ext_names::readable(&out) // (DataFusion's words for spilling, in the setting Pondra asks for, and in Postgres's words; files as SQL named them)
 }
 
@@ -152,6 +153,18 @@ const SPILL_SAYS: &[(&str, &str)] = &[
 
 /// DataFusion's words for what Postgres says otherwise, said in Postgres's words: a client (or an agent) that knows them
 /// reads one error at every door. A scalar subquery that gives more than one row is 21000 either way (`by_words`).
+/// Arrow's words for a list of the wrong length written to a fixed-size one (`VECTOR(3)`, `FLOAT[3]`: `friendly::vector`), in
+/// pgvector's (22000): `expected 3 dimensions, not 2`.
+fn dimensions(out: String) -> String {
+    if !out.contains("Cannot cast to FixedSizeList(") {
+        return out;
+    }
+    static WRONG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:Cast error: )?Cannot cast to FixedSizeList\((\d+)\): value at index \d+ has length (\d+)").expect("a regex")
+    });
+    WRONG.replace_all(&out, "expected $1 dimensions, not $2").into_owned()
+}
+
 const POSTGRES_SAYS: &[(&str, &str)] = &[("Scalar subquery returned more than one row", "more than one row returned by a subquery used as an expression")];
 
 /// What a spill that is off says, in the setting a user can change: a page's query pool, `memory_gb`, or a node's `PONDRA_SPILL_GB`.
@@ -234,6 +247,7 @@ fn by_words(text: &str) -> &'static str {
     let first_said = |w: &str| t.split_once(' ').is_some_and(|(_, rest)| rest.starts_with(w)); // (`v is a view…`: what a name is, said first)
     match () {
         _ if has("could not serialize") => "40001",                                             // serialization_failure
+        _ if has("dimensions, not ") && has("expected ") => "22000",                            // data_exception (pgvector's: a vector of the wrong length, `dimensions`)
         _ if has("cannot insert a non-default value") || has("can only be updated to default") => "428C9", // generated_always
         _ if has("more than one row returned by a subquery") || has("scalar subquery returned more than one row") => "21000", // cardinality_violation (`one_row::MANY`; DataFusion's and spmd's words for one that reads no outer row)
         _ if has("nextval: reached") => "2200H",                                                // sequence_generator_limit_exceeded
@@ -281,7 +295,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
         _ if has("come in 1.1") || has("comes in 1.1") || has("coming in 1.1") => "0A000", // feature_not_supported (a statement 1.1 brings, refused by name where it is read as text: `kept.rs`)
-        _ if has("come with extensions") || has("comes with vector indexes") => "0A000", // feature_not_supported (a table's format or a vector's type, kept free for 1.2 and after 1.0: `kept.rs`)
+        _ if has("come with extensions") || has("with vector indexes") => "0A000", // feature_not_supported (a table's format or a vector's type, kept free for 1.2 and after 1.0: `kept.rs`)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
         _ if has("would have no value for it") || has(" column: it stays") || has("takes its type alone") || has("one table at a time") || has("'s last column (drop table") => "0A000", // (a node's ALTER TABLE: a column filled over rows already there, or a key, partition, TTL or order column dropped)
         _ if has("read-only") || has("read only") => "25006",                                   // read_only_sql_transaction
@@ -515,7 +529,7 @@ mod tests {
         assert_eq!(of("t already has a column w"), "42701");
         assert_eq!(of("key is t's key column: it stays"), "0A000");
         assert_eq!(of("CREATE TABLE … USING lance: tables kept in another format come with extensions (1.2); Pondra keeps its tables in its own lake, published as Delta or Iceberg with WITH (publish = …)"), "0A000");
-        assert_eq!(of("VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"), "0A000");
+        assert_eq!(of("HALFVEC(n): half-precision vectors come with vector indexes (ADR-051, after 1.0); a vector is VECTOR(n) until then"), "0A000");
         assert_eq!(of("a is t's last column (DROP TABLE t)"), "0A000");
         assert_eq!(of("ALTER TABLE t ADD COLUMN d … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE t SET d = …)"), "0A000");
         assert_eq!(of("v is a view: write to the tables it reads"), "42809");
@@ -530,6 +544,8 @@ mod tests {
         assert_eq!(of("something else"), "XX000");
         // Arrow's words for a number that doesn't fit are 22003; a text that isn't a number is still 22P02
         assert_eq!(of("Cast error: Can't cast value 99999999999 to type Int32"), "22003");
+        let short = anyhow::anyhow!("Arrow error: Cast error: Cannot cast to FixedSizeList(3): value at index 0 has length 2");
+        assert_eq!((super::words(&short).as_str(), super::of(&short)), ("expected 3 dimensions, not 2", "22000"), "a vector of the wrong length, in pgvector's words");
         assert_eq!(of("Invalid argument error: 12345.0 is too large to store in a Decimal128 of precision 3. Max is 99.9"), "22003");
         assert_eq!(of("Cast error: Cannot cast string '99999999999' to value of Int32 type"), "22003");
         assert_eq!(of("Cast error: Cannot cast string '-99999999999999999999' to value of Int64 type"), "22003");

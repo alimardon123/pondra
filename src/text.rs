@@ -340,8 +340,11 @@ pub(crate) fn types_pass() -> crate::passes::Pass {
 /// call, a `||` that may meet a jsonb document, and a string compared with a column that reads it as jsonb (a document, or JSON
 /// written otherwise than jsonb writes it) are parsed too.
 pub fn names_a_type(sql: &str) -> bool {
-    if sql.contains("[]") {
-        return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_text::array_literals`)
+    // (an array type: a string cast to one reads as a Postgres array literal, `pg_text::array_literals`; one of a size,
+    // `FLOAT[3]`, and `VECTOR(3)`, which is one, where a string may be cast to it)
+    static SIZED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\[\s*\d+\s*\]|\bvector\s*\(").expect("a regex"));
+    if sql.contains("[]") || (sql.contains('\'') && SIZED.is_match(sql)) {
+        return true;
     }
     // (a set function: one in a FROM that reads a column is LATERAL's, `lateral::functions`; JSON's give a document's
     // rows, `pg_json_sets::sets`)
@@ -986,6 +989,8 @@ mod tests {
             assert!(names_a_type(sql), "{sql}");
         }
         assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT * FROM jsonb_each(t.doc)") && names_a_type("SELECT '{a}'::text[]"));
+        assert!(names_a_type("SELECT '[1,2,3]'::vector(3)") && names_a_type("SELECT CAST('{1,2}' AS FLOAT[2])"), "a string cast to a VECTOR or a sized array");
+        assert!(!names_a_type("CREATE TABLE t (v VECTOR(3), f FLOAT[2])"), "no string to cast");
     }
 
     #[test]

@@ -133,6 +133,20 @@ pub fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::
     complete.then(|| crate::sketch::min_max(&[lo]).zip(crate::sketch::min_max(&[hi]))).flatten().map(|((lo, _), (_, hi))| (lo, hi))
 }
 
+/// Each column of no fixed width in a file, its bytes before compression as the footer `md` says (`DataFile::sizes`).
+pub fn sizes(md: &ParquetMetaData) -> std::collections::BTreeMap<String, u64> {
+    use datafusion::parquet::basic::Type::{DOUBLE, FLOAT, INT32, INT64, INT96};
+    let fixed = |name: &str| md.file_metadata().schema_descr().columns().iter().any(|c| c.path().parts()[0] == name && c.path().parts().len() == 1 && matches!(c.physical_type(), INT32 | INT64 | INT96 | FLOAT | DOUBLE));
+    let mut out = std::collections::BTreeMap::new();
+    for c in md.row_groups().iter().flat_map(|g| g.columns()) {
+        let name = &c.column_path().parts()[0];
+        if !fixed(name) {
+            *out.entry(name.clone()).or_insert(0) += c.uncompressed_size().max(0) as u64;
+        }
+    }
+    out
+}
+
 /// A type whose files keep a range (floats too, from their rows: Parquet leaves NaN out of its own).
 pub fn orderable(t: &DataType) -> bool {
     t.is_integer() || t.is_floating() || matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Boolean)
@@ -251,6 +265,13 @@ pub async fn pruned(lake: &Lake, meta: &TableMeta, manifests: Option<&[Manifest]
     let (from_lists, from_entry) = kept.split_at(loaded.len());
     let mut files: Vec<DataFile> = loaded.into_iter().zip(from_lists).filter(|(_, k)| **k).map(|(f, _)| f).collect();
     files.extend(meta.files.iter().zip(from_entry).filter(|(_, k)| **k).map(|(f, _)| f.clone()));
+    // (a bucket's files by their parts: no range says which bucket a file holds)
+    if let Some(spec) = &meta.partition {
+        let list = meta.column_list();
+        if let Some(keep) = crate::partition::wanted(spec, filters, |c| list.of_stored(c).map(|c| c.name.clone()), schema) {
+            files.retain(|f| keep(&f.part));
+        }
+    }
     let total = listed.iter().map(|m| m.files).sum::<u64>() + meta.files.len() as u64;
     crate::metrics::add(&lake.node.metrics.files_scanned, files.len() as u64);
     crate::metrics::add(&lake.node.metrics.files_skipped, total - files.len() as u64);

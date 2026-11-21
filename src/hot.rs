@@ -31,12 +31,13 @@
 //! for a filter on the time; a top-N reads the batches in its key's order, so its bound is tight
 //! after the first few, either way round.
 use crate::store::{DataFile, Lake, Lineage, TableMeta};
+use datafusion::datasource::file_format::options::ReadOptions;
+use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
+use datafusion::prelude::ParquetReadOptions;
 use anyhow::Result;
 use datafusion::arrow::array::{new_null_array, Array, ArrayData, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchOptions, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::datasource::file_format::options::ReadOptions;
-use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::{arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder}, ProjectionMask};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -48,7 +49,6 @@ use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicate
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::{empty::EmptyExec, execution_plan::replace_children_if_necessary, union::UnionExec, ExecutionPlan};
 use datafusion::physical_plan::projection::{all_alias_free_columns, new_projections_for_columns};
-use datafusion::prelude::ParquetReadOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use datafusion::common::instant::Instant;
@@ -840,13 +840,20 @@ impl TableProvider for HotFiles {
         }
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
         let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| plain_file(f, deletes));
+        let (planned, footed): (Vec<&DataFile>, Vec<&DataFile>) = plain.iter().copied().partition(|f| crate::scan::sized(f, &self.schema));
         // The loads this scan starts wait on this sender: the files of its plan carry it (`gated`), so they start when the
         // last copy of those files goes, with the query's plan. Here the scan lets go of its own copy.
         let (go, gate) = tokio::sync::oneshot::channel::<()>();
         let gate: LoadGate = futures::FutureExt::shared(gate);
         let holder = Arc::new(Gate(go));
-        if !plain.is_empty() {
-            let urls = plain.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
+        if !planned.is_empty() {
+            // (planned from their entries: no footer is read to plan, and the opener reads each one it decodes)
+            let table = crate::scan::own(|p| self.lake.full(p), &planned, &self.schema).map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+            plans.push(gated(told(table.scan(state, projection, filters, limit).await?, &self.known)?, &holder)?);
+        }
+        if !footed.is_empty() {
+            crate::metrics::add(&self.lake.node.metrics.footers_planned, footed.len() as u64);
+            let urls = footed.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
             let options = ParquetReadOptions::default().to_listing_options(state.config(), state.default_table_options());
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
             let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());

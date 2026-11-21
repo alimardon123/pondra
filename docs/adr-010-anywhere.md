@@ -153,7 +153,8 @@ Connect Claude Code with:
 
 ### 8. Vector search in SQL
 
-An embedding is a `FLOAT[]` (or `DOUBLE[]`) column. DataFusion's `cosine_distance`,
+An embedding is a `FLOAT[]` (or `DOUBLE[]`) column, or `VECTOR(n)` (pgvector's name for `FLOAT[n]`: every row's
+list has n numbers, and a list of another length is refused). DataFusion's `cosine_distance`,
 `inner_product` and `array_distance` give an exact nearest-neighbour search:
 
 ```sql
@@ -162,7 +163,11 @@ SELECT id, title FROM docs ORDER BY cosine_distance(emb, [0.1, 0.3, …]) LIMIT 
 
 - It works over the log and Parquet alike, and in upsert tables (an embedding per key, replaced
   on update).
-- Over Postgres, a driver's array parameter (`%s` with a Python list) becomes the literal.
+- Over Postgres, a driver's array parameter (`%s` with a Python list) becomes the literal. A
+  `VECTOR(n)` column is sent as `real[]`, so every driver reads it as a list. The port's catalog
+  also has pgvector's `vector` type, in `public`, so pgvector's `register_vector` (psycopg's and
+  asyncpg's) works. A numpy array or a `Vector` is then sent as a vector, in text (`[1,2,3]`) or
+  pgvector's binary form, and the port reads both.
 
 This is a scan, fine up to millions of vectors per query. Flink 2.2 added `VECTOR_SEARCH`; Fluss
 plans vector columns. An approximate index (HNSW or IVF) is future work.

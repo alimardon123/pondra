@@ -36,6 +36,10 @@ pub struct DataFile {
     /// Append tables: each column's min and max, so queries skip files without opening them.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub stats: crate::data_file::Stats,
+    /// Each column of no fixed width (text, bytes, lists), its bytes as its footer says before compression: what its
+    /// decoded size is taken to be where a scan is planned from the catalog (`scan::own`), as from a footer.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sizes: std::collections::BTreeMap<String, u64>,
     /// The same, typed (`bounds.rs`): what a file written in a lake of format 8 keeps instead. Read with
     /// `bounds::Ranged`, which takes these, else `stats`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
