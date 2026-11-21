@@ -63,8 +63,8 @@ fn json_decoder(schema: &SchemaRef, text: &[bool], rows: usize) -> Result<datafu
     let fields = schema.fields().iter().zip(text).map(|(f, &t)| match (f.data_type().is_integer(), t) {
         (true, true) => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
         (true, false) => Arc::new(f.as_ref().clone().with_data_type(DataType::Float64)),
-        // (a type whose storage isn't its text, INET, is given as its text: `whole_batch` reads it)
-        (false, _) if crate::column_types::of(f).is_some_and(|t| t.parse.is_some()) => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8)),
+        // (a type whose storage isn't its text, INET, is given as its text: `whole_batch` reads it; a struct, FILE, as its object)
+        (false, _) if !f.data_type().is_nested() && crate::column_types::of(f).is_some_and(|t| t.parse.is_some()) => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8)),
         (false, _) => f.clone(),
     });
     let read = Arc::new(Schema::new(fields.collect::<Vec<_>>()));

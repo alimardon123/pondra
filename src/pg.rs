@@ -16,7 +16,7 @@ use crate::app::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Date32Type, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
+use datafusion::arrow::datatypes::{DataType, Date32Type, Field, FieldRef, Fields, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::sql::sqlparser::ast::{self, BinaryOperator, CastKind, ExactNumberInfo, Expr, UnaryOperator, Value};
 use futures::{stream, Sink, SinkExt};
@@ -885,7 +885,8 @@ impl Backend {
             let names = schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>().join(&c.delimiter.unwrap_or(',').to_string());
             bytes::Bytes::from(names + "\n")
         });
-        let mut rows = batches.into_iter().flat_map(move |b| each_row(&b, &types, |cols, i| {
+        let marked = schema.fields().clone();
+        let mut rows = batches.into_iter().flat_map(move |b| each_row(&b, &marked, &types, |cols, i| {
             for (col, t) in cols.iter().zip(&pg_types) {
                 field!(&mut enc, col, i, t)?;
             }
@@ -1134,8 +1135,8 @@ fn show_column(sql: &str) -> Option<(String, String)> {
 /// time, as the client takes them.
 fn rows(schema: &Schema, batches: Vec<RecordBatch>, format: &Format) -> PgWireResult<QueryResponse> {
     let (info, types) = fields(schema, &|i| format.format_for(i));
-    let each = info.clone();
-    let rows = batches.into_iter().flat_map(move |b| each_row(&b, &types, |cols, i| {
+    let (each, marked) = (info.clone(), schema.fields().clone());
+    let rows = batches.into_iter().flat_map(move |b| each_row(&b, &marked, &types, |cols, i| {
         let mut row = DataRowEncoder::new(each.clone());
         for (c, f) in cols.iter().zip(each.iter()) {
             field!(&mut row, c, i, f.datatype())?;
@@ -1152,11 +1153,16 @@ fn fields(schema: &Schema, format: &dyn Fn(usize) -> FieldFormat) -> (Arc<Vec<Fi
     (Arc::new(info), types.into_iter().map(|(_, a)| a).collect())
 }
 
-/// `row(columns, i)` for each row of `b`, its columns cast to `types` first.
-fn each_row<T>(b: &RecordBatch, types: &[DataType], mut row: impl FnMut(&[ArrayRef], usize) -> PgWireResult<T>) -> Vec<PgWireResult<T>> {
-    match b.columns().iter().zip(types).map(|(c, t)| cast(c, t)).collect::<Result<Vec<_>, _>>() {
+/// `row(columns, i)` for each row of `b`, its columns cast to `types` first: a column of a type sent as text whose storage
+/// isn't its text (FILE's struct, as its object) shown as its type shows it (`column_types::show_of`), by its field in `fields`.
+fn each_row<T>(b: &RecordBatch, fields: &Fields, types: &[DataType], mut row: impl FnMut(&[ArrayRef], usize) -> PgWireResult<T>) -> Vec<PgWireResult<T>> {
+    let sent = |(c, (f, t)): (&ArrayRef, (&FieldRef, &DataType))| match crate::column_types::show_of(f) {
+        Some(show) if *t == DataType::Utf8 => show(c),
+        _ => cast(c, t).map_err(anyhow::Error::from),
+    };
+    match b.columns().iter().zip(fields.iter().zip(types)).map(sent).collect::<anyhow::Result<Vec<_>>>() {
         Ok(cols) => (0..b.num_rows()).map(|i| row(&cols, i)).collect(),
-        Err(e) => vec![Err(plain(e.into()))],
+        Err(e) => vec![Err(plain(e))],
     }
 }
 
@@ -1168,6 +1174,9 @@ fn field_type(f: &datafusion::arrow::datatypes::Field, format: FieldFormat) -> (
     }
     if crate::column_types::of(f).is_some_and(|t| t.name == crate::column_types::INET.name) {
         return (Type::INET, DataType::FixedSizeBinary(crate::column_types::inet::WIDTH as i32));
+    }
+    if crate::column_types::of(f).is_some_and(|t| t.name == crate::column_types::FILE.name) {
+        return (Type::JSONB, DataType::Utf8); // (L6: a FILE is a jsonb here, its text its object: `each_row` shows it)
     }
     match crate::pg_types::marked_type(f) {
         Some(Ty::Uuid) => (Type::UUID, DataType::Utf8),

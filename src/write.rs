@@ -160,7 +160,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         }
         let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its bytes)
         if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && *ty == holds(t))) {
-            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, and an INET its address (a column of the table, of type {})", holds(t));
+            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, an INET its address and a FILE its parts (a column of the table, of type {})", holds(t));
         }
         for (c, expr) in &defaults {
             ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
@@ -292,7 +292,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     // to a published table has no type there; left out of the node's --publish with a notice)
     let notice = if defaulted { crate::delta::left_out(name, &meta) } else { None };
     if let Some((f, why)) = meta.publish.iter().find_map(|f| crate::delta::refused(&meta, f).map(|why| (f, why))) {
-        ensure!(defaulted, "{name} can't be published as {f}: {why}");
+        if !defaulted {
+            return Err(crate::codes::coded("0A000", format!("{name} can't be published as {f}: {why}"))); // (not yet: a feature, not a fault)
+        }
     }
     meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect();
     let (mut puts, readers) = kept;

@@ -54,7 +54,7 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let config = crate::optimize::config(config.with_information_schema(true));
     let state = SessionStateBuilder::new().with_config(config).with_runtime_env(rt).with_default_features();
     let state = state.with_analyzer_rules(crate::optimize::analyzer_rules()).with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
-    let mut state = state.with_type_planner(Arc::new(crate::column_types::sql::Named)); // (INET as a cast's type)
+    let mut state = state.with_type_planner(Arc::new(crate::column_types::sql::Named)); // (INET, FILE as a cast's type)
     state.expr_planners().get_or_insert_with(Vec::new).insert(0, Arc::new(crate::column_types::sql::Compared)); // (ip = '10.0.0.1')
     state.expr_planners().get_or_insert_with(Vec::new).insert(0, substrings()); // (SUBSTRING of bytes too)
     state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds')
@@ -134,7 +134,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
     register: |r| {
         r.section_mut::<Functions>().add("engine", own);
         r.section_mut::<crate::languages::Languages>().add(&crate::parsed::LANGUAGE);
-        r.section_mut::<crate::column_types::ColumnTypes>().add(&crate::column_types::INET); // (INET: an address in 16 bytes)
+        r.section_mut::<crate::column_types::ColumnTypes>().add(&crate::column_types::INET); // (INET: an address in 17 bytes)
+        r.section_mut::<crate::column_types::ColumnTypes>().add(&crate::column_types::FILE); // (FILE: a path, a version and a content type)
         r.section_mut::<crate::file_formats::FileFormats>().add(&crate::file_formats::parquet::PARQUET); // (a table's data files: Parquet, the default)
         r.section_mut::<crate::answer::Shown>().set(crate::column_types::show_of); // (a JSON or CSV answer shows it as text)
         let passes = r.section_mut::<crate::passes::Passes>();
@@ -266,7 +267,7 @@ fn own(mut ctx: SessionContext) -> SessionContext {
     crate::avg::register(&ctx); // avg(DECIMAL): as sum / count answers it
     crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
-    crate::column_types::sql::register(&ctx); // pondra_inet(x), pondra_inet_text(x): casts to INET and from it
+    crate::column_types::sql::register(&ctx); // pondra_inet(x), pondra_inet_text(x), pondra_file(x), …: casts to a column type and from it
     crate::dialect_fns::register(&ctx); // safe_divide(a, b): BigQuery's, typed by its arguments
     crate::finish::register(&ctx); // pondra_moments(x): what a view kept for a variance (made before format 7)
     crate::fvar::register_parts(&ctx); // pondra_mean_parts(x), pondra_var_parts(x): what a view keeps for an average and a variance

@@ -60,7 +60,7 @@ pub fn not_found(path: &str) -> String {
     format!("no such file: {path}")
 }
 
-/// The content type a file is served as, by its extension.
+/// The content type a file is served as, by its extension: a FILE's too (`column_types::file`).
 pub fn content_type(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
     match ext.as_str() {
@@ -72,7 +72,13 @@ pub fn content_type(path: &str) -> &'static str {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "svg" => "image/svg+xml",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
         "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "parquet" => "application/vnd.apache.parquet",
         _ => "application/octet-stream",
     }
 }

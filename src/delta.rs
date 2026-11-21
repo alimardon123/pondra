@@ -203,7 +203,8 @@ pub fn refused(meta: &TableMeta, format: &str) -> Option<String> {
     if let Some((_, name, held)) = meta.live().filter(|(s, _, _)| parted.iter().any(|p| p == s)).find_map(|(s, n, _)| Some((s, n, meta.held_of(s).filter(|h| crate::column_types::stored(h).is_some())?))) {
         return Some(format!("it is partitioned by {name}, an {}, whose parts {format} doesn't name yet", held.to_uppercase()));
     }
-    let (_, name, t) = meta.live().filter(|(s, _, _)| !meta.marker(s)).find(|(_, _, t)| !carried(t))?;
+    let (s, name, t) = meta.live().filter(|(s, _, _)| !meta.marker(s)).find(|(_, _, t)| !carried(t))?;
+    let t = meta.held_of(s).filter(|h| crate::column_types::stored(h).is_some()).map_or_else(|| t.to_string(), str::to_uppercase); // (a FILE, not its struct)
     Some(format!("{format} has no type for {name} ({t})"))
 }
 
