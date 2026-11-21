@@ -1329,8 +1329,8 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
         };
         own.or_else(|| crate::text::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i))
     };
-    // A list's elements have an id too, after every column's (`iceberg.rs`: `element-id`): a reader that matches a
-    // file's fields by id alone (DuckDB's `iceberg_scan`) reads a list whose elements have none as NULLs.
+    // A list's elements have an id too, `column::ELEMENTS` past the column's (`iceberg.rs`: `element-id`): a reader that
+    // matches a file's fields by id alone (DuckDB's `iceberg_scan`) reads a list whose elements have none as NULLs.
     let columns = list.as_ref().map_or(made.len(), |l| l.all().len());
     let element = |t: &DataType, id: usize| {
         let with = |f: &FieldRef| std::sync::Arc::new(f.as_ref().clone().with_metadata([(ID.to_string(), id.to_string())].into()));
@@ -1345,7 +1345,7 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
         Some(i) => {
             let mut m = f.metadata().clone();
             m.insert(ID.to_string(), i.to_string());
-            let t = if i <= columns { element(f.data_type(), columns + i) } else { f.data_type().clone() };
+            let t = if i <= columns { element(f.data_type(), crate::column::ELEMENTS as usize + i) } else { f.data_type().clone() };
             std::sync::Arc::new(f.as_ref().clone().with_metadata(m).with_data_type(t))
         }
         None => f.clone(),
