@@ -872,7 +872,7 @@ pub(crate) async fn prepare_as(lake: &Lake, name: &str, current: &Value, asked: 
     }
     let changes = !c.removed.is_empty() || !c.deletes.is_empty();
     if changes && !crate::adopt::fits_as_written(&meta) {
-        return Err(bad(format!("{name} has a renamed or dropped column, so other engines append to it; change its rows with Pondra's SQL (DELETE, UPDATE, MERGE)")));
+        return Err(bad(format!("{name} has a renamed or dropped column or a bucket in its partition_by, so other engines append to it; change its rows with Pondra's SQL (DELETE, UPDATE, MERGE)")));
     }
     c.deleted = deleted(lake, &c.deletes).await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
     if (!c.incoming.is_empty() || changes) && as_written && crate::adopt::fits_as_written(&meta) {
