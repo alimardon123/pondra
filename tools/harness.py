@@ -4410,6 +4410,16 @@ def scale():
         "tables that share a key meet where they are, by its ranges": sum(r for *_, r in list(shuffles.values())[23:29]) >= 4,
         "Delta and Iceberg readers see sealed files": all(v == n_rows for v in theirs.values()),
     }
+    # (step 5 I3-d: a published table's partition_by changes; its readers read the files of both specs, each under its own)
+    q("ALTER TABLE ev SET (partition_by = 'k, month(ts)')")
+    q(f"INSERT INTO ev SELECT value + 5000000, to_timestamp_seconds({base} + value * 3600), 1.0, 'k' || (value % 5), NULL FROM generate_series(0, 99)")
+    for _ in range(20):
+        call(port, "POST", "/tier")
+        respec = {**open_check.readers(lake, "ev"), **{f"iceberg/{k}": v for k, v in open_check.iceberg_readers(lake, "ev").items()}}
+        if all(v == n_rows + 100 for v in respec.values()):
+            break
+        time.sleep(1)
+    checks["a published table's partition_by changes: readers read both specs' files"] = all(v == n_rows + 100 for v in respec.values()) and q("SELECT count(*) AS n FROM ev")[0]["n"] == n_rows + 100
     for n in list(NODES):
         n.kill()
     # A 50 MB memory limit: a 2M-group aggregation and a sort spill, a join of 3M rows switches
