@@ -97,15 +97,15 @@ impl Seen {
     /// table's entries stay small; strings only up to 64 characters, where a cut-off value would no
     /// longer bound them), and of the system columns (`sys.rs`: a purge finds changed rows by them).
     /// Floats' come from their rows (Parquet leaves NaN out of its own, and a NaN must not be pruned
-    /// away), the rest from the footer, when exact: Parquet cuts a value at 64 bytes, which a file
-    /// keeps no range of anyway (`bounds::kept`).
-    pub fn ranges(&mut self, written: &ParquetMetaData) -> Values {
+    /// away), the rest from what the file's format kept (`file_formats::FileStats`: Parquet's footer),
+    /// when exact: Parquet cuts a value at 64 bytes, which a file keeps no range of anyway (`bounds::kept`).
+    pub fn ranges(&mut self, written: &dyn crate::file_formats::FileStats) -> Values {
         let mut out = Values::new();
         let floats: BTreeMap<usize, (ScalarValue, ScalarValue)> = self.floats.iter_mut().filter_map(|(i, lo, hi)| Some((*i, (lo.evaluate().ok()?, hi.evaluate().ok()?)))).collect();
         for (i, f) in self.schema.fields().iter().enumerate().filter(|(i, f)| ranged(*i, f)) {
             let range = match f.data_type().is_floating() {
                 true => floats.get(&i).cloned(),
-                false => from_footer(written, &self.schema, f.name()),
+                false => written.range(&self.schema, f.name()),
             };
             if let Some((lo, hi)) = range.filter(|(lo, hi)| !lo.is_null() && !hi.is_null()) {
                 out.insert(f.name().clone(), (lo, hi));

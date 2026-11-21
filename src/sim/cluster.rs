@@ -112,6 +112,7 @@ impl Cluster {
                 }
                 stops
             })),
+            one_runtime: true,
         };
         let mut options = crate::node::Options::member(&self.dir(m), &member.name, given);
         options.start = lock(&self.start).clone();
@@ -239,9 +240,13 @@ impl Cluster {
                     }
                     stops
                 })),
+                one_runtime: true,
             };
+            // (its host's end is kept while it runs: a node whose host is gone stops the process on a failure, and a guest
+            // stopped at a point fails its own work)
+            let (host, _told) = crate::node::Host::beside();
             let mut options = crate::node::Options::guest(&dir, vec![], crate::node::Guest::Writes);
-            (options.given, options.host) = (given, Some(crate::node::Host::beside().0));
+            (options.given, options.host) = (given, Some(host));
             let (path, body) = (path.clone(), sql.as_bytes().to_vec());
             let run = crate::spawns::untracked(async move {
                 let node = crate::node::Node::open(options).await?;

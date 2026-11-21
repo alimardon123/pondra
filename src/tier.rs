@@ -159,7 +159,6 @@ pub async fn all_to_files(lake: &Lake, table: &str, upto: u64, nodes: &[String],
 /// similar size (`run`); only when that run reaches the oldest file is the whole table rewritten.
 /// Returns whether anything changed.
 const MERGE_BYTES: u64 = 256 << 20; // input a merge job takes at most
-pub(crate) const ROW_GROUP_BYTES: usize = 64 << 20; // a row group at most, as the Parquet writer counts it (`writer`)
 
 /// `now_anyway` (`CHECKPOINT`): a keyed table that publishes is compacted whatever it holds, so
 /// other engines see its rows as they are now.
@@ -1148,53 +1147,6 @@ impl Seen {
     fn has(&self, path: &str) -> bool { self.bits(path).into_iter().all(|bit| self.0[bit / 64] >> (bit % 64) & 1 == 1) }
 }
 
-/// Parquet writer. Keyed tables are written for lookups as well as scans — sorted by key (see
-/// `latest_sql`), with a bloom filter per key column, and in small row groups and pages, so reading
-/// one key touches one page instead of a million rows.
-///
-/// Every table's row groups hold at most `ROW_GROUP_BYTES` as the writer counts them (about 40 MB
-/// written): a scan holds a row group's columns while it decodes it, so a million rows of a wide
-/// table held hundreds of MB a partition (ClickBench's 105 columns on four cores: a top-10 of every
-/// column peaked at 1.9 GB, and a node in a 1.6 GB container was killed; 1.0 GB in groups of this
-/// size, and faster). A narrower table's million rows stay one group (TPC-H's lineitem: 34 MB).
-pub(crate) fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
-    let mut props = WriterProperties::builder().set_compression(codec()).set_max_row_group_bytes(Some(ROW_GROUP_BYTES));
-    if !keys.is_empty() {
-        props = props.set_max_row_group_row_count(Some(256 << 10));
-    }
-    for k in keys {
-        props = props.set_column_bloom_filter_enabled(k.as_str().into(), true);
-    }
-    // System columns: row ids count up, deltas of a few bits each; versions and times repeat per
-    // commit, and plain values the codec squeezes are what costs least to write (the files come
-    // out the size they were without them).
-    for c in crate::text::NAMES.iter().filter(|c| schema.index_of(c).is_ok()) {
-        let path: datafusion::parquet::schema::types::ColumnPath = (*c).into();
-        let encoding = if *c == crate::text::ROW_ID { datafusion::parquet::basic::Encoding::DELTA_BINARY_PACKED } else { datafusion::parquet::basic::Encoding::PLAIN };
-        props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, encoding);
-    }
-    Ok(ArrowWriter::try_new_with_options(vec![], schema, plain(props.build()))?)
-}
-
-/// Writer options with the Parquet file's own types only: no Arrow schema in its footer, which would
-/// have other engines' Arrow read strings as views (`string_view`), which PyArrow can't yet take
-/// rows of — PyIceberg applying a position delete, say.
-pub fn plain(props: WriterProperties) -> datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions {
-    datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions::new().with_properties(props).with_skip_arrow_metadata(true)
-}
-
-/// The codec data files are written with (`PONDRA_CODEC`). LZ4 by default: it decodes fastest,
-/// so scans are CPU-cheap (TPC-H runs 13-20% faster than on ZSTD, with files a third bigger).
-/// `zstd` where storage or bandwidth costs more than CPU; `snappy` or `none` also work.
-pub(crate) fn codec() -> Compression {
-    match crate::env::get("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
-        "zstd" => Compression::ZSTD(ZstdLevel::try_new(1).expect("a valid level")),
-        "snappy" => Compression::SNAPPY,
-        "none" => Compression::UNCOMPRESSED,
-        _ => Compression::LZ4_RAW,
-    }
-}
-
 use crate::answer::storable;
 
 /// One Parquet file of these rows, which carries its columns' min and max: an append table's, and a keyed table's, whose
@@ -1234,7 +1186,8 @@ const HOT_KEEP: usize = 64 << 20;
 /// table is held with: `hot` (each one's batch column index and the type it is held as) and `kept`
 /// (each one's arrays so far), which `put` hands to `hot::Hot::put`.
 struct Encoding {
-    w: ArrowWriter<Vec<u8>>,
+    w: Box<dyn crate::file_formats::TableWriter>,
+    ending: &'static str, // (its format's: a file's name ends in it)
     ids: datafusion::arrow::datatypes::SchemaRef,
     rows: usize,
     sys: bool,
@@ -1256,7 +1209,8 @@ impl Encoding {
         let at = |f: FieldRef| Some((schema.index_of(f.name()).ok()?, f));
         let hot: Vec<(usize, FieldRef)> = hot.into_iter().map(at).collect::<Option<_>>().unwrap_or_default();
         let kept = vec![vec![]; hot.len()];
-        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, sketches, hot, kept, kept_bytes: 0 })
+        let format = crate::file_formats::default();
+        Ok(Encoding { w: format.writer(ids.clone(), keys)?, ending: format.ending(), ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, sketches, hot, kept, kept_bytes: 0 })
     }
 
     fn write(&mut self, b: &RecordBatch) -> Result<()> {
@@ -1288,16 +1242,15 @@ impl Encoding {
     }
 
     /// Its size so far, encoded.
-    fn bytes(&self) -> usize { self.w.bytes_written() + self.w.in_progress_size() }
+    fn bytes(&self) -> usize { self.w.bytes() }
 
     /// The file's bytes, finished, and its entry but for where it goes: its ranges typed in a lake of format 8 (`typed`).
     fn finish(self, typed: bool) -> Result<(Vec<u8>, DataFile)> {
-        let Encoding { mut w, rows, sys, mut seen, sketches, .. } = self;
-        let footer = w.finish()?; // (its statistics: the file's min and max, without a second pass)
-        let buf = std::mem::take(w.inner_mut());
-        let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(&footer), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
-        let bytes = buf.len() as u64;
-        let sizes = crate::manifest::sizes(&footer);
+        let Encoding { w, rows, sys, mut seen, sketches, .. } = self;
+        let done = w.finish()?; // (its statistics: the file's min and max, as its format kept them, without a second pass)
+        let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(done.stats.as_ref()), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
+        let (bytes, sizes) = (done.bytes.len() as u64, done.stats.sizes());
+        let buf = done.bytes;
         Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, sizes, nulls, sketch, sys, ..Default::default() }))
     }
 
@@ -1306,9 +1259,9 @@ impl Encoding {
     async fn put(mut self, lake: &Lake, table: &str, meta: Option<&TableMeta>) -> Result<DataFile> {
         let hot: Vec<FieldRef> = self.hot.iter().map(|(_, f)| f.clone()).collect();
         let kept = std::mem::take(&mut self.kept);
-        let typed = crate::format::typed(lake).await?;
+        let (typed, ending) = (crate::format::typed(lake).await?, self.ending);
         let (buf, file) = blocking(move || self.finish(typed)).await?;
-        let path = format!("data/{}/{}.parquet", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
+        let path = format!("data/{}/{}.{ending}", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
         lake.put(&path, buf).await?;
         maybe_crash("after_parquet_put", &lake.node);
         if !hot.is_empty() {

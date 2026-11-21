@@ -39,11 +39,11 @@ async fn caught<T>(busy: crate::node_state::Busy, f: impl Future<Output = T>) ->
 /// watch loop, so it watches each poll of one instead (`oom::polled`), and answers its own [`crate::oom::PAGE_OOM`].
 /// Any other request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
 pub fn work<T: Send + 'static>(node: &crate::node_state::NodeState, stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> impl Future<Output = Result<T, String>> + Send + 'static {
-    worked(node.drain.busy(), node.metrics.clone(), stoppable, f) // (counted as it comes, as `door` counts it)
+    worked(node.drain.busy(), node.metrics.clone(), stoppable, node.one_runtime, f) // (counted as it comes, as `door` counts it)
 }
 
 /// `work`, with its place in its node's count of requests in flight already taken.
-async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, metrics: std::sync::Arc<crate::metrics::Metrics>, stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
+async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, metrics: std::sync::Arc<crate::metrics::Metrics>, stoppable: bool, one_runtime: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     use futures::future::{Aborted, Either};
     use std::sync::atomic::Ordering::Relaxed;
     // (a page's one thread runs no watch loop beside a request, so each poll of a stoppable one is watched: `oom::polled`)
@@ -89,7 +89,7 @@ async fn worked<T: Send + 'static>(busy: crate::node_state::Busy, metrics: std::
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let long = running.first_key_value().is_some_and(|(_, r)| r.since.elapsed() >= LONG);
         running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, resting: false, used, left: None, first_try: None, metrics });
-        long
+        long && !one_runtime // (the sim's member keeps it on its test's runtime: `Given::one_runtime`)
     };
     crate::oom::wake(); // (the watch looks now, once this request is in RUNNING: it may be one to stop)
     let mut stop = Stop(id, None);

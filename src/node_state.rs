@@ -21,6 +21,9 @@ pub struct Given {
     pub dial: Option<Arc<dyn crate::calls::Dial>>,
     pub stops: Option<Stops>,
     pub started: Option<Arc<dyn Fn(&Arc<NodeState>) + Send + Sync>>,
+    /// Does all its work stay on the runtime it runs on, none of it moved to the process's queries' runtime
+    /// (`spawns::queries`)? The sim's members: their time is their test's (paused), and a process holds many of them.
+    pub one_runtime: bool,
 }
 
 impl NodeState {
@@ -46,6 +49,8 @@ pub struct NodeState {
     pub dial: std::sync::Arc<dyn crate::calls::Dial>,
     /// Where it stops on purpose, as its host gave (`Given::stops`: the sim's member), beside `PONDRA_CRASH`'s points.
     pub(crate) stops: Option<Stops>,
+    /// Does all its work stay on the runtime it runs on (`Given::one_runtime`: the sim's member)?
+    pub(crate) one_runtime: bool,
     /// The space it spills into past its memory: its process's host's (`scratch::install`), or this machine's folders.
     #[cfg(feature = "lake")]
     pub scratch: std::sync::Arc<dyn crate::scratch::Scratch>,
@@ -104,7 +109,7 @@ impl NodeState {
 
     fn made(life: Life, machine: crate::machine::Mach, settings: crate::settings::Values, claims: Arc<Claims>, given: &Given) -> Arc<NodeState> {
         let reaches = crate::reaches::Reaches::inherited(settings.get(crate::reaches::REACH_VAR));
-        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] dial: given.dial.clone().unwrap_or_else(crate::calls::native), stops: given.stops.clone(), #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), jobs: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: crate::clock::Instant::now() })
+        Arc::new(NodeState { reaches, #[cfg(feature = "lake")] tasks: crate::spawns::Tasks::new(life.clone()).kept_on_one_runtime(given.one_runtime), life, machine, #[cfg(feature = "lake")] net: crate::net::installed(), #[cfg(feature = "lake")] calls: Default::default(), #[cfg(feature = "lake")] dial: given.dial.clone().unwrap_or_else(crate::calls::native), stops: given.stops.clone(), one_runtime: given.one_runtime, #[cfg(feature = "lake")] scratch: crate::scratch::installed(), settings, metrics: Default::default(), move_failed: Default::default(), drain: Drain::default(), idle: Idle::default(), line: Default::default(), jobs: Default::default(), id: uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string(), claims, tokens: Default::default(), serving: tokio::sync::watch::Sender::new(false), began: crate::clock::Instant::now() })
     }
 
     /// The state of a lake a test opens, with no node around it (`lifecycle::Unhosted`).
