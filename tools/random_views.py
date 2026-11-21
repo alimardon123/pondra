@@ -11,7 +11,7 @@ No write runs while views are compared, so the query's answer then is its answer
 on a view that stays different from its query, a view whose run fails, a node that stopped, or a known difference
 (`KNOWN`) past its date; a write Pondra refuses is listed (`kind: refused`) and fails nothing.
 """
-import argparse, datetime, json, random, sys, time
+import argparse, datetime, json, random, re, sys, time
 
 import harness
 from random_sql import bag, pondra
@@ -21,7 +21,9 @@ from random_sql import bag, pondra
 KNOWN = {
     "lookup-join": {"evidence": "A view kept from each write's rows looks its joins up as each write arrives (ADR-059 §2), so "
                                 "a later write to the joined table doesn't reach rows already kept: `SELECT o.c, count(*) FROM o JOIN m "
-                                "ON o.g = m.g GROUP BY o.c` after `INSERT INTO m`. F2 (li1113, L1, step 11) makes it follow both sides.",
+                                "ON o.g = m.g GROUP BY o.c` after `INSERT INTO m`. Counted only in a round that wrote `m`, and each such view is "
+                                "made again after that round, so a round of writes to `o` alone holds it to its query (11-20 audit L5). "
+                                "F2 (li1113, L1, step 11) makes it follow both sides.",
                     "expires": "2026-12-31"},
 }
 
@@ -116,24 +118,31 @@ def main():
                 if over():
                     break
                 stats["rounds"] += 1
+                wrote_m = False  # (the joined table: what a lookup join doesn't follow, KNOWN)
                 for _ in range(rnd.randint(1, 3)):
                     s = g.write()
                     made.append(s)
                     try:
                         q(s)
                         stats["writes"] += 1
+                        wrote_m |= bool(re.match(r"(INSERT INTO|DELETE FROM|UPDATE) m\b", s))
                     except Exception as e:
                         if not node.alive():
                             raise
                         stats["refused_writes"] += 1
                         found.append({"kind": "refused", "write": s, "pondra": str(e)[:300], "views": {n: kept.get(n) for n in views}})
                 for name, sql in views.items():
-                    ok, mine, whole = same(name, sql, 5 if name in joins else A.wait)  # (a lookup join may never come to it: KNOWN)
+                    lookup = name in joins and wrote_m  # (ADR-059 §2's lookup misses this round's write to `m`: KNOWN)
+                    ok, mine, whole = same(name, sql, 5 if lookup else A.wait)
                     stats["checked"] += 1
-                    if not ok and name in joins:  # (ADR-059 §2's lookup: KNOWN)
+                    if not ok and lookup:
                         known["lookup-join"] += 1
                     elif not ok:
                         found.append({"kind": "wrong", "view": name, "way": kept.get(name), "sql": sql, "view_rows": str(mine[:5])[:400], "query_rows": str(whole[:5])[:400], "writes": made[-30:]})
+                if wrote_m:
+                    for name in joins:  # (made again from the rows as they are: a later round's difference is a wrong answer)
+                        q(f"DROP MATERIALIZED VIEW {name}")
+                        q(f"CREATE MATERIALIZED VIEW {name} AS {views[name]}")
                 failing = pondra(A.port, "SELECT name, error FROM pondra.flows WHERE error IS NOT NULL")
                 found += [{"kind": "failing", "view": n, "way": kept.get(n), "error": str(e)[:300]} for n, e in failing]
                 if any(f["kind"] in ("wrong", "failing") for f in found):
