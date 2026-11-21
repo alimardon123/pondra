@@ -135,6 +135,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         r.section_mut::<Functions>().add("engine", own);
         r.section_mut::<crate::languages::Languages>().add(&crate::parsed::LANGUAGE);
         r.section_mut::<crate::column_types::ColumnTypes>().add(&crate::column_types::INET); // (INET: an address in 16 bytes)
+        r.section_mut::<crate::file_formats::FileFormats>().add(&crate::file_formats::parquet::PARQUET); // (a table's data files: Parquet, the default)
         r.section_mut::<crate::answer::Shown>().set(crate::column_types::show_of); // (a JSON or CSV answer shows it as text)
         let passes = r.section_mut::<crate::passes::Passes>();
         for p in [crate::kept::pass(), crate::dialect_stmts::pass(), crate::diff::pass(), crate::past_names::pass(), crate::text::types_pass(), crate::grouping::pass()].into_iter().chain(crate::friendly::passes()) {
