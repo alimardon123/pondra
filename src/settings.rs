@@ -338,6 +338,7 @@ pub const CORE: &[Setting] = &[
     test("PONDRA_CRASH", Text, No),
     test("PONDRA_DROP_BEATS", Path, No),
     test("PONDRA_NO_DIRECT", Switch, No),
+    test("PONDRA_SIM_FROM", Int, Is("1")),
     test("PONDRA_SIM_SEED", Int, No),
     test("PONDRA_SIM_SEEDS", Int, Is("2")),
     test("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS", Ms, No),

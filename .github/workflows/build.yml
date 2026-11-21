@@ -500,6 +500,8 @@ jobs:
           cache-on-failure: true
           save-if: false # (the host's job saves this key, with the workspace's crates: `host`)
       - run: cargo test --release --lib
+        env:
+          PONDRA_SIM_SEEDS: 8 # (the sim's scenarios over 8 seeds, a few seconds: 200 a night, sim.yml)
       # The core as the page form builds it (web/: no server feature), checked: a module every build has that
       # called one only a node has broke main's browser build after a pull request merged on Linux's CI alone (#131).
       - name: The browser's half of the crate compiles (as the page builds it, with the lake and no server feature)
