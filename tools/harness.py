@@ -19875,9 +19875,10 @@ def inets():
         check("a view filters by address, and a materialized view's table keeps the type: filtered by address, shown as text", viewed)
 
         def branched():
-            db = q("SELECT current_database() AS d")[0]["d"]
-            q(f'CREATE DATABASE inets_dev CLONE "{db}"')
-            return q("SELECT id FROM inets_dev.doors WHERE ip = '10.0.0.4'") == [{"id": 4}]
+            db, dev = q("SELECT current_database() AS d")[0]["d"], f"inets_{uuid.uuid4().hex[:8]}"
+            q(f'CREATE DATABASE {dev} CLONE "{db}"')
+            LAKES.append(lake.rstrip("/").rsplit("/", 1)[0] + "/" + dev)  # (its folder, beside the lake: removed with it)
+            return q(f"SELECT id FROM {dev}.doors WHERE ip = '10.0.0.4'") == [{"id": 4}]
         check("a branch (CREATE DATABASE … CLONE) keeps the type: filtered by address", branched)
 
         def published():
