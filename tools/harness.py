@@ -30259,6 +30259,16 @@ def publishing():
         checks["a list column: its values in DuckDB's iceberg_scan and delta_scan, PyIceberg and delta-rs"] = all(v == want_embs for v in (lists or {}).values()) and len(lists or {}) == 4
         if not checks["a list column: its values in DuckDB's iceberg_scan and delta_scan, PyIceberg and delta-rs"]:
             print(f"publishing: a list column: the readers said {lists}")
+        # …and after ADD COLUMN: the elements keep their id (`column::ELEMENTS` past the column's), so the files written before
+        # still read, and the new column's id is its own (audit 11-20 H4: it took the elements' id, which moved).
+        q("ALTER TABLE embs ADD COLUMN w INT")
+        q("INSERT INTO embs VALUES (3, [7.0], 1)")
+        q("CHECKPOINT")
+        want_embs = want_embs + [[3, [7.0]]]
+        lists = until(lambda: _try(embs), {k: want_embs for k in ("DuckDB iceberg_scan", "DuckDB delta_scan", "PyIceberg", "delta-rs")}, 60)
+        checks["…and after ADD COLUMN, the files before it too"] = all(v == want_embs for v in (lists or {}).values()) and len(lists or {}) == 4
+        if not checks["…and after ADD COLUMN, the files before it too"]:
+            print(f"publishing: a list column after ADD COLUMN: the readers said {lists}")
         # The ranges the open formats carry (`delta.rs` `stats`, `iceberg.rs` `entry`): each file's min and max and its NULLs,
         # so a reader skips the files a filter rules out. Each batch is one file (a CHECKPOINT after each INSERT: small files merge
         # only 8 at a time), and every reader answers each filter as the model does.

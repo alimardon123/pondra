@@ -496,12 +496,11 @@ async fn listed(lake: &Lake, path: &str) -> Result<Vec<(String, (u64, i64))>> {
 #[allow(clippy::too_many_arguments)]
 fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Value, layout: &Layout, meta: &TableMeta, snapshots: &[(Value, String)]) -> Value {
     let list = meta.column_list();
-    let n = list.all().len() as u32;
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
     // (a renamed column by both names: Pondra's files keep the stored one, other writers write SQL's)
     let known = |c: &crate::column::Column| if c.name == c.stored { json!([c.stored]) } else { json!([c.name, c.stored]) };
     let mut names: Vec<Value> = list.all().iter().map(|c| match crate::answer::list_item(&c.dtype).is_some() {
-        true => json!({"field-id": c.id, "names": known(c), "fields": [{"field-id": n + c.id, "names": ["item", "element"]}]}),
+        true => json!({"field-id": c.id, "names": known(c), "fields": [{"field-id": crate::column::ELEMENTS + c.id, "names": ["item", "element"]}]}),
         false => json!({"field-id": c.id, "names": known(c)}),
     }).collect();
     // The files also hold the rows' system columns (`sys.rs`), which the schema leaves out: named
@@ -512,7 +511,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
     let current = &snapshots[snapshots.len() - 1].0["snapshot-id"];
     json!({
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{folder}")),
-        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * n, // (list elements take ids after the columns')
+        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": crate::column::last_id(list.all().iter().map(|c| (c.id, crate::answer::list_item(&c.dtype).is_some()))),
         "current-schema-id": 0, "schemas": [schema],
         "default-spec-id": layout.partition.is_some() as i32, "last-partition-id": 999 + layout.parts().len(),
         "partition-specs": std::iter::once(json!({"spec-id": 0, "fields": []})).chain(layout.partition.as_ref().map(|_| json!({"spec-id": 1, "fields": layout.spec()}))).collect::<Vec<_>>(),
@@ -531,7 +530,7 @@ pub fn empty(location: &str, columns: &[(String, String)], now: u64) -> Option<V
     let fields = fields(&TableMeta::with_columns(columns.to_vec()))?;
     Some(json!({
         "format-version": 2, "table-uuid": uuid::Uuid::new_v4().to_string(), "location": location,
-        "last-sequence-number": 0, "last-updated-ms": now, "last-column-id": 2 * columns.len(),
+        "last-sequence-number": 0, "last-updated-ms": now, "last-column-id": crate::column::last_id(columns.iter().enumerate().map(|(i, (_, t))| (i as u32 + 1, crate::answer::list_item(t).is_some()))),
         "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
         "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "last-partition-id": 999,
         "default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
@@ -565,10 +564,9 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
             },
         })
     };
-    let n = list.all().len() as u32;
-    // A list column (an embedding, say) needs an id for its elements too: they follow the columns'.
+    // A list column (an embedding, say) needs an id for its elements too: `column::ELEMENTS` past the column's.
     let kind = |id: u32, t: &str| match crate::answer::list_item(t) {
-        Some(item) => Some(json!({"type": "list", "element-id": n + id, "element": iceberg(&item)?, "element-required": false})),
+        Some(item) => Some(json!({"type": "list", "element-id": crate::column::ELEMENTS + id, "element": iceberg(&item)?, "element-required": false})),
         None => Some(Value::String(iceberg(t)?)),
     };
     // (listed in SQL's order: a field is known by its id, wherever it is listed; a key's are required, as identifier fields)
@@ -1282,6 +1280,20 @@ mod tests {
         floats.add_column("f", "Float64", None, None);
         floats.partition = Some("region, f".into());
         assert!(Layout::of(&floats).partition.is_none() && Layout::of(&floats).record("x/1.5").unwrap().is_empty());
+    }
+
+    /// A list's elements keep their field id when a column is added, and no column takes it (audit 11-20 H4: they took the
+    /// ids after the columns', so ADD COLUMN gave the new column theirs and moved them, and older files read as NULLs).
+    #[test]
+    fn a_lists_element_id_stays_when_a_column_is_added() {
+        let mut meta = TableMeta::made(crate::store::Made { columns: vec![("v".into(), "Float64[]".into()), ("id".into(), "Int32".into())], ..Default::default() });
+        let element = |meta: &TableMeta| fields(meta).unwrap()[0]["type"]["element-id"].as_u64();
+        assert_eq!(element(&meta), Some(500_001));
+        meta.add_column("w", "Int32", None, None);
+        let f = fields(&meta).unwrap();
+        assert_eq!((element(&meta), f[2]["id"].as_u64()), (Some(500_001), Some(3)));
+        let list = meta.column_list();
+        assert_eq!(crate::column::last_id(list.all().iter().map(|c| (c.id, crate::answer::list_item(&c.dtype).is_some()))), 500_001);
     }
 
     /// A version lets go of a file only when none of its own is that file: a file moved between our manifests and the

@@ -6,6 +6,15 @@
 //! readers that did). A table's entry keeps its columns as a list (`store::Stored`, step 1b's piece 6), and
 //! `TableMeta::column_list` makes this from it.
 
+/// The field id of a list column's elements in its files and in Iceberg's schema: the column's own id past this, so it never
+/// moves when a column is added (the elements once took the ids after every column's, and ADD COLUMN gave one of them to
+/// the new column: audit 11-20 H4). Columns' ids stay below it, and the system columns' are past 1,000,000 (`tier::field_ids`).
+pub const ELEMENTS: u32 = 500_000;
+
+/// The highest field id a schema of columns with these ids gives (`list`: does the column hold a list?): Iceberg's
+/// `last-column-id`.
+pub fn last_id(columns: impl Iterator<Item = (u32, bool)>) -> u32 { columns.map(|(id, list)| if list { ELEMENTS + id } else { id }).max().unwrap_or(0) }
+
 /// One column of a table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Column {
