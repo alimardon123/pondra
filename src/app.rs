@@ -132,7 +132,13 @@ impl App {
 tokio::task_local! {
     /// Set while this task holds one of the node's query turns (`App::query_listed`).
     static TURN: ();
+    /// Set around the query whose answer a door sends back (`answering`).
+    static ANSWERING: ();
 }
+
+/// `f`, a door's query whose rows it sends back: the one answer `MAX_ROWS` cuts (`App::run_query`). Any other query, one a
+/// write, a script's loop, a variable or a procedure reads, runs whole, wherever it runs (11-20 audit H1).
+pub async fn answering<F: std::future::Future>(f: F) -> F::Output { ANSWERING.scope((), f).await }
 
 /// The node's turns for queries: `PONDRA_QUERIES` run at once (4 a core, 16 at least), in the order
 /// they asked, and a query that waits `PONDRA_QUEUE_SECS` (60) for one is refused (53300). Without
@@ -230,8 +236,8 @@ impl App {
         let explained = crate::explain::asked(query);
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
         // (`MAX_ROWS`: the door's answer, at most this many rows, collected whole so its door can say it was cut before its
-        // first byte. Not a query inside another one, nor an INSERT's or a refresh's: those don't come here)
-        let cap = scope.max_rows().filter(|_| top);
+        // first byte. Only a door's answer (`answering`): never a query inside another one, nor one a write or a script reads)
+        let cap = scope.max_rows().filter(|_| top && ANSWERING.try_with(|_| ()).is_ok());
         let run = async {
             let nodes = if spread == Some("0") || self.here_only_for(query, scope).await { vec![] } else { self.members.nodes() };
             // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
