@@ -392,37 +392,89 @@ async fn nextval_on_three_members_hands_out_each_value_once_through_a_leader_kil
     }
 }
 
+/// Guests `0..guests` write at once, each `statements` statements of `size` rows `(g, s, i)` into `t`; a statement that
+/// fails is run again with its job, as its user runs it again. How many runs again it took.
+async fn guests_write(c: &Cluster, guests: usize, statements: usize, size: usize) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let again = &AtomicUsize::new(0);
+    let guest = |g: usize| async move {
+        for s in 0..statements {
+            let values = (0..size).map(|i| format!("({g}, {s}, {i})")).collect::<Vec<_>>().join(", ");
+            let (sql, job) = (format!("INSERT INTO t VALUES {values}"), format!("g{g}-s{s}"));
+            let mut tries = 0;
+            while let Err(e) = c.guest(g, &sql, &job).await {
+                (tries, _) = (tries + 1, again.fetch_add(1, Relaxed));
+                assert!(tries < 20, "seed {}: {job} never went: {e:#}\n{}", c.seed, c.met());
+            }
+        }
+    };
+    futures::future::join_all((0..guests).map(guest)).await;
+    again.load(Relaxed)
+}
+
+/// Member `m` sees `all` rows in `t`, each once.
+async fn each_once(c: &Cluster, m: usize, all: usize) {
+    let a = c.sql(m, "SELECT count(*) AS n, count(DISTINCT g * 1000 + s * 10 + i) AS d FROM t").await.unwrap();
+    let (n, d) = (rows(&a)[0]["n"].as_i64(), rows(&a)[0]["d"].as_i64());
+    if (n, d) != (Some(all as i64), Some(all as i64)) {
+        let each = c.sql(m, "SELECT g, s, count(*) AS n FROM t GROUP BY g, s ORDER BY g, s").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let later = c.sql(m, "SELECT count(*) AS n FROM t").await.unwrap();
+        panic!("seed {}: rows {n:?}, distinct {d:?}, not {all}; 30 s later {later}\neach statement's: {each}\n{}", c.seed, c.met());
+    }
+}
+
 /// The harness's `serverless`: six guests (`pondra sql`, with no node running) write at once into a lake nobody serves,
 /// through a bucket whose calls are slow and now and then fail or lose their answer. Each takes the lake for the moment
-/// or waits for whoever has it; a statement that fails is run again with its job, as its user runs it again. Then a
-/// member starts on the lake: every row is there once.
+/// or waits for whoever has it. Then a member starts on the lake: every row is there once.
 #[tokio::test(start_paused = true)]
 async fn guests_with_no_node_running_write_each_statement_once() {
-    let (guests, statements, size) = (6usize, 5usize, 10usize);
     for seed in seeds() {
         let c = Cluster::new(seed, 1);
         c.guest(0, "CREATE TABLE t (g INT, s INT, i INT)", "made").await.unwrap();
-        let (cluster, again) = (&c, std::sync::atomic::AtomicUsize::new(0));
-        let again = &again;
-        let guest = |g: usize| async move {
-            cluster.guest_faults(g).everywhere(Odds { fail: 0.02, lost: 0.02, slow: Duration::from_millis(50) });
-            for s in 0..statements {
-                let values = (0..size).map(|i| format!("({g}, {s}, {i})")).collect::<Vec<_>>().join(", ");
-                let (sql, job) = (format!("INSERT INTO t VALUES {values}"), format!("g{g}-s{s}"));
-                let mut tries = 0;
-                while let Err(e) = cluster.guest(g, &sql, &job).await {
-                    (tries, _) = (tries + 1, again.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-                    assert!(tries < 20, "seed {seed}: {job} never went: {e:#}\n{}", cluster.met());
-                }
-            }
-        };
-        futures::future::join_all((0..guests).map(guest)).await;
+        (0..6).for_each(|g| c.guest_faults(g).everywhere(Odds { fail: 0.02, lost: 0.02, slow: Duration::from_millis(50) }));
+        let again = guests_write(&c, 6, 5, 10).await;
         c.start(0).await.unwrap();
-        let a = c.sql(0, "SELECT count(*) AS n, count(DISTINCT g * 100 + s * 10 + i) AS d FROM t").await.unwrap();
-        let (n, d) = (rows(&a)[0]["n"].as_i64(), rows(&a)[0]["d"].as_i64());
-        let all = (guests * statements * size) as i64;
-        assert_eq!((n, d), (Some(all), Some(all)), "seed {seed}: rows, and distinct rows\n{}", c.met());
-        let again = again.load(std::sync::atomic::Ordering::Relaxed);
-        println!("seed {seed}: {all} rows from {guests} guests with no node running, each once ({again} statements run again)");
+        each_once(&c, 0, 300).await;
+        println!("seed {seed}: 300 rows from 6 guests with no node running, each once ({again} statements run again)");
+    }
+}
+
+/// A guest stopped at a crash point (its process killed after a segment is put, after its commit, or after a file is
+/// tiered) runs again with its job, as `pondra sql` does: three guests with no node running, each statement once.
+#[tokio::test(start_paused = true)]
+async fn guests_stopped_at_crash_points_write_each_statement_once() {
+    for seed in seeds() {
+        let c = Cluster::new(seed, 1);
+        c.guest(0, "CREATE TABLE t (g INT, s INT, i INT)", "made").await.unwrap();
+        for g in 0..3 {
+            POINTS.iter().for_each(|(point, _)| c.guest_faults(g).stop_at(point, 0.1));
+        }
+        let again = guests_write(&c, 3, 8, 10).await;
+        let stopped = (0..3).flat_map(|g| c.guest_faults(g).met()).filter(|m| m.starts_with("stopped")).count();
+        c.start(0).await.unwrap();
+        each_once(&c, 0, 240).await;
+        println!("seed {seed}: 240 rows from 3 guests stopped {stopped} times at crash points, each once ({again} statements run again)");
+    }
+}
+
+/// A guest cut off from a live leader (it beats, but doesn't answer from here) writes through the bucket's inbox, where
+/// the leader records it; a guest that reaches the leader writes through it. Three of each at once, through a bucket
+/// that now and then fails a call or loses its answer: each statement once.
+#[tokio::test(start_paused = true)]
+async fn guests_cut_off_from_the_leader_write_through_its_inbox_each_statement_once() {
+    for seed in seeds() {
+        let c = Cluster::new(seed, 1);
+        c.start(0).await.unwrap();
+        c.sql(0, "CREATE TABLE t (g INT, s INT, i INT)").await.unwrap();
+        for g in 0..6 {
+            c.guest_faults(g).everywhere(Odds { fail: 0.01, lost: 0.01, slow: Duration::from_millis(50) });
+            if g < 3 {
+                c.net.cut(&format!("g{g}"), c.name(0), true);
+            }
+        }
+        let again = guests_write(&c, 6, 5, 10).await;
+        each_once(&c, 0, 300).await;
+        println!("seed {seed}: 300 rows from 6 guests, 3 through the leader's inbox, each once ({again} statements run again)");
     }
 }
