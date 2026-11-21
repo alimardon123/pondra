@@ -240,79 +240,36 @@ fn allowed<T>(_: &App, req: &Request<T>, need: Role) -> Result<Role, Status> {
     }
 }
 
-/// Who a call is, from its `authorization`: a token, or a user's token or session (`Bearer`:
-/// `users::who`); or a name and password (`Basic`: what ADBC's and pyarrow's handshakes send). With
-/// nothing that needs a sign-in, anyone is an admin. A wrong password is an error, said at once.
+/// Who a call is, from its `authorization`: a token, or a user's token or session (`Bearer`: `users::who`); or a name and
+/// password (`Basic`: what ADBC's and pyarrow's handshakes send), a token as the password whatever the name. Signed in as
+/// every door signs in (`signin::Attempt`: the lock, the count, 400 ms, the audit). With nothing sent, or on a node
+/// nothing locks, nothing is refused: anyone is the open node's admin, else no one (`Gate` refuses what needs a sign-in).
+/// A credential sent that signs nobody in is refused, a Bearer's too. A password crosses only TLS from another machine
+/// (`tls.rs`; no peer at all refuses one).
 async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, peer: Option<Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
-    if let Some(why) = credential.malformed() {
-        crate::audit::refused(app, "", "flight", from, "sign in", &why).await;
-        return Err(refused("28000", why));
-    }
-    let who = match &credential {
-        crate::auth::Credential::Password { user, password } => password_sign_in(app, user, password, peer).await?,
-        c => crate::users::who(&app.lake, &app.auth, c).await,
-    };
-    let who = match who {
-        Some(p) => p,
-        None if app.open().await => crate::auth::Principal::of(Role::Admin),
-        None => {
-            // (an identity provider's token says why it was refused, as HTTP's 401 does)
-            let why = match credential.token() {
-                Some(t) => crate::sso::why(&app.lake, t).await,
-                None => None,
-            };
-            if sent {
-                crate::audit::refused(app, "", "flight", from, "sign in", why.as_deref().unwrap_or("wrong token")).await;
-            }
-            if let Some(why) = why {
-                return Err(refused("28000", why));
-            }
-            crate::auth::Principal::of(Role::None)
+    if let crate::auth::Credential::Password { user, password } = &credential {
+        let token = crate::users::is_token(user, password) || app.auth.token_role(password) > Role::None;
+        if !token && !peer.is_some_and(|p| p.may_send_password()) && !app.open().await {
+            return Err(refused("28000", crate::tls::PASSWORD_PLAIN));
         }
+    }
+    let attempt = crate::signin::Attempt::at(app, "flight", from);
+    let who = match attempt.check(&credential).await {
+        crate::signin::Tried::Signed(p) => p,
+        crate::signin::Tried::Refused(r) => return Err(said_no(r)),
+        crate::signin::Tried::Nobody(_) if app.open().await => crate::auth::Principal::of(Role::Admin),
+        crate::signin::Tried::Nobody(_) if !sent => crate::auth::Principal::of(Role::None),
+        crate::signin::Tried::Nobody(why) => return Err(said_no(attempt.refuse(&credential, why).await)),
     };
     Ok(who.at("flight", from))
 }
 
-/// A name and password: a token as the password whatever the name, else a user's password (or
-/// `pt_` token), checked as every door checks one. A password crosses only TLS from another machine
-/// (`tls.rs`; no peer at all refuses one), and failed sign-ins are counted per address and name
-/// (`auth::guessing`), each costing 400 ms. None on a node nothing locks.
-async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<Peer>) -> Result<Option<crate::auth::Principal>, Status> {
-    let role = app.auth.token_role(password);
-    if role > Role::None {
-        return Ok(Some(crate::auth::Principal::token(role)));
-    }
-    if app.open().await {
-        return Ok(None);
-    }
-    let from = peer.map(|p| p.addr);
-    let ip = from.map(|a| a.ip());
-    let by_token = crate::users::is_token(user, password);
-    if !by_token && !peer.is_some_and(|p| p.may_send_password()) {
-        return Err(refused("28000", crate::tls::PASSWORD_PLAIN));
-    }
-    if let Some(wait) = crate::auth::guessing(&app.lake, ip, user) {
-        let why = crate::auth::guessing_says(user, wait);
-        crate::audit::refused(app, user, "flight", from, "sign in", &why).await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (as a wrong guess does)
-        return Err(refused("28000", why));
-    }
-    match crate::users::sign_in(&app.lake, &app.auth, user, password).await {
-        Some(p) if p.role > Role::None => Ok(Some(p)),
-        _ => {
-            if !by_token {
-                crate::auth::guessed(&app.lake, ip, user); // (a token isn't guessed: it is random)
-            }
-            // (a provider's refusal says why, 28000; a wrong password is 28P01, as Postgres says it)
-            let (code, why) = match if by_token { crate::sso::why(&app.lake, password).await } else { None } {
-                Some(why) => ("28000", why),
-                None => ("28P01", "wrong user name or password".to_string()),
-            };
-            crate::audit::refused(app, user, "flight", from, "sign in", &why).await;
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time, as HTTP's and Postgres's do)
-            Err(refused(code, why))
-        }
+/// A refused sign-in as Flight says it: 28P01 for a wrong name and password, as Postgres says it, else 28000.
+fn said_no(r: crate::signin::Refusal) -> Status {
+    match r.kind {
+        crate::signin::Kind::Password => refused("28P01", r.words),
+        _ => refused("28000", r.words),
     }
 }
 

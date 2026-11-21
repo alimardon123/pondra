@@ -187,6 +187,7 @@ core_statements engine
 connections catalog
 string_agg engine
 sys engine
+signin engine
 tasks engine
 temp engine
 tier engine

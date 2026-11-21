@@ -67,7 +67,7 @@ files -> auth  4
 files -> ext  1
 find -> measures  1
 flight -> server  1
-flight -> sso  3
+flight -> sso  1
 flight -> tls  4
 friendly -> pg_bytea  5
 front -> measures  3
@@ -85,7 +85,7 @@ inbox -> backup  1
 inbox -> write  1
 joined -> store  1
 kafka -> dial  5
-kafka -> sso  3
+kafka -> sso  1
 kafka -> tls  5
 kafka_client -> crypto  7
 kafka_client -> wasm32  2
@@ -159,7 +159,7 @@ optimize -> wasm32  1
 page -> wasm32  3
 page_records -> dial  4
 panics -> wasm32  3
-pg -> sso  6
+pg -> sso  5
 pg -> tls  6
 pg_json_sets -> measures  1
 protect -> apply  4
@@ -207,7 +207,7 @@ server -> origins  2
 server -> python  10
 server -> served  2
 server -> sharing  1
-server -> sso  4
+server -> sso  3
 server -> sso_flow  3
 server -> tls  12
 server -> udf  6
@@ -235,7 +235,7 @@ text -> pg_json_make  1
 tier -> dial  2
 types -> pg_casts  1
 udf -> wasm32  4
-users -> crypto  17
+users -> crypto  16
 users -> dial  1
 users -> shares  1
 users -> sso  12
