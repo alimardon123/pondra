@@ -173,6 +173,13 @@ async fn each<'a, T>(jobs: Vec<impl std::future::Future<Output = (&'a String, an
     done
 }
 
+/// Whether `error` is `sys::hide`'s EXCLUDE naming a column its table lacks: the query names a system column or `_deleted` as
+/// the session decides it (`mentioned::columns`), and the error's words name one too.
+fn excluded(query: &str, error: &str) -> bool {
+    let (system, deleted) = crate::mentioned::columns(query);
+    (system && crate::sys::mentioned(error)) || (deleted && crate::query::names_deleted(error))
+}
+
 impl App {
     pub fn log(&self) -> anyhow::Result<&Log> { self.log.as_deref().ok_or_else(|| anyhow::anyhow!("read-only node")) }
 
@@ -182,7 +189,7 @@ impl App {
         match self.query_as(&crate::sys::planned(query)?, spread, false, scope).await {
             // (`*` left as it is when `sys::hide`'s EXCLUDE names a column its table lacks: a
             // stored view's, say)
-            Err(e) if crate::query::handed().is_none() && [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false, scope).await, // (an answer half sent is never run again)
+            Err(e) if crate::query::handed().is_none() && excluded(query, &format!("{e:#}")) => self.query_as(&crate::asof::as_of(query)?, spread, false, scope).await, // (an answer half sent is never run again)
             r => r,
         }
     }

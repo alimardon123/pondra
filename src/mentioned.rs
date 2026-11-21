@@ -41,6 +41,20 @@ impl Mentioned {
         Some(Mentioned { tables, quoted: names.quoted, functions: names.functions, every: names.every, system_columns, deleted })
     }
 
+    /// What `sql` names, its statements' read as the engine reads them (`parsed::generic`, kept in the statement's context);
+    /// None for a text the parser doesn't take.
+    pub(crate) fn of_text(sql: &str, normalize: bool) -> Option<Mentioned> {
+        let mut all: Option<Mentioned> = None;
+        for s in crate::parsed::generic(sql).ok()? {
+            let m = Mentioned::of(sql, &DFStatement::Statement(Box::new(s)), normalize)?;
+            match &mut all {
+                Some(a) => a.union(m),
+                None => all = Some(m),
+            }
+        }
+        all
+    }
+
     /// `other`'s names added: a view's, or a temporary view's, the statement reads. `every` stays the statement's own.
     pub(crate) fn union(&mut self, other: Mentioned) {
         self.tables.extend(other.tables);
