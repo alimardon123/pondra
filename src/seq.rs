@@ -586,10 +586,57 @@ async fn may_move(lake: &Lake, name: &str, s: &Sequence, set: bool) -> Result<()
 }
 
 /// The tables a sequence's values go into: one whose identity column it numbers, or whose default takes from it
-/// (`nextval('name')`), as the catalog names them.
+/// (`nextval('name')`), as the catalog names them. Kept as tables are committed (`Takers`), so a `nextval` by a user not
+/// granted the owner table reads only the entries committed since the last one, not every table's (11-10 audit M4).
 async fn takers(lake: &Lake, name: &str) -> Result<Vec<String>> {
-    let takes = |c: &crate::store::Col| c.identity.as_ref().is_some_and(|i| i.sequence == name) || c.default.as_ref().is_some_and(|e| named(e).iter().any(|n| n == name));
-    Ok(lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(_, m)| m.list().columns.iter().any(takes)).map(|(k, _)| k[2..].to_string()).collect())
+    let kept = lake.state::<Takers>()?;
+    let mut by_table = kept.0.lock().await;
+    let read = async {
+        match lake.cat.written(TAKERS, crate::tier::SWEEP) {
+            Some(tables) => {
+                for t in tables {
+                    match lake.cat.meta(&crate::store::table_key(&t)).await?.map(|m| takes_from(&m)) {
+                        Some(of) if !of.is_empty() => by_table.insert(t, of),
+                        _ => by_table.remove(&t), // (dropped, renamed away, or takes from none)
+                    };
+                }
+            }
+            None => {
+                let all = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+                *by_table = all.into_iter().map(|(k, m)| (k[2..].to_string(), takes_from(&m))).filter(|(_, of)| !of.is_empty()).collect();
+            }
+        }
+        anyhow::Ok(())
+    };
+    if let Err(e) = read.await {
+        lake.cat.missed(TAKERS); // (its next call reads every table)
+        return Err(e);
+    }
+    let mut of: Vec<String> = by_table.iter().filter(|(_, of)| of.iter().any(|s| s == name)).map(|(t, _)| t.clone()).collect();
+    of.sort();
+    Ok(of)
+}
+
+/// The sequences a table takes values from: its identity columns' and those its defaults name.
+fn takes_from(m: &TableMeta) -> Vec<String> {
+    let columns = m.list().columns.iter();
+    let mut of: Vec<String> = columns.flat_map(|c| c.identity.iter().map(|i| i.sequence.clone()).chain(c.default.iter().flat_map(|e| named(e)))).collect();
+    of.sort();
+    of.dedup();
+    of
+}
+
+const TAKERS: &str = "sequence_takers";
+
+/// The sequences each table takes values from (`takes_from`), by table, kept up as tables are committed: a lake's state.
+#[derive(Default)]
+pub struct Takers(tokio::sync::Mutex<HashMap<String, Vec<String>>>);
+
+impl crate::lake_state::LakeState for Takers {
+    const NAME: &'static str = TAKERS;
+    const ABOUT: &'static str = "the sequences each table takes values from, kept up as tables are committed";
+
+    fn make() -> Self { Takers::default() }
 }
 
 /// `nextval`, `currval` and `setval` in a query's session. `currval` is the session's: the last
@@ -736,6 +783,35 @@ mod tests {
         }
         assert!(WHO.scope(admin.clone(), crate::auth::reading(async { crate::auth::current().is_some_and(|p| p.reads) })).await, "reading marks its caller");
         assert!(crate::auth::reading(async { crate::auth::current().is_none() }).await, "and makes no caller of none");
+        Ok(())
+    }
+
+    /// A sequence's takers follow the tables committed since the last ask, not a read of every table (11-10 audit M4): a
+    /// default given, taken away, or its table dropped is seen at the next ask.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sequences_takers_follow_the_commits() -> anyhow::Result<()> {
+        use crate::store::{json, table_key};
+        let dir = std::env::temp_dir().join(format!("pondra-takers-{}", uuid::Uuid::new_v4()));
+        let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        for t in ["a", "b"] {
+            crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
+        }
+        assert!(super::takers(&lake, "s").await?.is_empty(), "the first ask reads every table: none takes from s");
+        let takes = async |t: &str, s: Option<&str>| -> anyhow::Result<()> {
+            let mut m = (*lake.cat.meta(&table_key(t)).await?.expect("made")).clone();
+            m.set_default("x", s.map(|s| format!("nextval('{s}')")));
+            lake.cat.commit(vec![(table_key(t), json(&m))], &[]).await
+        };
+        takes("a", Some("s")).await?;
+        assert_eq!(super::takers(&lake, "s").await?, ["a"]);
+        takes("b", Some("s")).await?;
+        assert_eq!(super::takers(&lake, "s").await?, ["a", "b"]);
+        assert!(super::takers(&lake, "other").await?.is_empty(), "only the sequence named");
+        takes("a", None).await?;
+        assert_eq!(super::takers(&lake, "s").await?, ["b"], "a's default dropped");
+        lake.cat.commit(vec![], &[table_key("b")]).await?;
+        assert!(super::takers(&lake, "s").await?.is_empty(), "b dropped");
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }
