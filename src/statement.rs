@@ -292,10 +292,13 @@ async fn run_once<W: Wire>(app: &App, how: &How<'_>, one: &str, files: bool, sco
     let batches = {
         // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
         let _armed = wire.pieces(one).map(crate::query::arm);
-        match files {
-            true => app.query_as(&crate::sys::planned(one)?, Some("0"), true, scope).await?, // (a file here: this node only)
-            false => app.query(one, how.spread, scope).await?,
-        }
+        crate::app::answering(async {
+            match files {
+                true => app.query_as(&crate::sys::planned(one)?, Some("0"), true, scope).await, // (a file here: this node only)
+                false => app.query(one, how.spread, scope).await,
+            }
+        })
+        .await?
     };
     if crate::query::handed().is_some() {
         return Ok((None, Answer::Sent)); // (its answer went to the door in pieces as its plan made them)

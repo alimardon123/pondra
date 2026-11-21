@@ -866,7 +866,7 @@ impl Backend {
             None if c.columns.is_empty() => format!("SELECT * FROM {}", c.table),
             None => format!("SELECT {} FROM {}", c.columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", "), c.table),
         };
-        let batches = self.app.query(&sql, None, &self.who().scope).await.map_err(self.err())?;
+        let batches = crate::app::answering(self.app.query(&sql, None, &self.who().scope)).await.map_err(self.err())?; // (its rows are the answer)
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => self.schema(&sql, "").await?,
@@ -1011,9 +1011,9 @@ impl Backend {
             true => None, // (a cut answer says so each time it is asked: `answer::cut`)
             false => self.app.remembers(sql, &scope).await,
         };
-        let Some(version) = version else { return self.app.query(sql, None, &scope).await };
+        let Some(version) = version else { return crate::app::answering(self.app.query(sql, None, &scope)).await };
         let run = || async {
-            let batches = self.app.query(sql, None, &scope).await?;
+            let batches = crate::app::answering(self.app.query(sql, None, &scope)).await?;
             let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST {
                 true => Some(crate::answer::ipc(&batches)?.into()),
                 false => None, // (a big answer: `Results` keeps none past `Results::BIGGEST`, nor encodes it to find out)
