@@ -141,13 +141,13 @@ mod tests {
     /// kept as its parse (`text::text_kept`): the engine plans from that tree and parses the text no more (step 8, 9c).
     #[test]
     fn a_planned_text_is_kept_as_its_parse() {
-        for sql in ["SELECT *, _row_id FROM t", "SELECT * FROM t WHERE _deleted", "SELECT * FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym"] {
+        crate::context::sync_scope(|| for sql in ["SELECT *, _row_id FROM t", "SELECT * FROM t WHERE _deleted", "SELECT * FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym"] {
             let out = planned(sql).unwrap();
             assert_ne!(out, sql, "rewritten");
             let kept = crate::parsed::already(&out).unwrap_or_else(|| panic!("not kept: {out}"));
             let stmts = kept.as_ref().as_ref().unwrap();
             assert_eq!(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"), out, "kept as what it prints");
-        }
+        });
         assert!(matches!(planned("SELECT * FROM t").unwrap(), Cow::Borrowed(_)), "nothing to do: as written");
     }
 

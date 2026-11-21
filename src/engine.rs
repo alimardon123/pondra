@@ -530,6 +530,14 @@ fn parsed_query(sql: &str) -> Option<datafusion::sql::parser::Statement> {
     }
 }
 
+/// `sql` as `state`'s parser reads it, from the statement's own parse when its looks made one and `state` parses as they
+/// did (`parsed_query`, as `planned` takes it), so a look at what a query names (`query::named_records`) parses it no
+/// more. None: parsed by DataFusion here.
+pub(crate) fn kept_query(state: &datafusion::execution::SessionState, sql: &str) -> Option<datafusion::sql::parser::Statement> {
+    let options = &state.config().options().sql_parser;
+    (matches!(options.dialect, datafusion::config::Dialect::Generic) && options.recursion_limit.get() == LOOKS_DEPTH).then(|| parsed_query(sql)).flatten()
+}
+
 /// A planned statement run, as `sql_checked` runs it: the frame of its rows. A DDL statement takes effect here.
 pub async fn run(ctx: &SessionContext, plan: LogicalPlan) -> anyhow::Result<datafusion::dataframe::DataFrame> {
     Ok(text_unions(ctx.execute_logical_plan(plan).await?)?)
@@ -762,6 +770,7 @@ mod tests {
     /// texts. The parse is kept under the very text it was made of, so it is planned only for that text (`parsed::already`).
     #[tokio::test]
     async fn a_query_planned_from_the_fronts_parse_is_datafusions_plan() {
+        crate::context::scope(async {
         use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
         let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         let batch = RecordBatch::try_from_iter(vec![("x", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap();
@@ -820,12 +829,14 @@ mod tests {
             planned(&ctx, sql).await.unwrap().display_indent_schema().to_string(),
             state.create_logical_plan(sql).await.unwrap().display_indent_schema().to_string()
         );
+        }).await // (one statement: the front's parse is kept in its context)
     }
 
     /// A session that parses otherwise than the front's looks (another dialect, another depth) plans each text from its
     /// own parse, even with the front's parse of that text at hand: `planned` takes the kept parse only as the looks parse.
     #[tokio::test]
     async fn a_session_that_parses_otherwise_plans_from_the_text() {
+        crate::context::scope(async {
         use datafusion::config::Dialect;
         let with = |set: &dyn Fn(&mut SessionConfig)| {
             let mut config = SessionConfig::new();
@@ -852,6 +863,7 @@ mod tests {
         assert!(crate::parsed::generic(&sql).is_ok());
         let plan = planned(&generic, &sql).await.unwrap();
         assert_eq!(plan, generic.state().create_logical_plan(&sql).await.unwrap());
+        }).await // (one statement: the front's parse is kept in its context)
     }
 
     /// A tree the front rewrote is kept as the parse of the text it prints to (`text::text_kept`), so the engine plans it
@@ -859,6 +871,7 @@ mod tests {
     /// the same plan. A tree printed with a fix for the reader (a doubled minus) parses back to another tree: not kept.
     #[tokio::test]
     async fn a_tree_the_front_rewrote_is_planned_from_itself() {
+        crate::context::scope(async {
         use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
         let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
         let batch = RecordBatch::try_from_iter(vec![("x", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap();
@@ -892,6 +905,7 @@ mod tests {
         assert_eq!(text, "SELECT -(-3) AS v FROM t");
         assert!(crate::parsed::already(&text).is_none(), "not kept: {text}");
         assert_eq!(planned(&ctx, &text).await.unwrap(), state.create_logical_plan(&text).await.unwrap());
+        }).await // (one statement: the front's parse is kept in its context)
     }
 
     /// `EXPLAIN ANALYZE` is answered by `collect` (`analyzed`, this file's copy of DataFusion's `create_output_batch`) and

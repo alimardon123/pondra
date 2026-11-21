@@ -696,7 +696,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job, scope: &crate:
 /// A job's rows as files, one a partition.
 async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<RecordBatch>, keys: &[String], ord: u64, whole: bool) -> Result<Vec<DataFile>> {
     let parts = match &meta.partition {
-        Some(spec) => crate::partition::split(spec, batches).await?,
+        Some(spec) => crate::partition::split(spec, held(Some(meta), batches)?).await?,
         None => vec![(String::new(), batches)],
     };
     let mut files = vec![];
@@ -1414,8 +1414,20 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
     Ok(files)
 }
 
+/// `batches` with each column of a type whose storage isn't its text marked as that type (`column_types::parsing`), so
+/// `partition::split` names a part by the value as the type shows it: an INET's address, never its 16 bytes. The files
+/// keep no Arrow schema (`plain`), so they are written as before.
+fn held(meta: Option<&TableMeta>, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    let Some(meta) = meta else { return Ok(batches) };
+    batches.into_iter().map(|b| {
+        let schema = crate::column_types::parsing(b.schema(), |n| meta.held_of(n));
+        Ok(if std::sync::Arc::ptr_eq(&schema, &b.schema()) { b } else { b.with_schema(schema)? })
+    }).collect()
+}
+
 /// `write_stream` for a partitioned table: `chunk` rows at a time, split by partition value.
 async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, chunk: usize, keys: &[String], spec: &str) -> Result<Vec<DataFile>> {
+    let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?; // (its held types: `held`)
     let (mut files, mut pending, mut n) = (vec![], vec![], 0);
     loop {
         let batch = stream.next().await.transpose()?;
@@ -1425,7 +1437,7 @@ async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatc
             pending.push(b);
         }
         if n >= chunk || (end && n > 0) {
-            for (part, batches) in crate::partition::split(spec, std::mem::take(&mut pending)).await? {
+            for (part, batches) in crate::partition::split(spec, held(meta.as_ref(), std::mem::take(&mut pending))?).await? {
                 files.extend(write_file(lake, table, &batches, keys).await?.map(|f| DataFile { part, ..f }));
             }
             n = 0;

@@ -154,15 +154,39 @@ pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch
         }
         return Ok(None);
     }
+    let found = holders(lake, table, keys, lake.visible(), " LIMIT 1").await?;
+    Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
+}
+
+/// Which rows of `rows` a live row of `table` holds the `on` columns of (as SQL names them), as of `upto`: an upsert's whose
+/// writer a filter on the table's rows holds asks it of the rows its MERGE inserts, whose keys no row it reads holds
+/// (`change::merge`). A row NULL in one of them is held by none: NULLs never conflict.
+pub async fn held_of(lake: &Lake, table: &str, rows: &RecordBatch, on: &[String], upto: u64) -> Result<datafusion::arrow::array::BooleanArray> {
+    let columns = on.iter().map(|c| Ok((c.as_str(), rows.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))?))).collect::<Result<Vec<_>>>()?;
+    let keys = RecordBatch::try_from_iter(columns)?;
+    if keys.num_rows() == 0 {
+        return Ok(datafusion::arrow::array::BooleanArray::from(Vec::<bool>::new()));
+    }
+    let found = holders(lake, table, &keys, upto, "").await?;
+    let found = match found.first() {
+        Some(f) => datafusion::arrow::compute::concat_batches(&f.schema(), &found)?,
+        None => return Ok(datafusion::arrow::array::BooleanArray::from(vec![false; keys.num_rows()])),
+    };
+    // (the join's rows hold no NULL: `=` matches none)
+    Ok(datafusion::arrow::compute::not(&absent(&keys, &found, on)?)?)
+}
+
+/// The rows of `table` as of `upto` that hold one of `keys` (columns as SQL names them, one row per key), in one query, the
+/// keys as a table of their own, so the files' key ranges prune; `limit` ends it. The leader's check: every row, granted or not.
+async fn holders(lake: &Lake, table: &str, keys: &RecordBatch, upto: u64, limit: &str) -> Result<Vec<RecordBatch>> {
     let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
     let names: Vec<String> = keys.schema().fields().iter().map(|f| f.name().clone()).collect();
     let cols = names.iter().map(|c| format!("t.{}", q(c))).collect::<Vec<_>>().join(", ");
     let on = names.iter().map(|c| format!("t.{0} = n.{0}", q(c))).collect::<Vec<_>>().join(" AND ");
-    let sql = format!("SELECT {cols} FROM {} AS t JOIN __pondra_keys AS n ON {on} LIMIT 1", crate::write::sql_name(table));
-    let ctx = crate::query::session_for(lake, &sql, "", Some(lake.visible()), &crate::auth::Principal::node().scope).await?; // (the leader's check: every row, granted or not)
+    let sql = format!("SELECT {cols} FROM {} AS t JOIN __pondra_keys AS n ON {on}{limit}", crate::write::sql_name(table));
+    let ctx = crate::query::session_for(lake, &sql, "", Some(upto), &crate::auth::Principal::node().scope).await?;
     ctx.register_batch("__pondra_keys", keys.clone())?;
-    let found = crate::engine::sql(&ctx, &sql).await?.collect().await?;
-    Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
+    Ok(crate::engine::sql(&ctx, &sql).await?.collect().await?)
 }
 
 /// The types `serve::lookup_versioned` turns a key's text back into.

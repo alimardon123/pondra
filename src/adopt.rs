@@ -119,7 +119,12 @@ async fn partition(md: &datafusion::parquet::file::metadata::ParquetMetaData, sc
             _ => anyhow::bail!("{path}: it holds rows of more than one partition ({spec}: {name} null and not); the table's partition spec, as it publishes it, puts each in a file of its own"),
         };
         values.push(datafusion::arrow::compute::cast(&ScalarValue::iter_to_array([lo, hi])?, &t)?);
-        fields.push(Field::new(col, t, true));
+        // (marked as its type, so the part is the value as the type shows it: an INET's address, `partition::split`)
+        let out = Field::new(col, t, true);
+        fields.push(match meta.held_of(col).and_then(crate::column_types::named) {
+            Some(held) => crate::column_types::mark(out, held),
+            None => out,
+        });
     }
     let batch = datafusion::arrow::array::RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), values)?;
     let parts: Vec<String> = crate::partition::split(spec, vec![batch]).await?.into_iter().map(|(p, _)| p).collect();
