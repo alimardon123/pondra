@@ -241,18 +241,17 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>
 }
 
 /// A staged create's table as the catalog answers it before it is made (`create`): the request's schema with the field ids
-/// Pondra's table will give it (its columns 1…n in order, a list's elements after them: `iceberg::fields`), its partition
+/// Pondra's table will give it (its columns 1…n in order, a list's elements `column::ELEMENTS` past their column's: `iceberg::fields`), its partition
 /// spec and write order on those ids, no snapshot. The engine writes its files with these ids, so they read as the table's.
 fn staged(location: &str, asked: &Value) -> Value {
     let fields = asked["schema"]["fields"].as_array().cloned().unwrap_or_default();
-    let n = fields.len() as i64;
     let ids: std::collections::HashMap<i64, i64> = fields.iter().enumerate().filter_map(|(i, f)| Some((f["id"].as_i64()?, i as i64 + 1))).collect();
     let id = |v: &Value| v.as_i64().and_then(|i| ids.get(&i)).copied().map_or(Value::Null, Value::from);
     let fields: Vec<Value> = fields.into_iter().enumerate().map(|(i, mut f)| {
         let own = i as i64 + 1;
         f["id"] = own.into();
         if f["type"]["type"] == "list" {
-            f["type"]["element-id"] = (n + own).into();
+            f["type"]["element-id"] = (crate::column::ELEMENTS as i64 + own).into();
         }
         f
     }).collect();
@@ -372,13 +371,12 @@ fn replacement(table: &str, asked: &Value, meta: &Value, publish: &str) -> Value
     })
 }
 
-/// Are a schema's field ids those Pondra gives a new table's columns (1…n in order, a list's elements after them)? Then the
+/// Are a schema's field ids those Pondra gives a new table's columns (1…n in order, a list's elements `column::ELEMENTS` past their column's)? Then the
 /// engine's files can be the table's as written; otherwise they're copied by name (`prepare_as`), since a file's columns are
 /// matched by field id first.
 fn aligned(schema: &Value) -> bool {
     let fields = schema["fields"].as_array().cloned().unwrap_or_default();
-    let n = fields.len() as i64;
-    fields.iter().enumerate().all(|(i, f)| f["id"] == i as i64 + 1 && (f["type"]["type"] != "list" || f["type"]["element-id"] == n + i as i64 + 1))
+    fields.iter().enumerate().all(|(i, f)| f["id"] == i as i64 + 1 && (f["type"]["type"] != "list" || f["type"]["element-id"] == crate::column::ELEMENTS as i64 + i as i64 + 1))
 }
 
 /// A replace through the catalog, as Pondra's CREATE OR REPLACE TABLE of what it makes current: the new table filled with the

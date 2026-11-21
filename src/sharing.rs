@@ -358,7 +358,19 @@ async fn partitions(app: &App, t: &Shared) -> anyhow::Result<HashMap<String, Str
     for m in crate::manifest::list(&app.lake, &meta).await? {
         all.extend(crate::manifest::files(&app.lake, &m).await?);
     }
-    Ok(all.into_iter().map(|f| (f.path, f.part)).collect())
+    // (a share takes partitions of a table partitioned by one column, before any ALTER of its partition_by: `shares::partitions_of`,
+    // so spec 0's; a file split by a later spec is in them by that column's value under its own, and left out if it has none)
+    let first = if meta.spec == 0 { meta.partition.clone() } else { meta.specs.get(&0).cloned() };
+    let column = first.and_then(|p| crate::partition::Spec::parse(&p).ok()).and_then(|s| match &s.fields[..] {
+        [f] if f.transform == crate::partition::Transform::Identity => Some(f.column.clone()),
+        _ => None,
+    });
+    Ok(all.into_iter().filter_map(|f| {
+        let spec = crate::partition::Spec::parse(meta.spec_of(&f)?).ok()?;
+        let i = spec.fields.iter().position(|s| s.transform == crate::partition::Transform::Identity && Some(&s.column) == column.as_ref())?;
+        let value = crate::partition::values(&f.part, spec.fields.len()).into_iter().nth(i)?;
+        Some((f.path, value))
+    }).collect())
 }
 
 /// What a lake keeps for its door's recipients (invariant 301): the links each was given this minute, by recipient (`quota`).

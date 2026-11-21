@@ -333,7 +333,9 @@ where marked.
 - **Pondra's own files written without a leader** (`pondra sql`, the inbox) now take lineage when
   they are recorded instead of being rewritten with their system columns. *(Decided by Claude: one
   rule for every file that doesn't hold them.)*
-- **Layout published** (`iceberg::Layout`): `partition_by` as partition spec 1 — identity (of an
+- **Layout published** (`iceberg::Layout`): `partition_by` as partition spec 1 (our spec k as k + 1,
+  once `ALTER TABLE … SET (partition_by = …)` changed it: every spec listed, a field again keeping its
+  id, each manifest one spec's files; step 5 I3-d) — identity (of an
   integer, string, boolean, date or timestamp), or year, month, day or hour — each manifest entry
   with its file's partition record; spec 0, no partitions, stays in the metadata for manifests
   written before. *(Decided by Claude: a new spec id rather than changing spec 0, so no manifest

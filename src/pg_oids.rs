@@ -16,6 +16,9 @@ pub struct PgType(pub u32, pub &'static str, pub &'static str, pub i16, pub char
 pub const VECTOR: u32 = 2_100_000_001;
 pub const VECTORS: u32 = 2_100_000_002;
 
+/// Postgres's `inet`: an INET column (`column_types::inet`) is sent as one.
+pub const INET: u32 = 869;
+
 /// A type's schema: pg_catalog's (11), or public's (2200) for pgvector's.
 pub fn schema(oid: u32) -> u32 { if oid == VECTOR || oid == VECTORS { 2200 } else { 11 } }
 
@@ -31,6 +34,7 @@ pub const TYPES: &[PgType] = &[
     PgType(1700, "numeric", "numeric", -1, 'N', 1231), PgType(2205, "regclass", "regclass", 4, 'N', 2210), PgType(2206, "regtype", "regtype", 4, 'N', 2211),
     PgType(2950, "uuid", "uuid", 16, 'U', 2951), PgType(3802, "jsonb", "jsonb", -1, 'U', 3807), PgType(2278, "void", "void", 4, 'P', 0),
     PgType(2249, "record", "record", -1, 'P', 2287), PgType(1560, "bit", "bit", -1, 'V', 1561), PgType(VECTOR, "vector", "vector", -1, 'U', VECTORS),
+    PgType(INET, "inet", "inet", -1, 'I', 1041),
 ];
 
 pub fn arrays() -> impl Iterator<Item = (u32, String, String, u32)> {

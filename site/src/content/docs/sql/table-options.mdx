@@ -42,8 +42,13 @@ Each clause is also an option, for tools that write options: `partition_by = 'da
 Change a table's layout later with `ALTER TABLE t CLUSTER BY (a, b)`, `ALTER TABLE t TTL seen +
 INTERVAL '2 hours'` and `ALTER TABLE t SEQUENCE BY seen`, and its options with `ALTER TABLE t SET
 (publish = iceberg, retention = '30 days')`. Files written from then on follow them, and files
-written before keep their order until they are merged. `PARTITION BY` can't change, because each
-file holds one partition, and `MERGE` can't change either.
+written before keep their order until they are merged. An append table's `PARTITION BY` changes the
+same way: `ALTER TABLE t SET (partition_by = 'month(ts), bucket(16, id)')`, or `''` for none, splits
+the files written from then on, and each file written before keeps the spec it was split by, which
+its reads prune by. Small files of an earlier spec are split by the new one as they merge. A published
+table lists every spec in its Iceberg metadata, each file under its own, so other engines read and
+prune it too. A column of an earlier spec can't be dropped or change type. A keyed table's
+`PARTITION BY` can't change, and `MERGE` can't change either.
 
 ### Append table
 
@@ -118,7 +123,8 @@ What Pondra refuses:
 | `TTL ts + INTERVAL '1 month'` | `an interval in seconds, minutes, hours, days or weeks, not "month" ("1 month")` |
 | `SEQUENCE BY` a key column | `SEQUENCE BY: a column of the table, not its key` |
 | `PARTITION BY` and `partition_by` both | `CREATE TABLE: partition_by is given twice, as a clause and in WITH (…)` |
-| `ALTER TABLE t SET (partition_by = …)` | `PARTITION BY can't change: each of t's files holds one partition` |
+| `ALTER TABLE t SET (partition_by = …)` on a keyed table | `t has a key: its partition_by can't change (an append table's can), …` (`0A000`) |
+| `ALTER TABLE t DROP COLUMN c`, `c` in `partition_by` now or before | `c is t's partition_by column: it stays` (`0A000`) |
 | `retention = 'soon'` | `retention: a time such as '7 days', '12 hours' or '0 seconds', not "soon"` |
 
 ## Materialized views

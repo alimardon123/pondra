@@ -90,6 +90,15 @@ impl Spec {
     }
 }
 
+/// `text` with its columns named by `name` (stored names to SQL's), as written: `day(ts), bucket(16, id)`. A text that
+/// doesn't parse comes back as it is.
+pub fn renamed(text: &str, name: impl Fn(&str) -> String) -> String {
+    match Spec::parse(text) {
+        Ok(s) => s.fields.into_iter().map(|f| text_of(&Field { column: name(&f.column), ..f })).collect::<Vec<_>>().join(", "),
+        Err(_) => text.to_string(),
+    }
+}
+
 fn field(text: &str) -> Result<Field> {
     let unquote = |c: &str| c.trim().trim_matches('"').to_string();
     let Some((name, rest)) = text.split_once('(') else {
@@ -147,6 +156,14 @@ fn part(values: &[&str]) -> String {
     }
 }
 
+/// A part's values, one a field of a spec of `n`: `part` read back.
+pub fn values(part: &str, n: usize) -> Vec<String> {
+    match n {
+        1 => vec![part.to_string()],
+        _ => part.split('/').map(|v| v.replace("%2F", "/").replace("%25", "%")).collect(),
+    }
+}
+
 /// A partitioned table's rows, one group per part (`day(ts)`: the day, `col`: the value).
 pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
     let Some(first) = batches.first() else { return Ok(vec![]) };
@@ -157,10 +174,18 @@ pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String,
     ctx.register_batch("t", all.clone())?;
     let exprs = spec.fields.iter().map(|f| Ok(expr(f, all.schema().field_with_name(&f.column)?.data_type()))).collect::<Result<Vec<_>>>()?;
     let values = ctx.sql(&format!("SELECT {} FROM t", exprs.join(", "))).await?.collect().await?;
+    // (a value whose storage isn't its text, an INET's 16 bytes, is its part as its type shows it: `column_types::show_of`)
+    let shows: Vec<_> = spec.fields.iter().map(|f| match f.transform {
+        Transform::Identity => all.schema().field_with_name(&f.column).ok().and_then(crate::column_types::show_of),
+        _ => None,
+    }).collect();
     let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     let mut i = 0u32;
     for b in &values {
-        let texts = b.columns().iter().map(|c| cast(c, &DataType::Utf8)).collect::<Result<Vec<_>, _>>()?;
+        let texts = b.columns().iter().zip(&shows).map(|(c, show)| match show {
+            Some(show) => show(c),
+            None => Ok(cast(c, &DataType::Utf8)?),
+        }).collect::<Result<Vec<_>>>()?;
         for row in 0..b.num_rows() {
             let each: Vec<&str> = texts.iter().map(|t| { let t = t.as_string::<i32>(); if t.is_null(row) { "null" } else { t.value(row) } }).collect();
             groups.entry(part(&each)).or_default().push(i);
@@ -176,7 +201,7 @@ pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String,
 /// stored column's name as the filters and `schema` say it. None: nothing to skip.
 pub fn wanted(spec: &str, filters: &[Expr], name: impl Fn(&str) -> Option<String>, schema: &Schema) -> Option<Box<dyn Fn(&str) -> bool + Send + Sync>> {
     let spec = Spec::parse(spec).ok()?;
-    let many = spec.fields.len() > 1;
+    let n = spec.fields.len();
     let mut need: Vec<(usize, HashSet<String>)> = vec![];
     for (i, f) in spec.fields.iter().enumerate() {
         let Transform::Bucket(n) = f.transform else { continue };
@@ -188,10 +213,7 @@ pub fn wanted(spec: &str, filters: &[Expr], name: impl Fn(&str) -> Option<String
     }
     (!need.is_empty()).then(move || -> Box<dyn Fn(&str) -> bool + Send + Sync> {
         Box::new(move |part: &str| {
-            let values: Vec<String> = match many {
-                true => part.split('/').map(|v| v.replace("%2F", "/").replace("%25", "%")).collect(),
-                false => vec![part.to_string()],
-            };
+            let values = values(part, n);
             need.iter().all(|(i, set)| values.get(*i).is_none_or(|v| set.contains(v)))
         })
     })
@@ -347,5 +369,17 @@ mod tests {
         let p = parts("bucket(4, id)").await;
         assert_eq!(p.iter().map(|(_, n)| n).sum::<usize>(), 4);
         assert!(p.iter().all(|(b, _)| b == "null" || b.parse::<i32>().is_ok_and(|b| (0..4).contains(&b))));
+    }
+
+    /// An INET column's part is its address as the type shows it, never its 16 bytes cast to text (which Arrow refuses).
+    #[tokio::test]
+    async fn an_inet_column_splits_by_its_address() {
+        use datafusion::arrow::datatypes::{Field as F, Schema};
+        let field = crate::column_types::mark(F::new("ip", DataType::FixedSizeBinary(16), true), &crate::column_types::INET);
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some("10.0.0.1"), Some("2001:db8::1"), None, Some("10.0.0.1")]));
+        let ip = crate::column_types::parsed(&text, &field).expect("a type with parse").unwrap();
+        let b = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![ip]).unwrap();
+        let parts = split("ip", vec![b]).await.unwrap().into_iter().map(|(p, r)| (p, r[0].num_rows())).collect::<Vec<_>>();
+        assert_eq!(parts, [("10.0.0.1".into(), 2), ("2001:db8::1".into(), 1), ("null".into(), 1)]);
     }
 }
