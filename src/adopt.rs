@@ -18,8 +18,35 @@ use futures::{StreamExt, TryStreamExt};
 /// columns: Delta readers match a file's columns by name, and the table's files keep the stored
 /// names (ADR-022). Those appends are copied, as round 25 did. A partitioned table's files must
 /// each hold one partition value, which a writer does when the table publishes its spec
-/// (`iceberg::Layout`). (A keyed table's: not yet.)
-pub fn fits_as_written(meta: &TableMeta) -> bool { !meta.mapped() && meta.key.is_empty() && crate::iceberg::Layout::followable(meta) }
+/// (`iceberg::Layout`). Not a bucketed table's (`bucket(n, c)`): a file's footer gives its column's range, which says its
+/// day or its truncated value but not its bucket, so those appends are copied too, split as the table's own writes are
+/// (audit 11-21 M1). (A keyed table's: not yet.)
+pub fn fits_as_written(meta: &TableMeta) -> bool { !meta.mapped() && meta.key.is_empty() && crate::iceberg::Layout::followable(meta) && !bucketed(meta) }
+
+/// Is a field of the table's partition spec a bucket?
+fn bucketed(meta: &TableMeta) -> bool {
+    let spec = meta.partition.as_deref().and_then(|p| crate::partition::Spec::parse(p).ok());
+    spec.is_some_and(|s| s.fields.iter().any(|f| matches!(f.transform, crate::partition::Transform::Bucket(_))))
+}
+
+#[cfg(test)]
+mod as_written_tests {
+    use super::*;
+
+    /// A day's or a truncated value's file is taken as written, its part from its footer's range; a bucket's is copied,
+    /// since no range says its bucket (audit 11-21 M1: a PyIceberg append to a bucketed table was refused).
+    #[test]
+    fn a_bucketed_tables_appends_are_copied() {
+        let made = |spec: &str| {
+            let columns = vec![("id".into(), "Int64".into()), ("ts".into(), "Timestamp(Microsecond, None)".into())];
+            let mut meta = TableMeta::made(crate::store::Made { columns, ..Default::default() });
+            meta.partition = Some(spec.into());
+            meta
+        };
+        assert!(fits_as_written(&made("day(ts)")) && fits_as_written(&made("truncate(10, id), day(ts)")));
+        assert!(!fits_as_written(&made("bucket(4, id)")) && !fits_as_written(&made("day(ts), bucket(16, id)")));
+    }
+}
 
 /// The files' footers, read once each (a ranged read), checked against the manifest's counts and
 /// the table's columns (a column's type as the table's; a NOT NULL column never NULL), and their
