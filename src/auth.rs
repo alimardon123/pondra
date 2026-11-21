@@ -728,15 +728,6 @@ impl Credential {
         }
     }
 
-    /// The secret itself: a token, or a password (which may be a token).
-    pub fn secret(&self) -> Option<&str> {
-        match self {
-            Credential::Token(t) => Some(t),
-            Credential::Password { password, .. } => Some(password),
-            _ => None,
-        }
-    }
-
     /// What a door answers it when it can't be read (`MALFORMED`, and why).
     pub fn malformed(&self) -> Option<String> {
         match self {

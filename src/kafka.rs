@@ -343,8 +343,8 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
     Ok(w)
 }
 
-/// SASL/PLAIN: "\0user\0password": a user and its password (or one of its tokens), or a role's
-/// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`). As on HTTP, a password crosses
+/// SASL/PLAIN: "\0user\0password": a user and its password, or any name and a token, which signs in the
+/// token's principal (`signin::Attempt`, as every door signs in). As on HTTP, a password crosses
 /// only TLS from another machine, a token may under `PONDRA_TLS=optional` (`tls::may_send_password`), and
 /// past ten failures a minute for a user from one address, that pair is refused (`auth::guessing`).
 async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
@@ -356,58 +356,34 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
         Some(token) => crate::auth::Credential::Token(token),
         None => crate::auth::Credential::of_sasl_plain(&auth),
     };
-    let (mut user, password) = match &credential {
+    let (user, password) = match &credential {
         crate::auth::Credential::Password { user, password } => (user.clone(), password.clone()),
         _ => (String::new(), String::new()),
     };
-    let ip = Some(peer.addr.ip());
-    let refused = if let Some(why) = credential.malformed() {
-        Some(why) // (never taken for no sign-in, an open node's included)
-    } else if app.open().await {
+    // (one sign-in at every door, `signin::Attempt`: the lock, whom it signs in, the count, 400 ms and the audit line. An open
+    // node takes anyone, but never a credential that can't be read; a password crosses only TLS from another machine)
+    let attempt = crate::signin::Attempt::at(app, "kafka", who.from);
+    let open = credential.malformed().is_none() && app.open().await;
+    let refused = if open {
         *who = made(crate::auth::Principal::of(Role::Admin)).at("kafka", who.from);
         *said = Some(Said::Open);
         None
-    } else if let Some(token) = credential.token() {
-        // (a bearer token, as HTTP takes one: an identity provider's, or Pondra's own; never a guess)
-        match crate::users::who(&app.lake, &app.auth, &credential).await {
-            Some(p) => {
-                user = p.name.clone();
-                *who = made(p).at("kafka", who.from);
-                *said = Some(Said::Bearer(token.to_string()));
-                None
-            }
-            None => Some(crate::sso::why(&app.lake, token).await.unwrap_or_else(|| "wrong token".to_string())),
-        }
-    } else if !peer.may_send_password() && !crate::users::is_token(&user, &password) {
+    } else if credential.user().is_some() && !peer.may_send_password() && !crate::users::is_token(&user, &password) && app.auth.token_role(&password) == Role::None {
+        crate::audit::refused(app, &user, "kafka", who.from, "sign in", PASSWORD_PLAIN).await; // (not a guess: no pause)
         Some(PASSWORD_PLAIN.to_string())
-    } else if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
-        Some(crate::auth::guessing_says(&user, wait))
     } else {
-        match crate::users::sign_in(&app.lake, &app.auth, &user, &password).await {
-            Some(p) => {
+        match attempt.sign_in(&credential).await {
+            Ok(p) => {
+                *said = Some(match credential.token() {
+                    Some(token) => Said::Bearer(token.to_string()),
+                    None => Said::Plain(user.clone(), password.clone()),
+                });
                 *who = made(p).at("kafka", who.from);
-                *said = Some(Said::Plain(user.clone(), password.clone()));
                 None
             }
-            None => {
-                let by_token = crate::users::is_token(&user, &password);
-                if !by_token {
-                    crate::auth::guessed(&app.lake, ip, &user); // (a token isn't guessed: it is random, as on HTTP and Postgres)
-                }
-                let why = match by_token {
-                    true => crate::sso::why(&app.lake, &password).await, // (an identity provider's says why)
-                    false => None,
-                };
-                Some(why.unwrap_or_else(|| "wrong user name or password".to_string()))
-            }
+            Err(r) => Some(r.words),
         }
     };
-    if let Some(why) = &refused {
-        crate::audit::refused(app, &user, "kafka", who.from, "sign in", why).await;
-        if why != PASSWORD_PLAIN {
-            tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time, as on HTTP)
-        }
-    }
     let mut w = vec![];
     w.put_i16(if refused.is_none() { 0 } else { SASL_FAILED });
     put_nstr(&mut w, refused.as_deref());

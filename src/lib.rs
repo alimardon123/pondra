@@ -294,6 +294,7 @@ mod table_record;
 #[cfg(feature = "lake")] mod store_wire;
 #[cfg(feature = "doors")] mod sync;
 #[cfg(feature = "lake")] mod sys;
+#[cfg(feature = "lake")] mod signin;
 #[cfg(feature = "lake")] mod tasks;
 #[cfg(feature = "lake")] mod temp;
 #[cfg(feature = "lake")] mod terms;

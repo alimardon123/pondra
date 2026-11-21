@@ -72,7 +72,7 @@ impl Door {
             return None;
         }
         let (app, session) = (&self.app, format!("pg-{}", uuid::Uuid::new_v4().simple()));
-        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: self.parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), copy: Default::default(), me: me.clone(), parsed: Default::default(), forget: Default::default() });
+        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: self.parser.clone(), session: session.clone(), who: Default::default(), again: Default::default(), named: Default::default(), copy: Default::default(), me: me.clone(), parsed: Default::default(), forget: Default::default() });
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: self.cancels.clone(), peer };
         Some((Arc::new(Pg(backend, Arc::new(startup), self.cancel.clone())), session))
     }
@@ -127,6 +127,7 @@ struct Backend {
     session: String,
     who: std::sync::Mutex<Option<crate::auth::Principal>>, // (whoever signed in)
     again: std::sync::Mutex<Option<Again>>,                // (how that sign-in is checked again: `signed`)
+    named: std::sync::Mutex<Option<String>>,               // (the principal's name, when a token signed it in: `user_of`)
     copy: std::sync::Mutex<Option<Pending>>,               // (its COPY FROM STDIN under way: the connection's own, so its bytes end with it)
     me: std::sync::Weak<Backend>,                          // (a statement runs on the queries' runtime: `told`)
     parsed: std::sync::Mutex<std::collections::HashSet<String>>, // (the names its Parses gave, which pgwire's store can't list: `forgotten`)
@@ -259,6 +260,16 @@ fn startup_options(options: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 /// A sign-in refused outright: FATAL, SQLSTATE 28000, with why (the connection ends with it).
+/// A refused sign-in as Postgres says it (`signin::Refusal`): a wrong password in pgwire's own words (28P01), a token
+/// that signs nobody in with why (28P01), a name locked out or a message that can't be read 28000.
+fn said_no(user: &str, r: crate::signin::Refusal) -> PgWireError {
+    match r.kind {
+        crate::signin::Kind::Password => PgWireError::InvalidPassword(user.to_string()),
+        crate::signin::Kind::Token => PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{user}\": {}", r.words)))),
+        crate::signin::Kind::Locked(_) | crate::signin::Kind::Malformed => fatal(r.words),
+    }
+}
+
 fn fatal(why: String) -> PgWireError { PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28000".into(), why))) }
 
 /// A sign-in refused for its failures from this address (`auth::guessing`), the right password too: it is
@@ -352,6 +363,8 @@ impl Startup {
             None => format!("{user} signs in with a token from the identity provider ({discovery})"),
             Some(token) => match crate::users::sign_in(&app.lake, &app.auth, &user, &token).await {
                 Some(who) => {
+                    // (a token signs in its own principal under any name, as at every door: the audit names both)
+                    crate::audit::signed_as(app, &who.name, &user, "postgres", from, from.map(|a| a.ip()));
                     let again = Again::Token { user: user.clone(), token: token.to_string() };
                     self.backend.signed_in(who.at("postgres", from), Some(again));
                     return self.ready(client).await;
@@ -425,25 +438,16 @@ impl StartupHandler for Startup {
             PgWireFrontendMessage::PasswordMessageFamily(m) if *self.plain.lock().await => {
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
                 let password = m.into_password()?.password;
-                let token = crate::users::is_token(&user, &password);
+                let token = crate::users::is_token(&user, &password) || app.auth.token_role(&password) > crate::auth::Role::None;
                 // (a user's password crosses only TLS from another machine; a token may, as `tls.rs` says)
                 if !token && !crate::tls::may_send_password(secure, at) {
                     return Err(fatal(crate::tls::PASSWORD_PLAIN.into()));
                 }
-                if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
-                    return Err(guessing_refused(app, &user, from, wait).await);
-                }
-                let Some(who) = crate::users::sign_in(&app.lake, &app.auth, &user, &password).await else {
-                    if !token {
-                        crate::auth::guessed(&app.lake, ip, &user); // (a token isn't guessed: it is random)
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    if let Some(why) = crate::sso::why(&app.lake, &password).await {
-                        // (an identity provider's token says why it was refused, as HTTP's 401 does)
-                        crate::audit::refused(app, &user, "postgres", from, "sign in", &why).await;
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{user}\": {why}")))));
-                    }
-                    return Err(wrong(&user).await);
+                // (signed in as at every door, `signin::Attempt`: the lock, whom it signs in, the count, 400 ms, the audit)
+                let credential = crate::auth::Credential::Password { user: user.clone(), password: password.clone() };
+                let who = match crate::signin::Attempt::at(app, "postgres", from).sign_in(&credential).await {
+                    Ok(who) => who,
+                    Err(r) => return Err(said_no(&user, r)),
                 };
                 let again = match token {
                     true => Again::Token { user: user.clone(), token: password.clone() },
@@ -796,10 +800,19 @@ impl Backend {
         move |e| worded(e, shows)
     }
 
+    /// The name this connection's statements run under, as `current_user` and the catalog say it: the name it gave, or, when
+    /// a token signed it in, the token's principal's, which may be another (a token signs in its own principal under any
+    /// name: `signin`).
+    fn user_of<C: ClientInfo>(&self, client: &C) -> String {
+        self.named.lock().unwrap().clone().unwrap_or_else(|| client.metadata().get("user").cloned().unwrap_or_default())
+    }
+
     fn who(&self) -> crate::auth::Principal { self.who.lock().unwrap().clone().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)) }
 
     /// Signed in as `who`, checked again as `again` says (the nodes' own and an open lake's anyone: never).
     fn signed_in(&self, who: crate::auth::Principal, again: Option<Again>) {
+        let token = matches!(again, Some(Again::Token { .. }));
+        *self.named.lock().unwrap() = token.then(|| who.name.clone()).filter(|n| !n.is_empty());
         let again = again.filter(|_| !who.operator);
         *self.who.lock().unwrap() = Some(who);
         *self.again.lock().unwrap() = again;
@@ -1833,7 +1846,7 @@ impl SimpleQueryHandler for Backend {
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
-        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        let user = self.user_of(client);
         let mut out = vec![];
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
             let one = async {
@@ -1942,7 +1955,7 @@ impl ExtendedQueryHandler for Backend {
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
-        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        let user = self.user_of(client);
         let statement = &portal.statement.statement;
         if let Some(Ok(c)) = Copy::of(&statement.sql).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
             return crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.signed().await?, self.copy_in(client, &user, c))).await;
