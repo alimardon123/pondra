@@ -45,7 +45,7 @@ pub struct Status<'a> {
 /// The formats, JSON first: an answer is JSON when no format is named, or one this build doesn't have.
 const FORMATS: &[Format] = &[
     Format { name: "json", content_type: "application/json", shape: Some(Shape::Json), whole: |_, b, _| json(b) },
-    Format { name: "table", content_type: "text/plain", shape: None, whole: |_, b, _| Ok(pretty_format_batches(b)?.to_string().into_bytes()) },
+    Format { name: "table", content_type: "text/plain", shape: None, whole: |_, b, _| Ok(pretty_format_batches(&b.iter().map(|b| as_text(b).map(|t| t.into_owned())).collect::<Result<Vec<_>>>()?)?.to_string().into_bytes()) },
     Format { name: "typed", content_type: "application/json", shape: None, whole: |_, b, status| typed(b, SHOWN, status.keep) },
     Format { name: "arrow", content_type: "application/vnd.apache.arrow.stream", shape: Some(Shape::Arrow), whole: |_, b, _| arrow_stream(b) },
     Format { name: "csv", content_type: "text/csv; charset=utf-8", shape: Some(Shape::Csv(b',')), whole: |_, b, _| csv(b, b',') },
@@ -305,11 +305,53 @@ pub enum Txn {
 /// Rows as a JSON array of objects.
 pub fn json<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>) -> Result<Vec<u8>> { json_array(batches, false) }
 
+/// The registry's text answers section: how a column of a type whose storage isn't its text (INET's 16 bytes) shows in a JSON
+/// or CSV answer, asked of its field. The column types fill it (`column_types::show_of`, a floor above this one); an Arrow
+/// answer keeps the storage and the type's extension name.
+#[derive(Default)]
+pub struct Shown(Option<fn(&Field) -> Option<fn(&ArrayRef) -> anyhow::Result<ArrayRef>>>);
+
+impl crate::registry::Section for Shown {
+    const NAME: &'static str = "text answers";
+}
+
+impl Shown {
+    pub fn set(&mut self, show_of: fn(&Field) -> Option<fn(&ArrayRef) -> anyhow::Result<ArrayRef>>) { self.0 = Some(show_of) }
+}
+
+/// `b` as a text answer writes it (`Shown`): each column of a type whose storage isn't text as its text. A batch with no
+/// field metadata, nearly every one, is as it was.
+fn as_text(b: &RecordBatch) -> Result<std::borrow::Cow<'_, RecordBatch>> {
+    use std::borrow::Cow;
+    if b.schema_ref().fields().iter().all(|f| f.metadata().is_empty()) {
+        return Ok(Cow::Borrowed(b));
+    }
+    let Some(show_of) = crate::registry::get().find::<Shown>().and_then(|s| s.0) else { return Ok(Cow::Borrowed(b)) };
+    if !b.schema_ref().fields().iter().any(|f| show_of(f).is_some()) {
+        return Ok(Cow::Borrowed(b));
+    }
+    let (mut fields, mut columns) = (vec![], vec![]);
+    for (f, c) in b.schema_ref().fields().iter().zip(b.columns()) {
+        match show_of(f) {
+            Some(show) => {
+                columns.push(show(c)?);
+                fields.push(Field::new(f.name(), DataType::Utf8, f.is_nullable()));
+            }
+            None => {
+                columns.push(c.clone());
+                fields.push(f.as_ref().clone());
+            }
+        }
+    }
+    let schema = Arc::new(Schema::new_with_metadata(fields, b.schema_ref().metadata().clone()));
+    Ok(Cow::Owned(RecordBatch::try_new_with_options(schema, columns, &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(b.num_rows())))?))
+}
+
 /// Rows as a JSON array of objects, a NULL as `null` (`nulls`) or left out.
 fn json_array<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>, nulls: bool) -> Result<Vec<u8>> {
     let mut w = arrow_json::WriterBuilder::new().with_explicit_nulls(nulls).build::<_, arrow_json::writer::JsonArray>(Vec::new());
     for b in batches {
-        w.write(b)?;
+        w.write(as_text(b)?.as_ref())?;
     }
     w.finish()?;
     Ok(w.into_inner())
@@ -319,7 +361,7 @@ fn json_array<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>, nulls: boo
 pub fn json_lines<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>) -> Result<Vec<u8>> {
     let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
     for b in batches {
-        w.write(b)?;
+        w.write(as_text(b)?.as_ref())?;
     }
     w.finish()?;
     Ok(w.into_inner())
@@ -376,7 +418,7 @@ fn arrow_stream(batches: &[RecordBatch]) -> Result<Vec<u8>> {
 fn csv(batches: &[RecordBatch], delimiter: u8) -> Result<Vec<u8>> {
     let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(true).with_delimiter(delimiter).build(Vec::new());
     for b in batches {
-        w.write(b)?;
+        w.write(as_text(b)?.as_ref())?;
     }
     Ok(w.into_inner())
 }

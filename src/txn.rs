@@ -1960,7 +1960,7 @@ enum Current {
 /// The schema of a row as `current` reads it: the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version`.
 fn row_schema(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     use datafusion::arrow::datatypes::{Field, TimeUnit};
-    let mut fields: Vec<Arc<Field>> = meta.schema()?.fields().to_vec();
+    let mut fields: Vec<Arc<Field>> = crate::column_types::parsing(meta.schema()?, |n| meta.held_of(n)).fields().to_vec(); // (an INET column marked: a SET's text is read as one)
     fields.push(Arc::new(Field::new(crate::text::ROW_ID, DataType::Int64, true)));
     fields.push(Arc::new(Field::new(crate::text::CREATED, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)));
     fields.push(Arc::new(Field::new(crate::text::VERSION, DataType::Int64, true)));
@@ -2058,8 +2058,8 @@ async fn change_one(lake: &Lake, name: &str, meta: &TableMeta, key: &[String], s
             None => crate::rules::fit::evaluate(crate::defaults::base(), &row, &expr).ok().flatten(),
         };
         let Some(v) = value else { return Ok(None) };
-        let t = new.schema().field_with_name(c)?.data_type().clone();
-        new = set(&new, c, crate::query::strict(&v, &t)?)?;
+        let f = new.schema().field_with_name(c)?.clone(); // (marked as an INET column's: its text is read as one, `fit::strict_to`)
+        new = set(&new, c, crate::rules::fit::strict_to(&v, &f)?)?;
     }
     let keep: Vec<usize> = (0..new.num_columns()).filter(|&i| new.schema().field(i).name() != crate::text::VERSION).collect();
     Ok(Some((vec![row], vec![new.project(&keep)?])))

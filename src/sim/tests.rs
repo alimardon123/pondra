@@ -2,15 +2,19 @@
 //! (`PONDRA_SIM_SEED` runs one alone). The harness's own copies (tools/harness.py) stay for what the sim can't be: real
 //! processes, sockets and buckets.
 use super::cluster::Cluster;
+use super::faults::Odds;
 use crate::terms::LEASE;
 use std::time::Duration;
 
-/// The seeds a scenario runs over: `PONDRA_SIM_SEED`'s alone, else 1 to `PONDRA_SIM_SEEDS` (2 by default).
+/// The seeds a scenario runs over: `PONDRA_SIM_SEED`'s alone, else `PONDRA_SIM_SEEDS` of them (2 by default) from
+/// `PONDRA_SIM_FROM` (1 by default). CI runs 8 a pull request, and 200 a night from one the date names (sim.yml); a
+/// failing seed is named in its failure, and `PONDRA_SIM_SEED` runs it again alone.
 fn seeds() -> Vec<u64> {
     if let Some(one) = crate::env::parse::<u64>("PONDRA_SIM_SEED") {
         return vec![one];
     }
-    (1..=crate::env::parse::<u64>("PONDRA_SIM_SEEDS").unwrap_or(2)).collect()
+    let from = crate::env::parse::<u64>("PONDRA_SIM_FROM").unwrap_or(1);
+    (from..from + crate::env::parse::<u64>("PONDRA_SIM_SEEDS").unwrap_or(2)).collect()
 }
 
 /// The rows of `answer` (a `/sql` answer: a JSON array of objects).
@@ -325,5 +329,100 @@ async fn keyed_writes_from_three_members_never_double_a_key() {
         let groups = c.sql(0, "SELECT count(*) AS n, count(DISTINCT id) AS d FROM kv").await.unwrap();
         assert_eq!(rows(&groups).first(), Some(&serde_json::json!({"n": keys.len(), "d": keys.len()})), "seed {seed}: a key doubled");
         println!("seed {seed}: {} keys from three members, each once, the leader killed once", keys.len());
+    }
+}
+
+/// The harness's `sequences`, its cluster part: `nextval` from nine clients on three members at once (a follower's go to
+/// the leader), while the leader is killed once: every value handed out is handed out once (a value a kill cut off
+/// before its answer is skipped, never given again).
+#[tokio::test(start_paused = true)]
+async fn nextval_on_three_members_hands_out_each_value_once_through_a_leader_kill() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        for m in 0..3 {
+            c.start(m).await.unwrap();
+        }
+        c.sql(1, "CREATE SEQUENCE s").await.unwrap();
+        let (cluster, taken) = (&c, AtomicUsize::new(0));
+        let taken = &taken;
+        let client = |k: usize| async move {
+            let (m, mut got) = (k % 3, vec![]);
+            for _ in 0..40 {
+                let mut tries = 0;
+                let values = loop {
+                    if cluster.up(m) {
+                        match cluster.sql(m, "SELECT nextval('s') AS v FROM range(25)").await {
+                            Ok(a) => break rows(&a).iter().map(|r| r["v"].as_i64().unwrap_or(-1)).collect::<Vec<_>>(),
+                            Err(e) => {
+                                tries += 1;
+                                assert!(tries < 100, "seed {seed}: client {k}'s nextval never answered: {e}\n{}", cluster.met());
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                got.extend(values);
+                taken.fetch_add(1, Relaxed);
+            }
+            got
+        };
+        let chaos = async {
+            while taken.load(Relaxed) < 120 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let mut lead = None;
+            for m in 0..3 {
+                if c.role(m).await.as_deref() == Some("leader") {
+                    lead = Some(m);
+                }
+            }
+            let lead = lead.unwrap_or_else(|| panic!("seed {seed}: no member leads\n{}", c.met()));
+            c.kill(lead);
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            c.start(lead).await.unwrap();
+        };
+        let (got, ()) = futures::join!(futures::future::join_all((0..9).map(client)), chaos);
+        let all: Vec<i64> = got.into_iter().flatten().collect();
+        let distinct: std::collections::BTreeSet<i64> = all.iter().copied().collect();
+        assert_eq!(all.len(), 9000, "seed {seed}: values answered");
+        assert_eq!(distinct.len(), all.len(), "seed {seed}: a value handed out twice\n{}", c.met());
+        assert!(distinct.first().is_some_and(|v| *v >= 1), "seed {seed}: the least value {:?}", distinct.first());
+        println!("seed {seed}: 9,000 values from nine clients on three members, each once (up to {}), the leader killed once", distinct.last().unwrap());
+    }
+}
+
+/// The harness's `serverless`: six guests (`pondra sql`, with no node running) write at once into a lake nobody serves,
+/// through a bucket whose calls are slow and now and then fail or lose their answer. Each takes the lake for the moment
+/// or waits for whoever has it; a statement that fails is run again with its job, as its user runs it again. Then a
+/// member starts on the lake: every row is there once.
+#[tokio::test(start_paused = true)]
+async fn guests_with_no_node_running_write_each_statement_once() {
+    let (guests, statements, size) = (6usize, 5usize, 10usize);
+    for seed in seeds() {
+        let c = Cluster::new(seed, 1);
+        c.guest(0, "CREATE TABLE t (g INT, s INT, i INT)", "made").await.unwrap();
+        let (cluster, again) = (&c, std::sync::atomic::AtomicUsize::new(0));
+        let again = &again;
+        let guest = |g: usize| async move {
+            cluster.guest_faults(g).everywhere(Odds { fail: 0.02, lost: 0.02, slow: Duration::from_millis(50) });
+            for s in 0..statements {
+                let values = (0..size).map(|i| format!("({g}, {s}, {i})")).collect::<Vec<_>>().join(", ");
+                let (sql, job) = (format!("INSERT INTO t VALUES {values}"), format!("g{g}-s{s}"));
+                let mut tries = 0;
+                while let Err(e) = cluster.guest(g, &sql, &job).await {
+                    (tries, _) = (tries + 1, again.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    assert!(tries < 20, "seed {seed}: {job} never went: {e:#}\n{}", cluster.met());
+                }
+            }
+        };
+        futures::future::join_all((0..guests).map(guest)).await;
+        c.start(0).await.unwrap();
+        let a = c.sql(0, "SELECT count(*) AS n, count(DISTINCT g * 100 + s * 10 + i) AS d FROM t").await.unwrap();
+        let (n, d) = (rows(&a)[0]["n"].as_i64(), rows(&a)[0]["d"].as_i64());
+        let all = (guests * statements * size) as i64;
+        assert_eq!((n, d), (Some(all), Some(all)), "seed {seed}: rows, and distinct rows\n{}", c.met());
+        let again = again.load(std::sync::atomic::Ordering::Relaxed);
+        println!("seed {seed}: {all} rows from {guests} guests with no node running, each once ({again} statements run again)");
     }
 }

@@ -149,7 +149,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         ensure!(cluster.iter().flatten().all(|c| columns.iter().any(|(n, _)| n == c)), "CLUSTER BY: columns of the table");
         ensure!(order.is_none() || (!key.is_empty() && merge.is_empty()), "SEQUENCE BY: a keyed table's (PRIMARY KEY), whose rows replace each other");
         ensure!(order.iter().all(|o| columns.iter().any(|(n, _)| n == o) && !key.contains(o)), "SEQUENCE BY: a column of the table, not its key");
-        if let Some(p) = &partition {
+        if let Some(p) = partition.as_ref().filter(|p| !p.is_empty()) {
             crate::partition::Spec::parse(p)?.check(&columns)?;
         }
         ensure!(not_null.iter().chain(defaults.keys()).chain(identity.keys()).all(|c| columns.iter().any(|(n, _)| n == c)), "NOT NULL, DEFAULT and identity: columns of the table");
@@ -157,8 +157,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
             bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
         }
-        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
-            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
+        let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its 16 bytes)
+        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && *ty == holds(t))) {
+            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, and an INET its address (a column of the table, of type {})", holds(t));
         }
         for (c, expr) in &defaults {
             ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
@@ -196,7 +197,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, owner, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), crate::rules::create::identity_default(&i.sequence));
             }
-            { let mut entry = TableMeta::made(crate::store::Made { columns, not_null, defaults, identity, enums, sql_types, ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = publish.unwrap_or_else(default_publish); entry.cluster = cluster.unwrap_or_default(); entry.ttl = ttl; entry.partition = partition; entry.order = order; entry.checks = checks; entry.constraints = constraints; entry.folder = folder; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.made_by = made_by; entry.ids = true; entry.properties = properties.unwrap_or_default(); entry.retention_secs = retention; entry }
+            { let mut entry = TableMeta::made(crate::store::Made { columns, not_null, defaults, identity, enums, sql_types, ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = publish.unwrap_or_else(default_publish); entry.cluster = cluster.unwrap_or_default(); entry.ttl = ttl; entry.partition = partition.filter(|p| !p.is_empty()); entry.order = order; entry.checks = checks; entry.constraints = constraints; entry.folder = folder; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.made_by = made_by; entry.ids = true; entry.properties = properties.unwrap_or_default(); entry.retention_secs = retention; entry }
         }
         Some(mut m) => {
             // (a CREATE TABLE … AS SELECT's definition is sent again only under the job that made the table: the same
@@ -207,12 +208,28 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             defaulted = false;
             // (the spec names columns as SQL does; the table keeps its stored names: ADR-022)
             let l = m.logical();
-            ensure!(partition.is_none() || partition == l.partition, "{name}'s partition_by can't change");
+            // (ALTER TABLE … SET (partition_by = …): files from now on are split by the new spec, and the ones before keep
+            // theirs, by its id, `TableMeta::spec_of`; '' for none)
+            let partition = partition.map(|p| crate::partition::renamed(&p, |c| c.to_string())).map(|p| (!p.is_empty()).then_some(p));
+            let respec = partition.as_ref().is_some_and(|p| *p != m.sql_partition()); // (both as `renamed` writes them)
+            if respec {
+                if !m.key.is_empty() {
+                    return Err(crate::codes::coded("0A000", format!("{name} has a key: its partition_by can't change (an append table's can), since its newer rows shadow older ones file by file")));
+                }
+                if !m.publish.is_empty() {
+                    return Err(crate::codes::coded("0A000", format!("{name} is published ({}): its partition_by can't change yet", m.publish.join(", "))));
+                }
+                crate::format::require(lake, crate::format::SPECS, "a table's partition_by changed").await?;
+            }
             // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
             // original definition is fine), and `publish` may change.
             let (old, new) = (l.columns().len(), columns.len());
             ensure!(columns[..new.min(old)].iter().map(|(c, t)| (c.as_str(), t.as_str())).eq(l.columns().take(new.min(old))), "{name} exists with other columns (only new ones can be added, at the end)");
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
+            if republish && publish.as_ref().is_some_and(|p| !p.is_empty()) && !m.specs.is_empty() {
+                // (I3-d publishes every spec; until then a file's record is its own spec's, which the table's doesn't name)
+                return Err(crate::codes::coded("0A000", format!("{name}'s partition_by changed, and its files are split by more than one spec: it can't be published yet")));
+            }
             // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
             ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
             if publish.iter().flatten().any(|f| !m.publish.contains(f)) {
@@ -221,7 +238,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let (recluster, rettl, reorder) = (cluster.as_ref().is_some_and(|c| *c != l.cluster), ttl.is_some() && ttl != l.ttl, order.is_some() && order != l.order);
             let reprop = properties.as_ref().is_some_and(|p| *p != m.properties);
             let reretain = retention.is_some() && retention != m.retention_secs;
-            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop && !reretain && shown.is_none() {
+            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop && !reretain && !respec && shown.is_none() {
                 return Ok(j!({"table": name, "publish": m.publish}));
             }
             if new > old {
@@ -254,6 +271,11 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let cluster = cluster.map(|c| c.iter().map(stored).collect());
             let ttl = ttl.map(|(c, s)| (stored(&c), s));
             let order = order.map(|o| stored(&o));
+            if let Some(p) = partition.filter(|_| respec) {
+                let p = p.map(|p| crate::partition::renamed(&p, |c| stored(&c.to_string())));
+                m.specs.insert(m.spec, m.partition.take().unwrap_or_default());
+                (m.spec, m.partition) = (m.spec + 1, p);
+            }
             m.cluster = cluster.unwrap_or(m.cluster);
             m.ttl = ttl.or(m.ttl);
             m.order = order.or(m.order);
@@ -874,6 +896,12 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
                 true => {
                     let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
                     sql_types.extend(query_types(from, &sql, &names, scope).await);
+                    // (a column of a type whose storage isn't text keeps its type: an INET column's query gives it marked)
+                    for f in &fields {
+                        if let Some(t) = crate::column_types::of(f).filter(|t| t.parse.is_some()) {
+                            sql_types.entry(f.name().clone()).or_insert_with(|| t.name.to_string());
+                        }
+                    }
                     fields
                 }
                 false => {
@@ -886,6 +914,12 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
     };
     let fixed = crate::format::fixed(from).await?; // (FLOAT[3] keeps its size where the lake records it: format 8)
     let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::fixed_name(f.data_type(), fixed))).collect();
+    // (a column type whose storage isn't text holds that storage, INET's 16 bytes: declared as text above, it is read into it)
+    for (c, t) in columns.iter_mut() {
+        if let Some(s) = sql_types.get(c.as_str()).and_then(|held| crate::column_types::stored(held)) {
+            *t = crate::answer::type_name(&s);
+        }
+    }
     // (what the statement declares, read from its AST alone: `rules/create.rs`, refused in the order a node always has)
     let d = crate::rules::create::declared(c)?;
     if d.keyed() && !columns.iter().any(|(c, _)| c == "_deleted") {
@@ -988,7 +1022,11 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.to_columns();
-            columns.push((column.to_string(), crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed)));
+            let planned = match held.as_deref().and_then(crate::column_types::stored) {
+                Some(s) => crate::answer::type_name(&s), // (INET: its 16 bytes)
+                None => crate::answer::fixed_name(ctx.table("t").await?.schema().field(0).data_type(), fixed),
+            };
+            columns.push((column.to_string(), planned));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
                 spec["enums"] = j!({column: e});
@@ -1004,7 +1042,7 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
                 match k.as_str() {
                     "publish" | "cluster_by" => spec[k] = j!(list(v)),
                     "ttl" | "order_by" | "retention" => spec[k.as_str()] = j!(v),
-                    "partition_by" => bail!("PARTITION BY can't change: each of {table}'s files holds one partition"),
+                    "partition_by" => spec[k.as_str()] = j!(v), // ('' for none: `create_table`)
                     // Other engines' own (`write.delete.mode`, `write.merge.mode`…): kept and published
                     // for them (Iceberg's table properties); '' takes one out.
                     p if p.contains('.') && v.is_empty() => drop(spec["properties"].as_object_mut().map(|o| o.remove(p))),
@@ -1407,10 +1445,14 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         None => default(name)?,
     }, t.clone()).alias(name))).collect::<Result<Vec<_>>>()?;
     let schema: SchemaRef = Arc::new(df.clone().select(casts)?.schema().as_arrow().clone());
+    let schema = match &meta {
+        Some(m) => crate::column_types::parsing(schema, |n| m.held_of(n)), // (an INET column's text is read as one, in `cast_given`)
+        None => schema,
+    };
     let given_n = given.len();
     let df = df.select(picks)?;
     let columns = target.iter().map(|(n, t)| (n.clone(), t.to_string())).collect();
-    let partition = meta.as_ref().and_then(|m| m.partition.clone());
+    let (partition, spec) = meta.as_ref().map(|m| (m.partition.clone(), m.spec)).unwrap_or_default();
     let next = Arc::new(std::sync::atomic::AtomicU64::new(0)); // (the streams share one block of ids)
     let streams = df.execute_stream_partitioned().await?.into_iter().map(|rows| cast_given(rows, schema.clone(), given_n)).map(|rows| checked_stream(rows, rules.clone(), table)).map(|rows| match stamp {
         Some(reserved) => crate::sys::stamp_stream(rows, next.clone(), reserved),
@@ -1418,7 +1460,9 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
     });
     // (files of up to 4M rows, as a merge writes them: `maintain` leaves them alone)
     let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], partition.as_deref()));
-    Ok((columns, futures::future::try_join_all(writes).await?.concat()))
+    let mut files = futures::future::try_join_all(writes).await?.concat();
+    files.iter_mut().for_each(|f| f.spec = spec); // (split by the spec read with the table: `TableMeta::spec_of`)
+    Ok((columns, files))
 }
 
 /// `rows` with its first `given` columns cast to the table's types, batch by batch, by `query::strict`, the cast INSERT
@@ -1432,7 +1476,7 @@ fn cast_given(rows: datafusion::execution::SendableRecordBatchStream, schema: Sc
         let mut columns = b.map_err(|e| crate::casts::parse_refusal(&e.to_string()).unwrap_or(e))?.columns().to_vec();
         for (column, field) in columns.iter_mut().zip(schema.fields()).take(given) {
             // (a refusal is the DataFusion error `casts::into` made, kept as it is: `codes::of` finds its code)
-            *column = crate::query::strict(column, field.data_type()).map_err(|e| match e.downcast::<datafusion::error::DataFusionError>() {
+            *column = crate::rules::fit::strict_to(column, field).map_err(|e| match e.downcast::<datafusion::error::DataFusionError>() {
                 Ok(d) => d,
                 Err(e) => datafusion::error::DataFusionError::External(e.into()),
             })?;

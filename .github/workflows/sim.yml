@@ -1,0 +1,44 @@
+name: sim
+
+# Each night, the sim's cluster scenarios (src/sim/tests.rs: a leader frozen and fenced, crash points and kills, finals
+# on three, keyed writes from three members, ...) over 200 seeds, from a first seed the date names, so each night tries
+# seeds no night tried before, and a pull request's 8 (build.yml's unit tests) are 1 to 8. Each runs a cluster in one
+# process on paused time, a few seconds of the runner's for minutes of the cluster's. A failure names its seed (and
+# the faults each member met): `PONDRA_SIM_SEED=<seed> cargo test --release --lib sim::` runs it again alone, anywhere.
+# By hand: Actions -> sim -> Run workflow (a session gets 403).
+on:
+  schedule:
+    - cron: "11 5 * * *" # (after fuzz.yml's 04:56)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sim
+  cancel-in-progress: false
+
+jobs:
+  sim:
+    name: the sim's scenarios over 200 seeds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60 # (the library's tests built in release, about 20 minutes, then the seeds)
+    env:
+      CARGO_INCREMENTAL: 0
+      PONDRA_SIM_SEEDS: 200
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: unit # (main's, as the unit tests build them)
+          save-if: false
+      - name: The library's tests, built
+        run: cargo test --release --lib --no-run
+      - name: The sim's scenarios, 200 seeds from the date's
+        run: |
+          export PONDRA_SIM_FROM=$(date -u +%Y%m%d)000
+          echo "seeds $PONDRA_SIM_FROM to $((PONDRA_SIM_FROM + PONDRA_SIM_SEEDS - 1))" >> "$GITHUB_STEP_SUMMARY"
+          cargo test --release --lib sim::

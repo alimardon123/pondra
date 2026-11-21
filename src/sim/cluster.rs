@@ -56,6 +56,8 @@ pub struct Cluster {
     members: Vec<Arc<Member>>,
     /// What each start gives its member besides its lake (`pondra serve`'s flags: `set_start`).
     start: Mutex<crate::node::Start>,
+    /// Each guest's faults, by its number, from its first statement on (`guest`).
+    guests: Mutex<std::collections::BTreeMap<usize, Arc<Faults>>>,
 }
 
 impl Cluster {
@@ -79,7 +81,7 @@ impl Cluster {
                 })
             })
             .collect();
-        Cluster { seed, name, bucket, net, members, start: Default::default() }
+        Cluster { seed, name, bucket, net, members, start: Default::default(), guests: Default::default() }
     }
 
     /// Member `m`'s lake (0-based): `sim://<cluster>-<member>/lake`, the cluster's one bucket through its faults.
@@ -197,7 +199,78 @@ impl Cluster {
     }
 
     /// Every fault each member met, in order: what a failing seed says.
-    pub fn met(&self) -> String { self.members.iter().map(|m| format!("{}: {:?}", m.name, m.faults.met())).collect::<Vec<_>>().join("; ") }
+    pub fn met(&self) -> String {
+        let guests = lock(&self.guests).iter().map(|(g, f)| format!("g{g}: {:?}", f.met())).collect::<Vec<_>>();
+        self.members.iter().map(|m| format!("{}: {:?}", m.name, m.faults.met())).chain(guests).collect::<Vec<_>>().join("; ")
+    }
+
+    /// Guest `g`'s faults (`g<g>`: the lake as `pondra sql` reaches it, `sim://<cluster>-g<g>/lake`), none until set.
+    pub fn guest_faults(&self, g: usize) -> Arc<Faults> {
+        let made = || {
+            let faults = Faults::new(self.seed.wrapping_mul(1_000_003).wrapping_add(1_000 + g as u64));
+            super::store::give(&format!("{}-g{g}", self.name), self.bucket.clone(), faults.clone());
+            faults
+        };
+        lock(&self.guests).entry(g).or_insert_with(made).clone()
+    }
+
+    /// `sql` run as `pondra sql` runs it, with job `job`, by guest `g`: a node with no address and no doors, which leads
+    /// the lake for the moment if nobody does, or goes through the leader, or its inbox; it answers, waits for what it
+    /// wrote to be durable, and ends. Fenced out by a newer writer, or stopped at a point (its process killed), it runs
+    /// again with the same job, as the command does, so whoever records the job records it once; it gives up after five.
+    pub async fn guest(&self, g: usize, sql: &str, job: &str) -> Result<serde_json::Value> {
+        let (name, faults) = (format!("g{g}"), self.guest_faults(g));
+        let dir = format!("sim://{}-{name}/lake", self.name);
+        let path = format!("/sql?job={}", url::form_urlencoded::byte_serialize(job.as_bytes()).collect::<String>());
+        let mut last = anyhow!("not run");
+        for _ in 0..5 {
+            // (its process: the task that runs it, and its node's tasks, all ended where they are when it stops at a point)
+            let node: Arc<Mutex<Weak<crate::node_state::NodeState>>> = Default::default();
+            let ran: Arc<Mutex<Option<tokio::task::AbortHandle>>> = Default::default();
+            let (kept, killed, run_by, stopper) = (node.clone(), node.clone(), ran.clone(), faults.clone());
+            let given = crate::node_state::Given {
+                dial: Some(self.net.dial(&name)),
+                started: Some(Arc::new(move |n: &Arc<crate::node_state::NodeState>| *lock(&kept) = Arc::downgrade(n))),
+                stops: Some(Arc::new(move |point: &str| {
+                    let stops = stopper.stops_at(point);
+                    if stops {
+                        lock(&run_by).take().inspect(tokio::task::AbortHandle::abort);
+                        lock(&killed).upgrade().inspect(|n| n.tasks.abort_all());
+                    }
+                    stops
+                })),
+            };
+            let mut options = crate::node::Options::guest(&dir, vec![], crate::node::Guest::Writes);
+            (options.given, options.host) = (given, Some(crate::node::Host::beside().0));
+            let (path, body) = (path.clone(), sql.as_bytes().to_vec());
+            let run = crate::spawns::untracked(async move {
+                let node = crate::node::Node::open(options).await?;
+                let answer = async {
+                    let res = node.ask("POST", &path, body).await?;
+                    let (ok, sqlstate) = (res.status().is_success(), res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string));
+                    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+                    anyhow::Ok((ok, sqlstate, String::from_utf8_lossy(&body).into_owned()))
+                }
+                .await;
+                let finished = node.finish().await; // (whatever the answer: a guest that led gives its term back)
+                let (ok, sqlstate, said) = answer?;
+                if !ok {
+                    return Err(crate::write::refusal(sqlstate.as_deref(), said));
+                }
+                finished?;
+                Ok(serde_json::from_str(&said).unwrap_or(serde_json::Value::Null))
+            });
+            *lock(&ran) = Some(run.abort_handle());
+            match run.await {
+                Ok(Ok(answer)) => return Ok(answer),
+                Ok(Err(e)) if crate::write::fenced(&e) => last = e,
+                Ok(Err(e)) => return Err(e.context(format!("{name}: {sql}"))),
+                // (stopped at a point, or sent back to run again: `Restarting`)
+                Err(e) => last = anyhow!("{name} stopped: {e}"),
+            }
+        }
+        Err(last.context(format!("{name}: gave up after five runs of {sql}")))
+    }
 
     /// The cluster's one bucket (what every member's lake is).
     pub fn bucket(&self) -> &Arc<Bucket> { &self.bucket }
@@ -209,6 +282,9 @@ impl Drop for Cluster {
         for (i, m) in self.members.iter().enumerate() {
             m.kill();
             super::store::forget(&format!("{}-m{}", self.name, i + 1));
+        }
+        for g in lock(&self.guests).keys() {
+            super::store::forget(&format!("{}-g{g}", self.name));
         }
     }
 }

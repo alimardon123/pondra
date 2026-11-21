@@ -453,6 +453,7 @@ fn partitions_of(table: &str, meta: &TableMeta, asked: Vec<(String, String)>) ->
     let spec = partition.as_deref().with_context(|| format!("{table} has no partition_by: share it whole, or a materialized view of the rows"))?;
     ensure!(!spec.contains('('), "{table} is partitioned by {spec}: a share takes partitions of a table partitioned by a column; a materialized view takes any rows");
     ensure!(meta.key.is_empty(), "{table} is keyed, and its rows move between partitions: share it whole, or a materialized view of the rows");
+    ensure!(meta.specs.is_empty(), "{table}'s partition_by changed, so its older files aren't split by {spec}: share it whole, or a materialized view of the rows");
     asked.into_iter().map(|(c, v)| { ensure!(c == spec, "{table} is partitioned by {spec}, not {c}"); Ok(v) }).collect()
 }
 

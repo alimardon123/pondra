@@ -47,6 +47,10 @@ pub struct DataFile {
     /// Partitioned tables: the one partition value this file holds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub part: String,
+    /// The id of the table's spec `part` was split by (`TableMeta::spec_of`): 0, the table's first, for every file written
+    /// before ALTER TABLE … SET (partition_by = …).
+    #[serde(default, skip_serializing_if = "is_zero_spec")]
+    pub spec: u32,
     /// Its rows carry their system columns (`sys.rs`); files written before round 19 don't.
     #[serde(default)]
     pub sys: bool,
@@ -80,6 +84,8 @@ pub struct DataFile {
 }
 
 fn is_zero(n: &u64) -> bool { *n == 0 }
+
+fn is_zero_spec(n: &u32) -> bool { *n == 0 }
 
 impl DataFile {
     /// The position-delete files that name it (paths in the lake).

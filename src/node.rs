@@ -1070,6 +1070,57 @@ mod tests {
             let q = |sql: &'static str| app.query(sql, Some("0"), &node.scope);
             let b = q("SELECT count(*), sum(id) FROM p").await.unwrap();
             assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (40, 820));
+            // (I3-b: a point lookup reads its value's bucket's file, not its day's other buckets', whose ids span it)
+            let scanned = || lake.node.metrics.files_scanned.load(std::sync::atomic::Ordering::Relaxed);
+            for (sql, rows, files) in [("SELECT count(*) FROM p WHERE id = 7", 1, 1), ("SELECT count(*) FROM p WHERE id IN (7, 8)", 2, 2), ("SELECT count(*) FROM p WHERE id = 7 AND s = 's7'", 1, 1)] {
+                let before = scanned();
+                let b = q(sql).await.unwrap();
+                assert_eq!(b[0].column(0).as_primitive::<Int64Type>().value(0), rows, "{sql}");
+                assert!(scanned() - before <= files, "{sql}: {} files read", scanned() - before);
+            }
+            // (I3-c: ALTER TABLE … SET (partition_by = …) splits the files from then on by the new spec, and the ones before
+            // keep theirs by its id; each prunes by its own, and '' stops partitioning)
+            for sql in [
+                "ALTER TABLE p SET (partition_by = 'day(ts)')",
+                "INSERT INTO p SELECT value, to_timestamp_seconds(1794657600 + value * 3600), 's' || value FROM range(41, 61)",
+                "ALTER TABLE p SET (partition_by = '')",
+                "INSERT INTO p VALUES (61, to_timestamp_seconds(1794657600), 's61')",
+            ] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            }
+            app.tier_all(0).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("p")).await.unwrap().unwrap();
+            assert_eq!((meta.spec, meta.partition.as_deref(), meta.specs.get(&0).map(String::as_str), meta.specs.get(&1).map(String::as_str)), (2, None, Some("day(ts), bucket(4, id)"), Some("day(ts)")));
+            let mut all = meta.files.clone();
+            for m in crate::manifest::list(&lake, &meta).await.unwrap() {
+                all.extend(crate::manifest::files(&lake, &m).await.unwrap());
+            }
+            for f in &all {
+                let fields = meta.spec_of(f).map_or(0, |s| crate::partition::Spec::parse(s).unwrap().fields.len());
+                assert_eq!(crate::partition::values(&f.part, fields.max(1)).len(), fields.max(1), "{} under spec {}: {}", f.path, f.spec, f.part);
+                assert!(f.spec != 2 || f.part.is_empty(), "unpartitioned now: {}", f.part);
+            }
+            assert!([0, 1, 2].iter().all(|s| all.iter().any(|f| f.spec == *s)), "a file of each spec");
+            let b = q("SELECT count(*), sum(id) FROM p").await.unwrap();
+            assert_eq!((b[0].column(0).as_primitive::<Int64Type>().value(0), b[0].column(1).as_primitive::<Int64Type>().value(0)), (61, 1891));
+            for (sql, rows) in [("SELECT count(*) FROM p WHERE id = 7", 1), ("SELECT count(*) FROM p WHERE id = 50", 1), ("SELECT count(*) FROM p WHERE id IN (7, 50, 61)", 3)] {
+                let b = q(sql).await.unwrap();
+                assert_eq!(b[0].column(0).as_primitive::<Int64Type>().value(0), rows, "{sql}");
+            }
+            // (a keyed table isn't partitioned; a published one's spec changes with I3-d)
+            for (sql, refused) in [
+                ("CREATE TABLE k (id BIGINT PRIMARY KEY, ts TIMESTAMP)", None),
+                ("ALTER TABLE k SET (partition_by = 'day(ts)')", Some("has a key")),
+                ("ALTER TABLE p SET (publish = 'iceberg')", Some("can't be published yet")),
+            ] {
+                let stmt = crate::write::parse(sql).unwrap();
+                let got = crate::write::on_node(&app, stmt, None, &node).await;
+                match refused {
+                    None => { got.unwrap_or_else(|e| panic!("{sql}: {e:#}")); }
+                    Some(why) => assert!(got.as_ref().is_err_and(|e| format!("{e:#}").contains(why)), "{sql}: {:?}", got.map(|_| ())),
+                }
+            }
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })

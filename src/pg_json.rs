@@ -12,10 +12,10 @@ use crate::pg_text::array_literal;
 use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, Int32Array, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type};
-use datafusion::common::{DFSchema, Result, ScalarValue};
-use datafusion::logical_expr::expr::{Alias, ScalarFunction};
-use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
-use datafusion::logical_expr::{Expr, ExprSchemable, ScalarUDF, Signature, Volatility};
+use datafusion::common::{Column, DFSchema, Result, ScalarValue, TableReference};
+use datafusion::logical_expr::expr::{Alias, GetFieldAccess, ScalarFunction};
+use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr, RawFieldAccessExpr};
+use datafusion::logical_expr::{lit, Expr, ExprSchemable, ScalarUDF, Signature, Volatility};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::BinaryOperator;
@@ -56,7 +56,34 @@ impl ExprPlanner for Operators {
         let call = Expr::ScalarFunction(ScalarFunction::new_udf(named(name), vec![e.left, e.right]));
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(call, None::<&str>, alias))))
     }
+
+    /// A document's `doc['k']` and `doc[0]` (E2, one path spelling): `->`'s step, so a path reads on JSON as it reads on a
+    /// STRUCT, a MAP or a LIST, whose steps stay DataFusion's. An index counts as its kind's home counts: JSON's from 0
+    /// (Postgres's jsonb subscripts and `->`), a LIST's from 1. A slice is refused, as jsonb's subscripts refuse one.
+    fn plan_field_access(&self, e: RawFieldAccessExpr, schema: &DFSchema) -> Result<PlannerResult<RawFieldAccessExpr>> {
+        if !e.expr.to_field(schema).is_ok_and(|(_, f)| json_mark(&f).is_some()) {
+            return Ok(PlannerResult::Original(e));
+        }
+        let key = match e.field_access {
+            GetFieldAccess::NamedStructField { name } => lit(name),
+            GetFieldAccess::ListIndex { key } => *key,
+            GetFieldAccess::ListRange { .. } => return Err(refuse("42804", "jsonb subscript does not support slices")),
+        };
+        Ok(PlannerResult::Planned(step(e.expr, key)))
+    }
+
+    /// A document's `doc.k.j` (E2), where `doc` is a JSON column: each name a step, as `doc['k']['j']` is.
+    fn plan_compound_identifier(&self, field: &Field, qualifier: Option<&TableReference>, names: &[String]) -> Result<PlannerResult<Vec<Expr>>> {
+        if json_mark(field).is_none() {
+            return Ok(PlannerResult::Original(vec![]));
+        }
+        let doc = Expr::Column(Column::from((qualifier, field)));
+        Ok(PlannerResult::Planned(names.iter().fold(doc, |doc, name| step(doc, lit(name.as_str())))))
+    }
 }
+
+/// One step into a document, `->`'s: a key of an object, or an index of an array. Its answer is JSON as its document is.
+fn step(doc: Expr, key: Expr) -> Expr { Expr::ScalarFunction(ScalarFunction::new_udf(named("json_object_field"), vec![doc, key])) }
 
 /// The function an operator calls, and whether both sides must be text. `->` takes a text key or an integer index,
 /// so only its left side must be text. `-` and `#-` are planned by `deletes`, which asks for the same two.
@@ -1314,5 +1341,42 @@ mod tests {
         assert_eq!(text_of("1.0", false).unwrap(), Some("1.0".to_string()));
         assert_eq!(text_of(r#"{"b":1,"a":2}"#, true).unwrap(), Some(r#"{"a": 2, "b": 1}"#.to_string()));
         assert_eq!(text_of(r#"{"b":1,"a":2}"#, false).unwrap(), Some(r#"{"b":1,"a":2}"#.to_string()));
+    }
+
+    /// E2, one path spelling: a document's `doc['k']`, `doc[0]` and `doc.k.j` are `->`'s steps, so a path reads on JSON
+    /// as it does on a STRUCT, a MAP and a LIST, whose steps stay DataFusion's. JSON counts an index from 0 (jsonb's
+    /// subscripts, `->`), a LIST from 1 (Postgres's arrays, DuckDB's lists).
+    #[tokio::test]
+    async fn one_path_spelling_reads_every_kind() {
+        let ctx = planned(SessionContext::new());
+        let from = r#"FROM (SELECT pondra_as_json('{"k": {"j": [1, 2]}, "a": 5}') AS j, pondra_as_jsonb('{"k": 7}') AS v,
+            named_struct('k', named_struct('j', [1, 2]), 'a', 5) AS s, map(['a'], [5]) AS m, [10, 20] AS l,
+            '{"a": 5}' AS x) AS t"#;
+        let answer = |path: &str| {
+            let (ctx, sql) = (ctx.clone(), format!("SELECT {path} {from}"));
+            async move {
+                let df = ctx.sql(&sql).await.map_err(|e| e.to_string())?;
+                let mark = df.schema().field(0).metadata().get(MARK).cloned();
+                let batches = df.collect().await.map_err(|e| e.to_string())?;
+                let text = datafusion::arrow::util::display::array_value_to_string(batches[0].column(0), 0).unwrap();
+                Ok::<_, String>((text, mark))
+            }
+        };
+        let json = |s: &str| (s.to_string(), Some("json".to_string()));
+        for (path, want) in [("j['a']", "5"), ("j.a", "5"), ("t.j.a", "5"), ("j['k']['j'][0]", "1"), ("j.k.j", "[1, 2]"), ("j.k['j'][1]", "2"), ("j['k']['j'][-1]", "2")] {
+            assert_eq!(answer(path).await, Ok(json(want)), "{path}");
+        }
+        assert_eq!(answer("v['k']").await, Ok(("7".into(), Some("jsonb".into()))), "a jsonb document's step is jsonb");
+        assert_eq!(answer("v.k").await, answer("v -> 'k'").await);
+        for path in ["j['b']", "j.k.j[2]", "j['k']['0']"] {
+            assert_eq!(answer(path).await.map(|(t, _)| t), Ok(String::new()), "{path}: NULL, as `->` answers where nothing is");
+        }
+        for (path, want) in [("s['a']", "5"), ("s.a", "5"), ("t.s.a", "5"), ("s.k.j[1]", "1"), ("s['k']['j'][2]", "2"), ("m['a']", "5"), ("l[1]", "10"), ("l[2]", "20")] {
+            assert_eq!(answer(path).await.map(|(t, m)| (t, m.is_none())), Ok((want.to_string(), true)), "{path}: DataFusion's, typed");
+        }
+        let slice = answer("j[0:1]").await.unwrap_err();
+        assert!(slice.contains("jsonb subscript does not support slices"), "{slice}");
+        let text = answer("x['a']").await.unwrap_err();
+        assert!(text.contains("is not Struct, Map, or Null"), "text that isn't marked JSON keeps DataFusion's refusal: {text}");
     }
 }

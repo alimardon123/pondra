@@ -265,6 +265,15 @@ pub async fn pruned(lake: &Lake, meta: &TableMeta, manifests: Option<&[Manifest]
     let (from_lists, from_entry) = kept.split_at(loaded.len());
     let mut files: Vec<DataFile> = loaded.into_iter().zip(from_lists).filter(|(_, k)| **k).map(|(f, _)| f).collect();
     files.extend(meta.files.iter().zip(from_entry).filter(|(_, k)| **k).map(|(f, _)| f.clone()));
+    // (a bucket's files by their parts: no range says which bucket a file holds; each file under the spec it was split by)
+    if meta.partition.is_some() || !meta.specs.is_empty() {
+        let list = meta.column_list();
+        let mut keeps: BTreeMap<u32, Option<Box<dyn Fn(&str) -> bool + Send + Sync>>> = BTreeMap::new();
+        files.retain(|f| {
+            let keep = keeps.entry(f.spec).or_insert_with(|| meta.spec_of(f).and_then(|spec| crate::partition::wanted(spec, filters, |c| list.of_stored(c).map(|c| c.name.clone()), schema)));
+            keep.as_ref().is_none_or(|keep| keep(&f.part))
+        });
+    }
     let total = listed.iter().map(|m| m.files).sum::<u64>() + meta.files.len() as u64;
     crate::metrics::add(&lake.node.metrics.files_scanned, files.len() as u64);
     crate::metrics::add(&lake.node.metrics.files_skipped, total - files.len() as u64);

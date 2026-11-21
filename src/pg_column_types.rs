@@ -6,9 +6,9 @@ use datafusion::arrow::datatypes::DataType;
 
 fn text(_: &[u64]) -> DataType { DataType::Utf8 }
 
-pub const UUID: ColumnType = ColumnType { name: "uuid", extension: "pondra.uuid", storage: text, refusal: Some(uuid) };
-pub const JSON: ColumnType = ColumnType { name: "json", extension: "arrow.json", storage: text, refusal: Some(json) };
-pub const JSONB: ColumnType = ColumnType { name: "jsonb", extension: "pondra.jsonb", storage: text, refusal: Some(jsonb) };
+pub const UUID: ColumnType = ColumnType { name: "uuid", extension: "pondra.uuid", storage: text, refusal: Some(uuid), parse: None, show: None };
+pub const JSON: ColumnType = ColumnType { name: "json", extension: "arrow.json", storage: text, refusal: Some(json), parse: None, show: None };
+pub const JSONB: ColumnType = ColumnType { name: "jsonb", extension: "pondra.jsonb", storage: text, refusal: Some(jsonb), parse: None, show: None };
 
 /// Not a uuid, or one written another way than the column holds (22P02).
 fn uuid(column: &str, v: &str) -> Option<(String, &'static str)> {
