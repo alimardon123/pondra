@@ -1108,11 +1108,14 @@ mod tests {
                 let b = q(sql).await.unwrap();
                 assert_eq!(b[0].column(0).as_primitive::<Int64Type>().value(0), rows, "{sql}");
             }
-            // (a keyed table isn't partitioned; a published one's spec changes with I3-d)
+            // (a keyed table isn't partitioned; an earlier spec's column stays; a published table's every spec publishes, I3-d)
             for (sql, refused) in [
                 ("CREATE TABLE k (id BIGINT PRIMARY KEY, ts TIMESTAMP)", None),
                 ("ALTER TABLE k SET (partition_by = 'day(ts)')", Some("has a key")),
-                ("ALTER TABLE p SET (publish = 'iceberg')", Some("can't be published yet")),
+                ("ALTER TABLE p DROP COLUMN id", Some("partition_by column")),
+                ("ALTER TABLE p SET (publish = 'iceberg')", None),
+                ("ALTER TABLE p SET (partition_by = 'bucket(2, id)')", None),
+                ("INSERT INTO p VALUES (62, to_timestamp_seconds(1794657600), 's62')", None),
             ] {
                 let stmt = crate::write::parse(sql).unwrap();
                 let got = crate::write::on_node(&app, stmt, None, &node).await;
@@ -1121,6 +1124,45 @@ mod tests {
                     Some(why) => assert!(got.as_ref().is_err_and(|e| format!("{e:#}").contains(why)), "{sql}: {:?}", got.map(|_| ())),
                 }
             }
+            // (I3-d: the published table lists every spec, ours k as Iceberg's k + 1 and one with no partitions as 0, a field
+            // again keeping its id; each file in a manifest of its own spec's)
+            app.tier_all(0).await.unwrap();
+            crate::delta::publish_all(&lake).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("p")).await.unwrap().unwrap();
+            let dir = format!("data/{}/metadata", meta.folder("p"));
+            let v = String::from_utf8(lake.object(&format!("{dir}/version-hint.text")).await.unwrap().to_vec()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&lake.object(&format!("{dir}/v{v}.metadata.json")).await.unwrap()).unwrap();
+            let specs: Vec<(i64, Vec<u64>)> = body["partition-specs"].as_array().unwrap().iter().map(|s| (s["spec-id"].as_i64().unwrap(), s["fields"].as_array().unwrap().iter().map(|f| f["field-id"].as_u64().unwrap()).collect())).collect();
+            assert_eq!(specs, [(0, vec![]), (1, vec![1000, 1001]), (2, vec![1000]), (4, vec![1002])]);
+            assert_eq!((body["default-spec-id"].as_i64(), body["last-partition-id"].as_i64()), (Some(4), Some(1002)));
+            let list = body["snapshots"].as_array().unwrap().last().unwrap()["manifest-list"].as_str().unwrap().to_string();
+            let list = list.strip_prefix(&lake.full("")).unwrap_or(&list);
+            let ids: std::collections::BTreeSet<i64> = crate::avro::records(&lake.object(list).await.unwrap()).unwrap().iter().map(|m| m["partition_spec_id"].as_i64().unwrap()).collect();
+            assert_eq!(ids, [0, 1, 2, 4].into());
+            // (audit 11-21 H1: one ALTER that changes the spec and publishes the table; its files before keep their own spec
+            // as published, so a round doesn't read a one-field part under the two-field spec and fail)
+            for sql in [
+                "CREATE TABLE c (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'day(ts)')",
+                "INSERT INTO c SELECT value, to_timestamp_seconds(1794657600 + value * 3600) FROM range(1, 41)",
+                "ALTER TABLE c SET (partition_by = 'bucket(4, id), day(ts)', publish = 'iceberg')",
+                "INSERT INTO c SELECT value, to_timestamp_seconds(1794657600 + value * 3600) FROM range(41, 61)",
+            ] {
+                let stmt = crate::write::parse(sql).unwrap();
+                crate::write::on_node(&app, stmt, None, &node).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                app.tier_all(0).await.unwrap();
+            }
+            crate::delta::publish_all(&lake).await.unwrap();
+            let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key("c")).await.unwrap().unwrap();
+            let dir = format!("data/{}/metadata", meta.folder("c"));
+            let v = String::from_utf8(lake.object(&format!("{dir}/version-hint.text")).await.unwrap().to_vec()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&lake.object(&format!("{dir}/v{v}.metadata.json")).await.unwrap()).unwrap();
+            let list = body["snapshots"].as_array().unwrap().last().unwrap()["manifest-list"].as_str().unwrap().to_string();
+            let list = list.strip_prefix(&lake.full("")).unwrap_or(&list);
+            let manifests = crate::avro::records(&lake.object(list).await.unwrap()).unwrap();
+            let ids: std::collections::BTreeSet<i64> = manifests.iter().map(|m| m["partition_spec_id"].as_i64().unwrap()).collect();
+            assert_eq!((ids, body["default-spec-id"].as_i64()), ([1, 2].into(), Some(2)));
+            let rows: i64 = manifests.iter().filter(|m| m["content"].as_i64() == Some(0)).map(|m| m["added_rows_count"].as_i64().unwrap_or(0) + m["existing_rows_count"].as_i64().unwrap_or(0)).sum();
+            assert_eq!(rows, 60);
             marks.abort();
             crate::memory_lake::forget_memory(&lake.url);
         })
