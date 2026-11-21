@@ -241,7 +241,7 @@ struct Known {
     name: String, // (the lake's own name: `lake.s.t` is its `s.t`)
     facts: HashMap<(String, String), (i64, f64)>,
     newest: i64, // (the newest history row read, µs)
-    read: Option<datafusion::common::instant::Instant>,
+    read: Option<crate::clock::Instant>,
     reading: bool,
 }
 
@@ -473,7 +473,7 @@ fn refresh(kept: &Arc<Kept>) {
     impl Drop for Done {
         fn drop(&mut self) {
             let mut k = self.0.known_mut();
-            (k.reading, k.read) = (false, Some(datafusion::common::instant::Instant::now()));
+            (k.reading, k.read) = (false, Some(crate::clock::Instant::now()));
         }
     }
     let done = Done(kept.clone());

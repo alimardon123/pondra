@@ -20,7 +20,7 @@ use futures::{Stream, StreamExt};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 pub const TABLE: &str = crate::records::AUDIT;

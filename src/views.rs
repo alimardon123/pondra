@@ -1036,7 +1036,7 @@ pub(crate) struct Failures {
     pub(crate) failures: u32,
     error: Option<String>,
     /// When the failures in a row began.
-    since: Option<datafusion::common::instant::Instant>,
+    since: Option<crate::clock::Instant>,
 }
 
 impl Failures {
@@ -1050,7 +1050,7 @@ impl Failures {
                     eprintln!("{what}: {e}");
                 }
                 (self.failures, self.error) = (self.failures + 1, Some(e));
-                self.since.get_or_insert_with(datafusion::common::instant::Instant::now);
+                self.since.get_or_insert_with(crate::clock::Instant::now);
             }
         }
     }
@@ -1076,7 +1076,7 @@ impl Failures {
 struct Runs {
     of: String, // (the view these runs are for: its `identity`)
     running: bool,
-    after: Option<datafusion::common::instant::Instant>, // (a page's clock too: std's Instant has none there)
+    after: Option<crate::clock::Instant>, // (a page's clock too: std's Instant has none there)
     failed: Failures,
 }
 
@@ -1121,7 +1121,7 @@ fn turn_of(kept: &std::sync::Arc<Kept>, view: &str, of: &str, what: &'static str
         }
         *run = Runs { of: of.to_string(), ..Default::default() };
     }
-    if run.running || run.after.is_some_and(|t| t > datafusion::common::instant::Instant::now()) {
+    if run.running || run.after.is_some_and(|t| t > crate::clock::Instant::now()) {
         return None;
     }
     run.running = true;
@@ -1140,7 +1140,7 @@ impl Kept {
         let Some(run) = runs.get_mut(view) else { return }; // (the view was dropped meanwhile: its runs are forgotten)
         run.running = false;
         run.failed.note(&format!("{what} {view}"), error);
-        run.after = (run.failed.failures > 0).then(|| datafusion::common::instant::Instant::now() + run.failed.backoff());
+        run.after = (run.failed.failures > 0).then(|| crate::clock::Instant::now() + run.failed.backoff());
     }
 
     /// Why `view`'s runs keep failing, if they do (two in a row), for the view `of`.
@@ -2303,7 +2303,7 @@ mod tests {
         f.note("emission of v", Some("boom".into()));
         assert_eq!(f.failing().as_deref(), Some("boom"));
         assert!(!f.failing_longer_than(FILL_HOLD), "two failures just now: a filling's source is still held");
-        f.since = datafusion::common::instant::Instant::now().checked_sub(FILL_HOLD + std::time::Duration::from_secs(1));
+        f.since = crate::clock::Instant::now().checked_sub(FILL_HOLD + std::time::Duration::from_secs(1));
         assert!(f.failing_longer_than(FILL_HOLD), "failing past the hold: held no longer");
         f.note("emission of v", Some("boom".into()));
         assert!(f.failing_longer_than(FILL_HOLD), "a failure in a row keeps when the failures began");
@@ -2340,7 +2340,7 @@ mod tests {
         t.ended(&Err(anyhow::anyhow!("boom")));
         assert!(turn_of(&kept, key, "", "emission of").is_none(), "after a failure, its backoff");
         assert_eq!(kept.failing(key, ""), None, "one failure is not yet failing");
-        kept.runs.lock().unwrap().get_mut(key).unwrap().after = Some(datafusion::common::instant::Instant::now());
+        kept.runs.lock().unwrap().get_mut(key).unwrap().after = Some(crate::clock::Instant::now());
         let t = turn_of(&kept, key, "", "emission of").expect("its backoff is over");
         t.ended(&Err(anyhow::anyhow!("boom")));
         assert_eq!(kept.failing(key, "").as_deref(), Some("boom"));
@@ -2356,7 +2356,7 @@ mod tests {
         let t = turn_of(&kept, key, "a", "emission of").expect("a's first turn");
         assert!(turn_of(&kept, key, "b", "emission of").is_none(), "while a's run is going, b's waits for it to end");
         t.ended(&Err(anyhow::anyhow!("boom")));
-        kept.runs.lock().unwrap().get_mut(key).unwrap().after = Some(datafusion::common::instant::Instant::now());
+        kept.runs.lock().unwrap().get_mut(key).unwrap().after = Some(crate::clock::Instant::now());
         let t = turn_of(&kept, key, "a", "emission of").expect("a's backoff is over");
         t.ended(&Err(anyhow::anyhow!("boom")));
         assert_eq!(kept.failing(key, "a").as_deref(), Some("boom"));

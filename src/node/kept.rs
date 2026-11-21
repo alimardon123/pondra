@@ -6,7 +6,8 @@ use super::{Event, Held, Node, Options, Restarting};
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::clock::Instant;
 use tokio::sync::mpsc;
 
 /// What a kept node is doing now.
@@ -111,7 +112,7 @@ async fn supervising(mut options: Options, state: Arc<Mutex<State>>, running: Sl
                             return failed_until_closed(&set, why, &mut events, first.take()).await;
                         }
                         Some(Event::Close) | None => {
-                            let t0 = std::time::Instant::now();
+                            let t0 = crate::clock::Instant::now();
                             node.drain().await; // (its requests in flight answered: the router stays till then)
                             if crate::env::is_set("PONDRA_TRACE_START") {
                                 eprintln!("stop: drained {:.2} s", t0.elapsed().as_secs_f64());
