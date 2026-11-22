@@ -6,7 +6,6 @@
 //! files are merged 8 at a time, and keyed tables are compacted into one file once 8 pile up.
 use crate::query::{latest_sql, raw};
 use crate::answer::schema;
-use datafusion::prelude::ParquetReadOptions;
 use crate::store::*;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -461,7 +460,7 @@ async fn dead_rows(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Res
     let within = col(crate::text::VERSION).between(lit(after as i64 + 1), lit(upto as i64));
     Ok(match paths.is_empty() {
         true => ctx.read_empty()?.select(vec![lit(0i64).alias("__id"), lit(0i64).alias("__v")])?.limit(0, Some(0))?,
-        false => ctx.read_parquet(paths, ParquetReadOptions::default()).await?.filter(within)?.select(vec![col(crate::text::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
+        false => crate::file_formats::read(&ctx, crate::file_formats::default(), paths, None).await?.filter(within)?.select(vec![col(crate::text::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
     })
 }
 
@@ -556,12 +555,19 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
     let runs = jobs.into_iter().map(|job| {
         let node = &nodes[rounds.next.fetch_add(1, Relaxed) % nodes.len()];
         async move {
-            if node == me {
-                return run_job(lake, job, &crate::auth::Principal::node().scope).await; // (the node's own work: a tiering round's)
+            if node != me {
+                match crate::dial::call(&lake.node, node, crate::dial::Call::json("/cluster/job", &job)?).await {
+                    // (a member counted live that is gone since, killed or no longer answering, until its lease runs out: its
+                    // job runs here, as nothing it wrote there was handed back; what it did write, the orphan sweep takes)
+                    Err(e) if lake.node.dial.unreached(&e) => {}
+                    r => {
+                        let r = r?;
+                        anyhow::ensure!(r.ok(), "job on {node}: {}", r.text().await?);
+                        return Ok(r.json().await?);
+                    }
+                }
             }
-            let r = crate::dial::call(&lake.node, node, crate::dial::Call::json("/cluster/job", &job)?).await?;
-            anyhow::ensure!(r.ok(), "job on {node}: {}", r.text().await?);
-            Ok(r.json().await?)
+            run_job(lake, job, &crate::auth::Principal::node().scope).await // (the node's own work: a tiering round's)
         }
     });
     let (written, failed): (Vec<_>, Vec<_>) = futures::future::join_all(runs).await.into_iter().partition(|r| r.is_ok());

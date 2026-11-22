@@ -259,6 +259,16 @@ async fn used(State(app): State<App>, req: Request, next: Next) -> Response {
     next.run(req).await.map(|body| axum::body::Body::new(crate::node_state::kept(body, used)))
 }
 
+/// A refused sign-in as HTTP says it (`signin::Refusal`): 429 with when to try again for a name locked out, else 401
+/// with the challenge that names how to sign in. (The request's path and headers, not the request: its body isn't `Sync`,
+/// so a borrow of it held across an await would make the guard's future not `Send`.)
+async fn said_no(app: &App, path: &str, headers: &axum::http::HeaderMap, r: crate::signin::Refusal) -> Response {
+    match r.kind {
+        crate::signin::Kind::Locked(wait) => (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], r.words).into_response(),
+        crate::signin::Kind::Password | crate::signin::Kind::Token | crate::signin::Kind::Malformed => challenge(app, path, headers, (StatusCode::UNAUTHORIZED, r.words).into_response()).await,
+    }
+}
+
 /// Who asks (see `auth.rs`, `users.rs`): a token, a user's token, session or password; the
 /// program that started the node (`owner`); or, when nothing needs a sign-in, anyone, as an admin.
 /// Its role must cover the route; the request then runs as it (`auth::WHO`), and handlers see its
@@ -314,11 +324,6 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         };
     }
     let client = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.client(req.headers()));
-    if let Some(why) = credential.malformed() {
-        // (a header that can't be read is told so, at every door alike, never taken for no sign-in: an open node's)
-        crate::audit::refused_by(&app, "", "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
-        return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
-    }
     let needed = crate::auth::Auth::needed(req.uri().path(), req.method().as_str());
     let starting = !*app.lake.caught.borrow();
     let token = credential.token();
@@ -326,18 +331,14 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     if starting && needed > crate::auth::Role::None && !node {
         let _ = app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
     }
-    // (a sign-in with a user's name and password is counted per address and name: past ten failures a minute
-    // that pair is refused at once, the right password too; a bearer token isn't counted: `auth::guessing`)
-    let basic_by = credential.user().map(|name| (name.to_string(), client));
-    if let Some((name, ip)) = &basic_by {
-        if let Some(wait) = crate::auth::guessing(&app.lake, *ip, name) {
-            let why = crate::auth::guessing_says(name, wait);
-            crate::audit::refused_by(&app, name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
-            tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
-            return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
-        }
-    }
-    let signed = crate::users::who_at(&app.lake, &app.auth, &credential, vouched).await;
+    // (one sign-in at every door, `signin::Attempt`: a header that can't be read is refused, never taken for no sign-in (an
+    // open node's); a name locked out from this address is refused at once, the right password too; then whom it signs in)
+    let attempt = crate::signin::Attempt { app: &app, door: "http", from, client, what: format!("{} {}", req.method(), req.uri().path()), vouched };
+    let (signed, why) = match attempt.check(&credential).await {
+        crate::signin::Tried::Signed(p) => (Some(p), None),
+        crate::signin::Tried::Nobody(why) => (None, why),
+        crate::signin::Tried::Refused(r) => return said_no(&app, req.uri().path(), req.headers(), r).await,
+    };
     let mut open = false; // (a node with no tokens and no users: anyone who reaches it is its admin and one of its nodes)
     let who = match signed {
         Some(p) => p,
@@ -353,20 +354,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                 crate::auth::Principal::of(crate::auth::Role::Admin)
             }
         },
-        None if header.is_some() => {
-            if let Some((name, ip)) = &basic_by {
-                crate::auth::guessed(&app.lake, *ip, name);
-            }
-            // (an identity provider's token says why it was refused: expired, another audience, no such user here)
-            let why = match credential.secret() {
-                Some(t) => crate::sso::why(&app.lake, t).await,
-                None => None,
-            };
-            let why = why.unwrap_or_else(|| "wrong token, or user name and password".into());
-            crate::audit::refused_by(&app, credential.user().unwrap_or_default(), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
-            tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
-            return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
-        }
+        None if header.is_some() => return said_no(&app, req.uri().path(), req.headers(), attempt.refuse(&credential, why).await).await, // (counted, audited, after 400 ms)
         None => crate::auth::Principal::of(crate::auth::Role::None),
     };
     let who = who.at("http", from);
@@ -475,24 +463,19 @@ async fn protected_resource(State(app): State<App>, headers: axum::http::HeaderM
 
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
 /// `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); the console's sign-in.
-async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, who: Option<axum::Extension<crate::auth::Principal>>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
+async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let b: Value = serde_json::from_slice(&body).unwrap_or_default(); // (JSON, whatever its content type says)
     let (user, password) = (b["user"].as_str().unwrap_or_default(), b["password"].as_str().unwrap_or_default());
     if !peer.may_send_password() {
         return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (`tls.rs`)
     }
-    let ip = Some(peer.client(&headers));
-    if let Some(wait) = crate::auth::guessing(&app.lake, ip, user) {
-        let why = crate::auth::guessing_says(user, wait);
-        crate::audit::refused_by(&app, user, "http", Some(peer.addr), ip, "sign in", &why).await;
-        tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
-        return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
-    }
-    if !crate::users::password_ok(&app.lake, user, password).await {
-        crate::auth::guessed(&app.lake, ip, user);
-        crate::audit::refused_by(&app, user, "http", who.as_ref().and_then(|w| w.0.from), ip, "sign in", "wrong user name or password").await;
-        tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
-        return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
+    // (a user's own password, which a session is made from: no token. Locked out, counted and audited as at every door)
+    let attempt = crate::signin::Attempt { app: &app, door: "http", from: Some(peer.addr), client: Some(peer.client(&headers)), what: "sign in".into(), vouched: false };
+    if let Err(r) = attempt.password(user, password).await {
+        return match r.kind {
+            crate::signin::Kind::Locked(wait) => (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], r.words).into_response(),
+            _ => (StatusCode::UNAUTHORIZED, r.words).into_response(),
+        };
     }
     match crate::users::session(&app.lake, user).await {
         Ok((token, until)) => Json(j!({"token": token, "until": until, "user": user})).into_response(),

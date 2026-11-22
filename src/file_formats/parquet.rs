@@ -1,6 +1,19 @@
 //! Parquet's entry: the format every table's files are in today, and the default.
 
-use super::{FileStats, Finished, TableFileFormat, TableWriter};
+use super::{FileStats, Finished, Rows, TableFileFormat, TableWriter, Take};
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
+use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, ParquetRowSelection};
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::TaskContext;
+use datafusion::parquet::file::metadata::PageIndexPolicy;
+use datafusion::physical_plan::ExecutionPlan;
+use futures::future::{BoxFuture, FutureExt};
+use datafusion::catalog::Session;
+use datafusion::datasource::file_format::{parquet::ParquetFormat, FileFormat};
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use std::sync::Arc;
 use anyhow::Result;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -11,6 +24,7 @@ use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::parquet::file::properties::WriterProperties;
 use std::collections::BTreeMap;
 
+#[derive(Debug)]
 pub struct Parquet;
 
 /// The entry (the engine registers it: `engine.rs`).
@@ -20,6 +34,75 @@ impl TableFileFormat for Parquet {
     fn name(&self) -> &'static str { "parquet" }
     fn ending(&self) -> &'static str { "parquet" }
     fn writer(&self, schema: SchemaRef, keys: &[String]) -> Result<Box<dyn TableWriter>> { Ok(Box::new(Writer(writer(schema, keys)?))) }
+    fn reader(&self, state: &dyn Session) -> Arc<dyn FileFormat> { Arc::new(ParquetFormat::default().with_options(state.default_table_options().parquet)) }
+    /// (Parquet's row selection: the pages and row groups no selected row is in are skipped unread)
+    fn select(&self, file: PartitionedFile, rows: &Rows) -> Option<PartitionedFile> {
+        Some(file.with_extension(ParquetRowSelection::new(selection(rows))))
+    }
+    fn take(&self) -> Option<&dyn Take> { Some(self) }
+    fn filtering(&self, scan: &DataSourceExec) -> Option<Arc<dyn ExecutionPlan>> {
+        let (config, parquet) = scan.downcast_to_file_source::<ParquetSource>()?;
+        if parquet.table_parquet_options().global.pushdown_filters {
+            return None;
+        }
+        let parquet = parquet.clone().with_pushdown_filters(true).with_reorder_filters(true);
+        Some(DataSourceExec::from_data_source(FileScanConfigBuilder::from(config.clone()).with_source(Arc::new(parquet)).build()))
+    }
+}
+
+impl Take for Parquet {
+    fn again(&self, scan: &DataSourceExec) -> Option<(FileScanConfig, Arc<dyn ExecutionPlan>)> {
+        let (files, parquet) = scan.downcast_to_file_source::<ParquetSource>()?;
+        if files.file_groups.iter().flat_map(|g| g.files()).any(|f| f.extension::<ParquetAccessPlan>().is_some()) {
+            return None; // (a row selection could not join a file's own access plan)
+        }
+        let all = DataSourceExec::from_data_source(FileScanConfigBuilder::from(files.clone()).with_source(Arc::new(parquet.with_predicate(datafusion::physical_expr::expressions::lit(true)))).build());
+        Some((files.clone(), all))
+    }
+
+    fn at(&self, ctx: Arc<TaskContext>, files: FileScanConfig, file: PartitionedFile, rows: Vec<usize>) -> BoxFuture<'static, datafusion::error::Result<Arc<dyn ExecutionPlan>>> {
+        async move {
+            let store = ctx.runtime_env().object_store(&files.object_store_url)?;
+            let cache = ctx.runtime_env().cache_manager.get_file_metadata_cache();
+            // (with its page index, so only the rows' pages are read: in the cache once read)
+            let meta = DFParquetMetadata::new(store.as_ref(), &file.object_meta).with_file_metadata_cache(Some(cache)).with_page_index_policy(Some(PageIndexPolicy::Optional)).fetch_metadata().await?;
+            let selection = RowSelection::from_consecutive_ranges(rows.iter().map(|r| *r..*r + 1), meta.file_metadata().num_rows() as usize);
+            let mut file = file.with_extension(ParquetRowSelection::new(selection));
+            file.range = None;
+            Ok(DataSourceExec::from_data_source(FileScanConfigBuilder::from(files).with_file_groups(vec![FileGroup::new(vec![file])]).build()) as Arc<dyn ExecutionPlan>)
+        }
+        .boxed()
+    }
+}
+
+/// `rows` as a Parquet row selection.
+fn selection(rows: &Rows) -> RowSelection {
+    if let Some(at) = rows.only {
+        return RowSelection::from_consecutive_ranges(at.iter().filter(|p| **p < rows.count).map(|p| *p as usize..*p as usize + 1), rows.count as usize);
+    }
+    let kept = kept(rows.gone, rows.count);
+    match rows.range {
+        Some((from, to)) => kept.intersection(&RowSelection::from_consecutive_ranges(std::iter::once(from as usize..to.min(rows.count) as usize), rows.count as usize)),
+        None => kept,
+    }
+}
+
+/// The rows a file keeps, as a row selection: all of its `rows` but the positions `gone`.
+fn kept(gone: &[u64], rows: u64) -> RowSelection {
+    let (mut out, mut at) = (vec![], 0u64);
+    for &g in gone.iter().filter(|g| **g < rows) {
+        if g > at {
+            out.push(RowSelector::select((g - at) as usize));
+        }
+        if g >= at {
+            out.push(RowSelector::skip(1));
+            at = g + 1;
+        }
+    }
+    if rows > at {
+        out.push(RowSelector::select((rows - at) as usize));
+    }
+    out.into()
 }
 
 struct Writer(ArrowWriter<Vec<u8>>);
@@ -86,5 +169,27 @@ pub(crate) fn codec() -> Compression {
         "snappy" => Compression::SNAPPY,
         "none" => Compression::UNCOMPRESSED,
         _ => Compression::LZ4_RAW,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file's rows by their places, as Parquet's row selection: those its deletes leave in its range, or those at places.
+    #[test]
+    fn rows_by_their_places_are_a_row_selection() {
+        let picked = |gone: &[u64], range: Option<(u64, u64)>, only: Option<&[u64]>| {
+            let s = selection(&Rows { count: 10, gone, range, only });
+            s.iter().fold((0, vec![]), |(at, mut out), r| {
+                if !r.skip {
+                    out.extend(at..at + r.row_count);
+                }
+                (at + r.row_count, out)
+            }).1
+        };
+        assert_eq!(picked(&[2, 5], Some((1, 8)), None), vec![1, 3, 4, 6, 7]);
+        assert_eq!(picked(&[3, 12], None, None), vec![0, 1, 2, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(picked(&[], None, Some(&[0, 9, 12])), vec![0, 9], "a place past its rows is none of them");
     }
 }

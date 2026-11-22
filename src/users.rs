@@ -243,6 +243,11 @@ fn parse(mut w: Words, rows: Option<&str>) -> Result<Change> {
                     let p = w.string()?;
                     ensure!(p.chars().count() >= 8, "a password has at least 8 characters");
                     ensure!(!crate::sso::shaped(&p), "a password shaped like a JSON Web Token (eyJ…, three parts) is taken for an identity provider's token, so it would never sign in: choose another");
+                    // (a token as the password signs in the token's principal whatever the name, `sign_in`: a password in a
+                    // token's form would be taken for one, so the forms are the tokens' alone)
+                    if let Some(t) = TOKEN_PREFIXES.iter().find(|t| p.starts_with(*t)) {
+                        bail!("a password can't begin {t}, the form of Pondra's tokens: choose another");
+                    }
                     verifier = Some(Verifier::of(&p));
                 } else if w.is("superuser") {
                     superuser = Some(true);
@@ -1636,32 +1641,42 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth
 
 /// `who`, for a request from this machine or with the nodes' authority's certificate (`vouched`) or from anyone
 /// else: the nodes' key counts as `nodes_key` says.
-pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth::Credential, vouched: bool) -> Option<Principal> {
-    if let crate::auth::Credential::Password { user, password } = credential {
-        return sign_in(lake, auth, user, password).await;
+pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth::Credential, vouched: bool) -> Option<Principal> { who_or_why(lake, auth, credential, vouched).await.ok() }
+
+/// `who_at`, or why it signs nobody in when there is something to say: an identity provider's token says why (expired,
+/// another audience, no such user here). Err(None): nobody, with nothing to say.
+pub async fn who_or_why(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth::Credential, vouched: bool) -> Result<Principal, Option<String>> {
+    match credential {
+        crate::auth::Credential::Password { user, password } => signed_in(lake, auth, user, password).await,
+        crate::auth::Credential::Token(token) => of_token(lake, auth, token, vouched).await,
+        _ => Err(None),
     }
-    if let Some(token) = credential.token() {
-        if let Some(p) = auth.lent_principal(lake, token) {
-            return Some(p);
-        }
-        let role = auth.token_role(token);
-        if role > Role::None {
-            return Some(Principal::token(role));
-        }
-        if let Some(c) = crate::sso::check(lake, token).await {
-            return claimed(lake, &c.ok()?).await.ok(); // (an identity provider's: ADR-074)
-        }
-        // (where an admin token is set the nodes call each other with it, so a `pn_` key read from the bucket opens nothing)
-        if token.starts_with("pn_") && nodes_key(auth.admin_set(), crate::ext::shared_master(), vouched) && keys(lake).await.is_ok_and(|k| crate::crypto::same(k.node.as_bytes(), token.as_bytes())) {
-            return Some(Principal::token(Role::Admin));
-        }
-        if token.starts_with("ps_") {
-            return session_principal(lake, token).await;
-        }
-        let (user, until) = token_user(lake, token).await?;
-        return token_principal(lake, &user, until).await;
+}
+
+/// Whom a token signs in: a lent one's, a node's role, an identity provider's user, the nodes' key (`nodes_key`), a
+/// session's, or a user's own (`pt_`).
+async fn of_token(lake: &Lake, auth: &crate::auth::Auth, token: &str, vouched: bool) -> Result<Principal, Option<String>> {
+    if let Some(p) = auth.lent_principal(lake, token) {
+        return Ok(p);
     }
-    None
+    let role = auth.token_role(token);
+    if role > Role::None {
+        return Ok(Principal::token(role));
+    }
+    if let Some(c) = crate::sso::check(lake, token).await {
+        // (an identity provider's: ADR-074. Refused, it says why, as `sso::why` words it)
+        let provider = |e: anyhow::Error| Some(format!("the identity provider's token: {e:#}"));
+        return claimed(lake, &c.map_err(provider)?).await.map_err(provider);
+    }
+    // (where an admin token is set the nodes call each other with it, so a `pn_` key read from the bucket opens nothing)
+    if token.starts_with("pn_") && nodes_key(auth.admin_set(), crate::ext::shared_master(), vouched) && keys(lake).await.is_ok_and(|k| crate::crypto::same(k.node.as_bytes(), token.as_bytes())) {
+        return Ok(Principal::token(Role::Admin));
+    }
+    if token.starts_with("ps_") {
+        return session_principal(lake, token).await.ok_or(None);
+    }
+    let (user, until) = token_user(lake, token).await.ok_or(None)?;
+    token_principal(lake, &user, until).await.ok_or(None)
 }
 
 /// Does the lake's key for its nodes (`pn_`) sign a request in? Only without an admin token (the nodes call each
@@ -1675,29 +1690,31 @@ pub fn nodes_key(admin_set: bool, sealed: bool, vouched: bool) -> bool { !admin_
 /// may cross a plain connection under `PONDRA_TLS=optional`, a password never (`tls::may_send_password`).
 pub fn is_token(user: &str, password: &str) -> bool { BUILT_IN.contains(&user) || password.starts_with("pt_") || crate::sso::shaped(password) }
 
-/// A name and a password (or a token as the password): the Postgres, Kafka and Flight doors' and
-/// HTTP Basic's. The tokens' names (`admin`, `writer`, `reader`) take their tokens.
-pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> {
-    if BUILT_IN.contains(&user) {
-        let role = auth.token_role(password);
-        return (role > Role::None && auth.token_for(user).is_some_and(|t| crate::crypto::same(t.as_bytes(), password.as_bytes()))).then(|| Principal::token(role));
+/// The forms of Pondra's own tokens: a user's (`pt_`), a session (`ps_`), the nodes' key (`pn_`), a branch's key (`pb_`).
+/// A password can't begin with one (`CREATE | ALTER USER … PASSWORD`).
+pub const TOKEN_PREFIXES: [&str; 4] = ["pt_", "ps_", "pn_", "pb_"];
+
+/// Is `password` a token, by its form: a node's token, a user's (`pt_`), a session (`ps_`), an identity provider's
+/// (`sso::shaped`)? Not the nodes' key or a branch's, which no name and password carries.
+pub fn token_form(auth: &crate::auth::Auth, password: &str) -> bool {
+    auth.token_role(password) > Role::None || password.starts_with("pt_") || password.starts_with("ps_") || crate::sso::shaped(password)
+}
+
+/// A name and a password, or a token as the password: the Postgres, Kafka and Flight doors' and HTTP Basic's. A token
+/// signs in the token's principal whatever the name (redesign step 7, piece 2): a node's token, a user's `pt_`, a session,
+/// an identity provider's. The name tells nothing a token doesn't, and the audit line records it beside (`signin`). Else
+/// a user's own password; a token's name (`admin`, `writer`, `reader`) takes none.
+pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> { signed_in(lake, auth, user, password).await.ok() }
+
+/// `sign_in`, or why not when a token says (`who_or_why`).
+async fn signed_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Result<Principal, Option<String>> {
+    if token_form(auth, password) {
+        return of_token(lake, auth, password, false).await;
     }
-    if let Some(c) = crate::sso::check(lake, password).await {
-        // (an identity provider's token as the password: it signs in only the user it names)
-        let c = c.ok().filter(|c| c.user == user.to_lowercase())?;
-        return claimed(lake, &c).await.ok();
+    if BUILT_IN.contains(&user) || !password_ok(lake, user, password).await {
+        return Err(None);
     }
-    if password.starts_with("pt_") {
-        let (named, until) = token_user(lake, password).await?;
-        return match named == user {
-            true => token_principal(lake, user, until).await,
-            false => None,
-        };
-    }
-    match password_ok(lake, user, password).await {
-        true => principal(lake, user).await.ok(),
-        false => None,
-    }
+    principal(lake, user).await.map_err(|_| None)
 }
 
 /// `SHOW USERS`, `SHOW GRANTS [TO name]`: what `pondra.users` and `pondra.grants` hold.
@@ -1769,6 +1786,19 @@ mod tests {
         assert!(!node.operator() && node.whole() && node.superuser(), "whole and an admin's, but not the operator's");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn a_password_in_a_tokens_form_is_refused() {
+        let made = |p: &str| parse(Words::of(&format!("CREATE USER ann PASSWORD '{p}'")).unwrap(), None).map(|_| ()).map_err(|e| e.to_string());
+        for t in TOKEN_PREFIXES {
+            let said = made(&format!("{t}0123456789")).unwrap_err();
+            assert!(said.contains(&format!("can't begin {t}")), "{t}: {said}");
+        }
+        assert!(made("eyJhbGciOi.eyJzdWIi.c2lnbmF0dXJl").is_err(), "a JSON Web Token's shape");
+        assert!(made("a-good-password_pt_").is_ok(), "a token's form inside a password is a password");
+        let altered = parse(Words::of("ALTER USER ann PASSWORD 'pt_0123456789'").unwrap(), None).map(|_| ()).unwrap_err().to_string();
+        assert!(altered.contains("can't begin pt_"), "ALTER too: {altered}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
