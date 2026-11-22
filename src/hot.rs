@@ -31,15 +31,12 @@
 //! for a filter on the time; a top-N reads the batches in its key's order, so its bound is tight
 //! after the first few, either way round.
 use crate::store::{DataFile, Lake, Lineage, TableMeta};
-use datafusion::datasource::file_format::options::ReadOptions;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
-use datafusion::prelude::ParquetReadOptions;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use datafusion::arrow::array::{new_null_array, Array, ArrayData, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchOptions, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::parquet::arrow::{arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder}, ProjectionMask};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{project_schema, stats::Precision, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
@@ -543,27 +540,16 @@ async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool
 
 /// `decode`'s reading, of a file's `bytes` whose rows `gone` are deleted.
 fn read_columns(bytes: bytes::Bytes, gone: &[u64], fields: &[FieldRef], lineage: Option<Lineage>, fits: impl FnOnce(usize) -> bool) -> Result<std::result::Result<Decoded, usize>> {
-    use datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-    // Strings straight to views (no copy of their bytes), as the table is read (see `read_schema`).
-    let file = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?.schema().clone();
-    let views = file.fields().iter().map(|f| match f.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
-        _ => f.clone(),
-    });
-    let hint = Arc::new(Schema::new_with_metadata(views.collect::<Vec<_>>(), file.metadata().clone()));
-    let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::new().with_schema(hint))?;
+    let format = crate::file_formats::default();
+    let file = format.columns().with_context(|| format!("{}: the hot tier decodes files' columns, which this format's aren't", format.name()))?.open(bytes)?;
+    let schema = file.schema();
     // (the file's column each field is read from: none for one its lineage makes or the file lacks)
     let made = |f: &FieldRef| lineage.is_some() && [crate::text::ROW_ID, crate::text::VERSION, crate::text::CREATED, crate::text::UPDATED].contains(&f.name().as_str());
-    let roots: Vec<Option<usize>> = fields.iter().map(|f| if made(f) { None } else { meta.schema().index_of(f.name()).ok() }).collect();
-    let guess = estimate(meta.metadata(), &ProjectionMask::roots(meta.parquet_schema(), roots.iter().flatten().copied()));
+    let roots: Vec<Option<usize>> = fields.iter().map(|f| if made(f) { None } else { schema.index_of(f.name()).ok() }).collect();
+    let guess = file.estimate(&roots.iter().flatten().copied().collect::<Vec<_>>());
     if !fits(guess) {
         return Ok(Err(guess));
     }
-    let read = |roots: Vec<usize>| {
-        let b = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes.clone(), meta.clone());
-        let mask = ProjectionMask::roots(b.parquet_schema(), roots);
-        b.with_projection(mask).with_batch_size(BATCH).build()
-    };
     // (which of a batch's rows are kept, the batch's first row being row `at` of the file)
     let keep = |at: u64, n: usize| {
         (!gone.is_empty()).then(|| {
@@ -595,7 +581,7 @@ fn read_columns(bytes: bytes::Bytes, gone: &[u64], fields: &[FieldRef], lineage:
     for (i, f) in fields.iter().enumerate() {
         let Some(root) = roots[i] else { continue };
         let mut n = vec![];
-        let a = arrays(f, &mut read(vec![root])?.map(|b| b.map_err(anyhow::Error::from)), &mut n)?;
+        let a = arrays(f, &mut file.read(&[root], BATCH)?, &mut n)?;
         if rows.get_or_insert_with(|| n.clone()) != &n {
             anyhow::bail!("{}: its columns read in batches of other sizes", f.name());
         }
@@ -605,7 +591,7 @@ fn read_columns(bytes: bytes::Bytes, gone: &[u64], fields: &[FieldRef], lineage:
     // The batches' rows (a file none of whose fields are read: from a read of no column), and the fields made, not read.
     let rows = match rows {
         Some(rows) => rows,
-        None => read(vec![])?.map(|b| Ok(b?.num_rows())).collect::<Result<Vec<_>>>()?,
+        None => file.read(&[], BATCH)?.map(|b| Ok(b?.num_rows())).collect::<Result<Vec<_>>>()?,
     };
     for (i, f) in fields.iter().enumerate().filter(|(i, _)| roots[*i].is_none()) {
         let mut batches = rows.iter().map(|&n| Ok(RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &RecordBatchOptions::new().with_row_count(Some(n)))?));
@@ -627,30 +613,6 @@ fn read_columns(bytes: bytes::Bytes, gone: &[u64], fields: &[FieldRef], lineage:
 
 /// What `decode` gives: each batch's rows, each column's arrays (a batch each), and each column's ranges.
 type Decoded = (Vec<usize>, Vec<Vec<ArrayRef>>, Vec<Option<Ranges>>);
-
-/// About the bytes the columns `mask` takes decode to, from the file's footer: each column chunk's uncompressed bytes,
-/// and at least its rows times what a value takes once decoded (a dictionary's indices decode to whole values; a string
-/// to a 16-byte view beside its bytes).
-fn estimate(meta: &datafusion::parquet::file::metadata::ParquetMetaData, mask: &ProjectionMask) -> usize {
-    use datafusion::parquet::basic::Type;
-    let columns = meta.file_metadata().schema_descr().columns();
-    let mut bytes = 0usize;
-    for g in meta.row_groups() {
-        let rows = g.num_rows().max(0) as usize;
-        for (i, c) in columns.iter().enumerate().filter(|(i, _)| mask.leaf_included(*i)) {
-            let raw = g.column(i).uncompressed_size().max(0) as usize;
-            bytes += match c.physical_type() {
-                Type::BYTE_ARRAY => raw + rows * 16,
-                Type::BOOLEAN => raw.max(rows / 8),
-                Type::INT32 | Type::FLOAT => raw.max(rows * 4),
-                Type::INT64 | Type::DOUBLE => raw.max(rows * 8),
-                Type::INT96 => raw.max(rows * 16), // (read as a timestamp of 8 bytes, or 12 kept: the larger)
-                Type::FIXED_LEN_BYTE_ARRAY => raw.max(rows * c.type_length().max(1) as usize),
-            };
-        }
-    }
-    bytes
-}
 
 /// A file's batches of one column copied into one allocation of their own (invariant 212), each buffer a piece of
 /// it that says its own size. Kept in the decoder's buffers, the columns sat among its short-lived
@@ -854,7 +816,7 @@ impl TableProvider for HotFiles {
         if !footed.is_empty() {
             crate::metrics::add(&self.lake.node.metrics.footers_planned, footed.len() as u64);
             let urls = footed.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
-            let options = ParquetReadOptions::default().to_listing_options(state.config(), state.default_table_options());
+            let options = crate::file_formats::listing(crate::file_formats::default(), state);
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
             let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
             plans.push(gated(told(table.scan(state, projection, filters, limit).await?, &self.known)?, &holder)?);
@@ -1467,14 +1429,15 @@ mod tests {
         let mut w = ArrowWriter::try_new(&mut body, batch.schema(), None).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
-        let b = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(body)).unwrap();
+        use crate::file_formats::Columns;
+        let b = crate::file_formats::parquet::PARQUET.open(bytes::Bytes::from(body)).unwrap();
         for (c, name) in [(0usize, "i"), (1, "name"), (2, "flag")] {
             let decoded = size(&whole(vec![batch.column(c).clone()]));
-            let guess = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [c]));
+            let guess = b.estimate(&[c]);
             assert!(guess >= decoded && guess <= decoded * 3, "{name}: guessed {guess} for {decoded}");
         }
-        let one = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [0]));
-        let all = estimate(b.metadata(), &ProjectionMask::roots(b.parquet_schema(), [0, 1, 2]));
+        let one = b.estimate(&[0]);
+        let all = b.estimate(&[0, 1, 2]);
         assert!(all > one * 3, "the columns asked for: {one} of {all}");
     }
 
@@ -1514,7 +1477,7 @@ mod tests {
         assert!(values(4).iter().all(|&v| v == 7));
         assert!(ranges[0].is_some());
 
-        let guess = estimate(ParquetRecordBatchReaderBuilder::try_new(body.clone()).unwrap().metadata(), &ProjectionMask::all());
+        let guess = crate::file_formats::Columns::open(&crate::file_formats::parquet::PARQUET, body.clone()).unwrap().estimate(&[0, 1]);
         match read_columns(body, &gone, &fields, lineage, |_| false).unwrap() {
             Err(estimate) => assert!(estimate > 0 && estimate <= guess, "{estimate} of {guess}"),
             Ok(_) => panic!("read though it doesn't fit"),

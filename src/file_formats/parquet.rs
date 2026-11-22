@@ -1,6 +1,12 @@
 //! Parquet's entry: the format every table's files are in today, and the default.
 
-use super::{FileStats, Finished, Rows, TableFileFormat, TableWriter, Take};
+use super::{BlockIndex, Blocks, Columns, FileStats, Finished, OpenFile, Rows, Stored, TableFileFormat, TableWriter, Take};
+use anyhow::Context;
+use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+use datafusion::parquet::arrow::ProjectionMask;
+use datafusion::parquet::file::statistics::Statistics;
+use futures::TryStreamExt;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, ParquetRowSelection};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource};
@@ -48,6 +54,120 @@ impl TableFileFormat for Parquet {
         let parquet = parquet.clone().with_pushdown_filters(true).with_reorder_filters(true);
         Some(DataSourceExec::from_data_source(FileScanConfigBuilder::from(config.clone()).with_source(Arc::new(parquet)).build()))
     }
+    fn blocks(&self) -> Option<&dyn Blocks> { Some(self) }
+    fn columns(&self) -> Option<&dyn Columns> { Some(self) }
+}
+
+/// A file's blocks are its row groups, its index its footer: a row group's min and max say whether it may hold a key.
+impl Blocks for Parquet {
+    fn index<'a>(&'a self, file: &'a Stored) -> BoxFuture<'a, Result<Arc<dyn BlockIndex>>> {
+        async move { Ok(Arc::new(Footer(ArrowReaderMetadata::load_async(&mut Reader::of(file), ArrowReaderOptions::new()).await?)) as Arc<dyn BlockIndex>) }.boxed()
+    }
+}
+
+/// A file's footer, as a lookup keeps it.
+struct Footer(ArrowReaderMetadata);
+
+impl BlockIndex for Footer {
+    fn holding(&self, column: &str, key: &ScalarValue) -> Result<Vec<usize>> {
+        let meta = self.0.metadata();
+        let col = meta.file_metadata().schema_descr().columns().iter().position(|c| c.name() == column).context("key column not in file")?;
+        Ok((0..meta.num_row_groups()).filter(|g| may_hold(meta.row_group(*g).column(col).statistics(), key)).collect())
+    }
+
+    fn read<'a>(&'a self, file: &'a Stored, b: usize) -> BoxFuture<'a, Result<RecordBatch>> {
+        async move {
+            let rows = self.0.metadata().row_group(b).num_rows() as usize;
+            let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(Reader::of(file), self.0.clone()).with_row_groups(vec![b]).with_batch_size(rows.max(1)).build()?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            Ok(datafusion::arrow::compute::concat_batches(self.0.schema(), &batches)?)
+        }
+        .boxed()
+    }
+}
+
+/// Whether a row group's min/max can contain `key` (unknown types and missing statistics: yes).
+fn may_hold(stats: Option<&Statistics>, key: &ScalarValue) -> bool {
+    match (stats, key) {
+        (Some(Statistics::Int64(s)), ScalarValue::Int64(Some(k))) => s.min_opt().is_none_or(|m| m <= k) && s.max_opt().is_none_or(|m| k <= m),
+        (Some(Statistics::Int32(s)), ScalarValue::Int32(Some(k))) => s.min_opt().is_none_or(|m| m <= k) && s.max_opt().is_none_or(|m| k <= m),
+        (Some(Statistics::ByteArray(s)), ScalarValue::Utf8(Some(k))) => {
+            s.min_opt().is_none_or(|m| m.data() <= k.as_bytes()) && s.max_opt().is_none_or(|m| k.as_bytes() <= m.data())
+        }
+        _ => true,
+    }
+}
+
+/// A file, read by byte range where it is.
+struct Reader(Arc<dyn datafusion::object_store::ObjectStore>, datafusion::object_store::path::Path, u64);
+
+impl Reader {
+    fn of(f: &Stored) -> Self { Reader(f.store.clone(), f.path.clone(), f.bytes) }
+}
+
+impl AsyncFileReader for Reader {
+    fn get_bytes(&mut self, range: std::ops::Range<u64>) -> BoxFuture<'_, datafusion::parquet::errors::Result<bytes::Bytes>> {
+        use datafusion::object_store::ObjectStoreExt;
+        async move { self.0.get_range(&self.1, range).await.map_err(|e| datafusion::parquet::errors::ParquetError::External(Box::new(e))) }.boxed()
+    }
+
+    fn get_metadata<'a>(&'a mut self, _: Option<&'a ArrowReaderOptions>) -> BoxFuture<'a, datafusion::parquet::errors::Result<Arc<ParquetMetaData>>> {
+        let size = self.2;
+        async move { Ok(Arc::new(datafusion::parquet::file::metadata::ParquetMetaDataReader::new().load_and_finish(self, size).await?)) }.boxed()
+    }
+}
+
+/// A file's columns are read from its bytes as the table is read: strings straight to views (see `read_schema`).
+impl Columns for Parquet {
+    fn open(&self, bytes: bytes::Bytes) -> Result<Box<dyn OpenFile>> {
+        use datafusion::arrow::datatypes::DataType;
+        let file = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?.schema().clone();
+        let views = file.fields().iter().map(|f| match f.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
+            _ => f.clone(),
+        });
+        let hint = Arc::new(Schema::new_with_metadata(views.collect::<Vec<_>>(), file.metadata().clone()));
+        Ok(Box::new(Open(bytes.clone(), ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::new().with_schema(hint))?)))
+    }
+}
+
+/// A file's bytes and their footer.
+struct Open(bytes::Bytes, ArrowReaderMetadata);
+
+impl OpenFile for Open {
+    fn schema(&self) -> SchemaRef { self.1.schema().clone() }
+
+    fn estimate(&self, columns: &[usize]) -> usize { estimate(self.1.metadata(), &ProjectionMask::roots(self.1.parquet_schema(), columns.iter().copied())) }
+
+    fn read(&self, columns: &[usize], batch: usize) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + Send>> {
+        let b = ParquetRecordBatchReaderBuilder::new_with_metadata(self.0.clone(), self.1.clone());
+        let mask = ProjectionMask::roots(b.parquet_schema(), columns.iter().copied());
+        Ok(Box::new(b.with_projection(mask).with_batch_size(batch).build()?.map(|b| b.map_err(anyhow::Error::from))))
+    }
+}
+
+/// About the bytes the columns `mask` takes decode to, from the file's footer: each column chunk's uncompressed bytes,
+/// and at least its rows times what a value takes once decoded (a dictionary's indices decode to whole values; a string
+/// to a 16-byte view beside its bytes).
+fn estimate(meta: &ParquetMetaData, mask: &ProjectionMask) -> usize {
+    use datafusion::parquet::basic::Type;
+    let columns = meta.file_metadata().schema_descr().columns();
+    let mut bytes = 0usize;
+    for g in meta.row_groups() {
+        let rows = g.num_rows().max(0) as usize;
+        for (i, c) in columns.iter().enumerate().filter(|(i, _)| mask.leaf_included(*i)) {
+            let raw = g.column(i).uncompressed_size().max(0) as usize;
+            bytes += match c.physical_type() {
+                Type::BYTE_ARRAY => raw + rows * 16,
+                Type::BOOLEAN => raw.max(rows / 8),
+                Type::INT32 | Type::FLOAT => raw.max(rows * 4),
+                Type::INT64 | Type::DOUBLE => raw.max(rows * 8),
+                Type::INT96 => raw.max(rows * 16), // (read as a timestamp of 8 bytes, or 12 kept: the larger)
+                Type::FIXED_LEN_BYTE_ARRAY => raw.max(rows * c.type_length().max(1) as usize),
+            };
+        }
+    }
+    bytes
 }
 
 impl Take for Parquet {

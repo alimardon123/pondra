@@ -1,31 +1,24 @@
 //! Serving reads without SQL. The current row of one key in an upsert table is found the way an
 //! LSM finds it: the log tail newest-first, then the files newest-first. Each file is narrowed to
-//! the row groups whose key range can hold the key (Parquet statistics), and a row group is
-//! decoded once and then kept in memory. A lookup costs a scan of one cached row group — tens of
-//! microseconds — instead of planning and running a query.
+//! the blocks whose key range can hold the key (its format's index: Parquet's row groups and their
+//! statistics), and a block is decoded once and then kept in memory. A lookup costs a scan of one
+//! cached block — tens of microseconds — instead of planning and running a query.
 use crate::store::*;
 use crate::ledger::{ByteLru, Charged};
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{make_comparator, Array, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::kernels::cmp::{eq, lt_eq};
-use datafusion::arrow::compute::{and, cast, concat_batches, SortOptions};
+use datafusion::arrow::compute::{and, cast, SortOptions};
 use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
-use datafusion::parquet::errors::ParquetError;
-use datafusion::parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
-use datafusion::parquet::file::statistics::Statistics;
+use crate::file_formats::{BlockIndex, Blocks, Stored};
 use datafusion::scalar::ScalarValue;
-use object_store_df::ObjectStoreExt;
-use futures::future::{BoxFuture, FutureExt};
-use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Decoded row groups (least recently used out past `new`'s bytes) and Parquet footers, per node.
+/// Decoded blocks (least recently used out past `new`'s bytes) and files' indexes, per node.
 pub struct Groups {
     rows: Mutex<ByteLru<(String, usize), (RecordBatch, bool)>>, // (rows, sorted by key), each charged its rows' memory
-    footers: Mutex<HashMap<String, ArrowReaderMetadata>>,
+    indexes: Mutex<HashMap<String, Arc<dyn BlockIndex>>>,
 }
 
 /// The row groups held for lookups (at most `max` bytes), the least recently used given back first.
@@ -40,14 +33,14 @@ impl Charged for Groups {
 }
 
 impl Groups {
-    pub fn new(max: usize) -> Self { Groups { rows: Mutex::new(ByteLru::new(max)), footers: Default::default() } }
+    pub fn new(max: usize) -> Self { Groups { rows: Mutex::new(ByteLru::new(max)), indexes: Default::default() } }
 }
 
 /// A lake's row groups for lookups, made as it opens (`lake_state::Registered::add_at_open`): its caches give memory back
 /// in the order it lists them (`Lake::caches`), and every lookup reads them.
 impl crate::lake_state::LakeState for Groups {
     const NAME: &'static str = "lookups";
-    const ABOUT: &'static str = "decoded row groups and Parquet footers of the files key lookups read";
+    const ABOUT: &'static str = "decoded blocks and indexes of the files key lookups read";
 
     fn make() -> Self { Groups::new(crate::store::cache_mb() << 19) }
 
@@ -484,15 +477,12 @@ pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &
 async fn newest_in_files(lake: &Lake, meta: &TableMeta, keys: &[(&str, ScalarValue)]) -> Result<Option<RecordBatch>> {
     let mut files: Vec<&DataFile> = meta.files.iter().collect();
     files.sort_by_key(|f| std::cmp::Reverse(f.ord));
+    let format = crate::file_formats::default();
+    let blocks = format.blocks().with_context(|| format!("{}: a key lookup reads files by blocks, which this format's aren't", format.name()))?;
     for f in files {
-        let footer = footer(lake, f).await?;
-        let schema = footer.metadata().file_metadata().schema_descr();
-        let col = schema.columns().iter().position(|c| c.name() == keys[0].0).context("key column not in file")?;
-        for g in 0..footer.metadata().num_row_groups() {
-            if !may_hold(footer.metadata().row_group(g).column(col).statistics(), &keys[0].1) {
-                continue;
-            }
-            let (batch, sorted) = row_group(lake, f, &footer, g, keys[0].0).await?;
+        let index = index(lake, blocks, f).await?;
+        for g in index.holding(keys[0].0, &keys[0].1)? {
+            let (batch, sorted) = block(lake, f, index.as_ref(), g, keys[0].0).await?;
             if let Some(i) = last_match(&batch, keys, sorted)? {
                 return Ok(Some(batch.slice(i, 1)));
             }
@@ -538,39 +528,24 @@ fn first(n: usize, before: impl Fn(usize) -> bool) -> usize {
     lo
 }
 
-/// Whether a row group's min/max can contain `key` (unknown types and missing statistics: yes).
-fn may_hold(stats: Option<&Statistics>, key: &ScalarValue) -> bool {
-    match (stats, key) {
-        (Some(Statistics::Int64(s)), ScalarValue::Int64(Some(k))) => s.min_opt().is_none_or(|m| m <= k) && s.max_opt().is_none_or(|m| k <= m),
-        (Some(Statistics::Int32(s)), ScalarValue::Int32(Some(k))) => s.min_opt().is_none_or(|m| m <= k) && s.max_opt().is_none_or(|m| k <= m),
-        (Some(Statistics::ByteArray(s)), ScalarValue::Utf8(Some(k))) => {
-            s.min_opt().is_none_or(|m| m.data() <= k.as_bytes()) && s.max_opt().is_none_or(|m| k.as_bytes() <= m.data())
-        }
-        _ => true,
-    }
-}
-
-/// A file's Parquet footer, read once per node (files never change).
-async fn footer(lake: &Lake, f: &DataFile) -> Result<ArrowReaderMetadata> {
-    if let Some(m) = lake.groups().footers.lock().unwrap().get(&f.path) {
+/// A file's index, read once per node (files never change).
+async fn index(lake: &Lake, blocks: &dyn Blocks, f: &DataFile) -> Result<Arc<dyn BlockIndex>> {
+    if let Some(m) = lake.groups().indexes.lock().unwrap().get(&f.path) {
         return Ok(m.clone());
     }
-    let m = ArrowReaderMetadata::load_async(&mut reader(lake, f)?, ArrowReaderOptions::new()).await?;
-    lake.groups().footers.lock().unwrap().insert(f.path.clone(), m.clone());
+    let m = blocks.index(&stored(lake, f)?).await?;
+    lake.groups().indexes.lock().unwrap().insert(f.path.clone(), m.clone());
     Ok(m)
 }
 
-/// Row group `g` of a file, decoded (through the SSD tier and read cache, like any query's reads),
+/// Block `g` of a file, decoded (through the SSD tier and read cache, like any query's reads),
 /// and whether it is sorted by column `key` (files are written sorted by key; older ones may not be).
-async fn row_group(lake: &Lake, f: &DataFile, footer: &ArrowReaderMetadata, g: usize, key: &str) -> Result<(RecordBatch, bool)> {
+async fn block(lake: &Lake, f: &DataFile, index: &dyn BlockIndex, g: usize, key: &str) -> Result<(RecordBatch, bool)> {
     let id = (f.path.clone(), g);
     if let Some(b) = lake.groups().rows.lock().unwrap().get(&id) {
         return Ok(b.clone());
     }
-    let rows = footer.metadata().row_group(g).num_rows() as usize;
-    let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(reader(lake, f)?, footer.clone()).with_row_groups(vec![g]).with_batch_size(rows.max(1)).build()?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-    let batch = concat_batches(&footer.schema().clone(), &batches)?;
+    let batch = index.read(&stored(lake, f)?, g).await?;
     let col = batch.column_by_name(key).context("key column missing")?;
     let n = col.len();
     let sorted = n < 2 || lt_eq(&col.slice(0, n - 1), &col.slice(1, n - 1))?.true_count() == n - 1;
@@ -580,23 +555,10 @@ async fn row_group(lake: &Lake, f: &DataFile, footer: &ArrowReaderMetadata, g: u
     Ok((batch, sorted))
 }
 
-/// A file, read by byte range through the store DataFusion uses for it.
-struct Reader(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path, u64);
-
-fn reader(lake: &Lake, f: &DataFile) -> Result<Reader> {
+/// A file where it is, read through the store DataFusion uses for it.
+fn stored(lake: &Lake, f: &DataFile) -> Result<Stored> {
     let url = ListingTableUrl::parse(lake.full(&f.path))?;
-    Ok(Reader(lake.object_store(&url)?, url.prefix().clone(), f.bytes))
-}
-
-impl AsyncFileReader for Reader {
-    fn get_bytes(&mut self, range: std::ops::Range<u64>) -> BoxFuture<'_, datafusion::parquet::errors::Result<bytes::Bytes>> {
-        async move { self.0.get_range(&self.1, range).await.map_err(|e| ParquetError::External(Box::new(e))) }.boxed()
-    }
-
-    fn get_metadata<'a>(&'a mut self, _: Option<&'a ArrowReaderOptions>) -> BoxFuture<'a, datafusion::parquet::errors::Result<Arc<ParquetMetaData>>> {
-        let size = self.2;
-        async move { Ok(Arc::new(ParquetMetaDataReader::new().load_and_finish(self, size).await?)) }.boxed()
-    }
+    Ok(Stored { store: lake.object_store(&url)?, path: url.prefix().clone(), bytes: f.bytes })
 }
 
 #[cfg(test)]
