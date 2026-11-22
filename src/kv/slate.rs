@@ -370,7 +370,7 @@ async fn unpin(store: Store) {
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let Ok(checkpoints) = admin.list_checkpoints(None).await else { continue };
-        let now = chrono::Utc::now();
+        let now = chrono::DateTime::from_timestamp_micros(crate::clock::wall_us() as i64).unwrap_or_default();
         for c in checkpoints {
             let compactor = c.name.is_none() && c.expire_time.is_some_and(|e| e - c.create_time >= chrono::Duration::minutes(15));
             if compactor && now - c.create_time > chrono::Duration::minutes(1) {

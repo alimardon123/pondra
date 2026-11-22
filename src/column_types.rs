@@ -2,15 +2,16 @@
 //! Arrow's own types don't say is an entry here, so a type is one entry and one register line, and what a door does with
 //! a column of it asks the entry. The first are Postgres's types the lake holds as text, `uuid`, `json` and `jsonb`
 //! (`pg_column_types`, the postgres extension's). An entry says what its files hold and the values a write refuses;
-//! the column record's full type and VECTOR, FILE and INET come with the next pieces, and step 15 opens the section to
-//! installed packages.
+//! VECTOR is Arrow's own (FixedSizeList), and step 15 opens the section to installed packages.
 //!
 //! A column of one is marked on its Arrow field (`mark`, the only writer of the mark): the Postgres port sends it as that
 //! type, and a function's answer of one carries it on (`pg_functions`).
 //!
-//! A type whose storage isn't its text (INET's bytes, `inet`) says how its values are read from text and shown as text
-//! (`parse`, `show`), and each door asks it: a write fits text to it (`parsed`), a text answer shows it (`show_of`), and SQL
-//! casts to it and from it and compares a string with it (`sql`).
+//! A type whose storage isn't its text (INET's bytes, `inet`; FILE's struct of a path, a version and a content type, `file`)
+//! says how its values are read from text and shown as text (`parse`, `show`), and each door asks it: a write fits text to
+//! it (`parsed`), a text answer shows it (`show_of`; a JSON answer shows a struct as its object), and SQL casts to it and
+//! from it and compares a string with it (`sql`).
+pub mod file;
 pub mod inet;
 pub mod sql;
 
@@ -18,6 +19,7 @@ use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
+pub use file::FILE;
 pub use inet::INET;
 
 /// The field metadata that marks a column with its type's entry (`uuid`, `json`, `jsonb`): the Postgres port reads it,
@@ -157,7 +159,7 @@ mod tests {
     /// The build's types: Postgres's held as text, each marked on a field and read back from it, its metadata kept.
     #[test]
     fn the_builds_types_mark_a_field_and_read_back() {
-        for name in ["uuid", "json", "jsonb", "inet"] {
+        for name in ["uuid", "json", "jsonb", "inet", "file"] {
             let t = named(name).unwrap_or_else(|| panic!("{name}: an entry"));
             let field = Field::new("c", (t.storage)(&[]), true).with_metadata([("x".to_string(), "y".to_string())].into());
             let marked = mark(field, t);

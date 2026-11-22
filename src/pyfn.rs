@@ -310,7 +310,7 @@ impl TableProvider for Called {
 /// function's lifetime, within `PONDRA_FUNCTION_CACHE_MB` (256), least recently used out first. Only calls that
 /// succeeded are kept. The caller isn't in the key: a function sees only its arguments.
 struct Answers {
-    kept: crate::ledger::ByteLru<Vec<u8>, (datafusion::common::instant::Instant, Kept)>, // (each charged its key and its answer)
+    kept: crate::ledger::ByteLru<Vec<u8>, (crate::clock::Instant, Kept)>, // (each charged its key and its answer)
 }
 
 enum Kept {
@@ -359,7 +359,7 @@ impl crate::ledger::Charged for Answered {
 
 impl Answers {
     fn get(&mut self, key: &[u8]) -> Option<&Kept> {
-        if self.kept.peek(key).is_some_and(|(until, _)| *until <= datafusion::common::instant::Instant::now()) {
+        if self.kept.peek(key).is_some_and(|(until, _)| *until <= crate::clock::Instant::now()) {
             self.kept.pop(key);
             return None;
         }
@@ -382,7 +382,7 @@ impl Answers {
 
     fn keep(&mut self, key: Vec<u8>, answer: Kept, secs: u64) {
         let bytes = answer.size() + key.len();
-        let _ = self.kept.put(key, (datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(secs), answer), bytes);
+        let _ = self.kept.put(key, (crate::clock::Instant::now() + std::time::Duration::from_secs(secs), answer), bytes);
     }
 }
 

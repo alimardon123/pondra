@@ -1410,14 +1410,14 @@ tokio::task_local! {
 /// `PONDRA_TRACE_QUERY=1`: where one HTTP `/sql` statement's time goes, one line on stderr at its end. A stage is the
 /// time since the mark before it, so the stages add up to the statement's time up to its last mark.
 struct StatementTrace {
-    start: datafusion::common::instant::Instant,
-    last: datafusion::common::instant::Instant,
+    start: crate::clock::Instant,
+    last: crate::clock::Instant,
     stages: Vec<(&'static str, f64)>, // (name, ms)
 }
 
 impl StatementTrace {
     fn mark(&mut self, stage: &'static str) {
-        let now = datafusion::common::instant::Instant::now();
+        let now = crate::clock::Instant::now();
         self.stages.push((stage, (now - self.last).as_secs_f64() * 1000.0));
         self.last = now;
     }
@@ -1440,7 +1440,7 @@ pub async fn traced<T>(work: impl std::future::Future<Output = T>) -> T {
     if !tracing() {
         return work.await;
     }
-    let now = datafusion::common::instant::Instant::now();
+    let now = crate::clock::Instant::now();
     let trace = std::cell::RefCell::new(Some(StatementTrace { start: now, last: now, stages: vec![] }));
     TRACE.scope(trace, async {
         let out = work.await;
@@ -1518,30 +1518,28 @@ pub fn table_ref(name: &str) -> datafusion::common::TableReference {
 /// designs/redesign/redesign.md §4). None: a text the parser doesn't take (it reads every table and view, as before).
 pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str], scope: &crate::rights::Scope) -> Result<Option<Named>> {
     let state = ctx.state();
-    let (dialect, catalog) = (state.config().options().sql_parser.dialect.clone(), state.config().options().catalog.clone());
-    let refers = |sql: &str| -> Option<Vec<String>> {
+    let options = state.config().options();
+    let (dialect, catalog, normalize) = (options.sql_parser.dialect.clone(), options.catalog.clone(), options.sql_parser.enable_ident_normalization);
+    // (what a text names, `mentioned.rs`: each table as the planner asks for it, and as written, not lower-cased, so a caller
+    // that names a table unquoted and then looks it up by its own name, as `views::join` does, finds it, as it did when every
+    // table whose name was a word of the text was read)
+    let refers = |sql: &str| -> Option<crate::mentioned::Mentioned> {
         let stmt = crate::engine::kept_query(&state, sql).map_or_else(|| state.sql_to_statement(sql, &dialect), Ok).ok()?; // (the statement's own parse: `engine::kept_query`)
-        let refs = state.resolve_table_references(&stmt).ok()?;
-        // (and each name as written, not lower-cased: a caller that names a table unquoted and then looks it up by its
-        // own name, as `views::join` does, finds it, as it did when every table whose name was a word of the text was read)
-        let written = datafusion::sql::resolve::resolve_table_references(&stmt, false).ok()?.0;
-        Some(refs.into_iter().chain(written).filter_map(|r| {
-            let r = r.resolve(&catalog.default_catalog, &catalog.default_schema);
-            (r.catalog.as_ref() == catalog.default_catalog.as_str()).then(|| match r.schema.as_ref() {
-                crate::text::PUBLIC => r.table.to_string(),
-                s => format!("{s}.{}", r.table),
-            })
-        }).collect())
+        crate::mentioned::Mentioned::of(sql, &stmt, normalize)
     };
     'tries: for _ in 0..3 {
         let (mut named, mut asked) = (Named::default(), std::collections::BTreeSet::new());
         let mut pending: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
-        let (mut first, mut keys) = (None, vec![]);
+        let (mut first, mut keys, mut own) = (None, vec![], true);
         loop {
             let mut names = vec![];
             for text in pending.drain(..) {
-                let Some(refs) = refers(&text) else { return Ok(None) };
-                names.extend(refs.into_iter().filter(|n| asked.insert(n.clone())));
+                let Some(m) = refers(&text) else { return Ok(None) };
+                names.extend(local(&catalog, &m.tables).filter(|n| asked.insert(n.clone())));
+                match std::mem::take(&mut own) { // (the statement's own, then each text it reads)
+                    true => named.mentioned = m,
+                    false => named.mentioned.union(m),
+                }
             }
             if names.is_empty() {
                 break;
@@ -1574,11 +1572,24 @@ pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str], sc
     Err(crate::codes::coded("40001", "could not serialize access: the catalog changed while the statement read its tables three times: run it again"))
 }
 
-/// What `named_records` read: each table's record by its key, and each stored view's name and expanded text.
+/// What `named_records` read: each table's record by its key, and each stored view's name and expanded text; and what the
+/// statement and the views it reads name (`mentioned.rs`).
 #[derive(Default)]
 pub struct Named {
     pub tables: std::collections::BTreeMap<String, bytes::Bytes>,
     pub views: Vec<(String, String)>,
+    pub(crate) mentioned: crate::mentioned::Mentioned,
+}
+
+/// The names of `tables` in the session's default catalog, as the lake keys them (`schema.table`, or `table` in public).
+fn local<'a>(catalog: &'a datafusion::config::CatalogOptions, tables: &'a std::collections::BTreeSet<datafusion::common::TableReference>) -> impl Iterator<Item = String> + 'a {
+    tables.iter().filter_map(|r| {
+        let r = r.clone().resolve(&catalog.default_catalog, &catalog.default_schema);
+        (r.catalog.as_ref() == catalog.default_catalog.as_str()).then(|| match r.schema.as_ref() {
+            crate::text::PUBLIC => r.table.to_string(),
+            s => format!("{s}.{}", r.table),
+        })
+    })
 }
 
 /// A session with every table and stored view `sql` names registered (`named_records`: the names its parse refers
@@ -1609,7 +1620,6 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     scope.onto(&ctx); // (whose it is, for everything planned in it: `Scope::of_session`)
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)
-    let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
     let asked: Arc<str> = Arc::from(if scope.whole() { "" } else { sql }); // (what a refusal of a column may name: `Guarded`)
     let mut temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
     for (_, v) in temps.iter_mut() {
@@ -1620,9 +1630,18 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     // (the tables and views it names, and theirs, read at one commit; a listing, or a statement the parser doesn't take,
     // reads every table and view as before)
     let texts: Vec<&str> = std::iter::once(sql).chain(temps.iter().map(|(_, s)| s.as_str())).collect();
-    let found = if listing || scan { None } else { named_records(lake, &ctx, &texts, scope).await? };
+    let records = if scan { None } else { named_records(lake, &ctx, &texts, scope).await? };
+    // (a listing reads every table; a text the parser doesn't take reads the tables its words name, as before)
+    let listing = match &records {
+        Some(n) => n.mentioned.every,
+        None => ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)),
+    };
+    let (found, mentioned) = match records {
+        Some(n) if !listing => (Some((n.tables, n.views)), Some(n.mentioned)),
+        _ => (None, None),
+    };
     let mut views = match &found {
-        Some(n) => n.views.clone(),
+        Some((_, views)) => views.clone(),
         None => stored_views(lake, &seen, listing, scope).await?, // (their tables are wanted too)
     };
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
@@ -1632,14 +1651,21 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     if crate::pattern::wanted(&text) || text.contains("pondra_match") || text.contains("pondra_open") {
         crate::matcher::register(&ctx); // (again, last: a DEFINE's glue sees the session's every function, the lake's own and Python ones too)
     }
-    let named_sys = crate::sys::mentioned(&text); // (named: the tables get their system columns)
+    // (a system column named: the tables get theirs; `_deleted` named: a keyed table's deleted rows are read too. What the
+    // statement and its views name, `mentioned.rs`; a listing's or an unparsed text's, from its words)
+    let (named_sys, deleted) = match &mentioned {
+        Some(m) => (m.system_columns, m.deleted),
+        None => crate::mentioned::columns(&text),
+    };
+    let catalog = ctx.state().config().options().catalog.clone();
+    let quoted: std::collections::BTreeSet<String> = mentioned.iter().flat_map(|m| local(&catalog, &m.quoted)).collect();
     let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
         default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
     }
     let named_only = found.is_some(); // (each entry is a table it names)
     let entries = match found {
-        Some(n) => n.tables,
+        Some((tables, _)) => tables,
         None => lake.cat.scan_raw("t/", "t0").await?,
     };
     lake.cat.settle().await?; // (the log read as far as these entries: `Catalog::settle`)
@@ -1648,17 +1674,20 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     for (key, raw) in entries {
         let name = &key[2..];
         // (a staged table is read only where the SQL names it quoted: its constraint checks, `constraints::held` and `kept`)
-        let staged = crate::sys::staged_for(name).is_some() && text.contains(&format!("\"{name}\""));
+        let staged = crate::sys::staged_for(name).is_some() && match &mentioned {
+            Some(_) => quoted.contains(name),
+            None => text.contains(&format!("\"{name}\"")),
+        };
         if name != except && (staged || !crate::sys::hidden(name) && (listing || named_only || mentions(&text, name))) {
             let meta = lake.cat.parsed(&key, &raw)?; // (only the tables it names: decoding every one was half of a small query's time)
             let touched = crate::txn::touched(name);
             let view = table_view(lake, &ctx, name, &meta, touched || named_sys, upto, scope).await?;
-            let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
+            let mut t = named(&ctx, view, &meta, deleted)?;
             if touched {
-                t = crate::txn::overlaid(&ctx, name, &meta.sql_key(), t, crate::sys::mentioned(&text))?;
+                t = crate::txn::overlaid(&ctx, name, &meta.sql_key(), t, named_sys)?;
             }
             if let Some(h) = &meta.history {
-                t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)
+                t = crate::views::history_view(&ctx, t, h, named_sys).await?; // (each version's __start_at and __end_at, as it is read)
             }
             match guarded(scope, name, t.clone(), listing, &asked) {
                 Some(t) => {
@@ -1680,7 +1709,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }
     for name in crate::past_names::names(&text) {
-        let (table, t, attached) = crate::past::table(lake, &ctx, &name, upto, crate::sys::mentioned(&text), scope).await?; // (`t AT (…)`: ADR-043)
+        let (table, t, attached) = crate::past::table(lake, &ctx, &name, upto, named_sys, scope).await?; // (`t AT (…)`: ADR-043)
         let t = if attached { across(scope, &table, t, false, &None, &asked) } else { guarded(scope, &table, t, false, &asked) }; // (an attached lake's: the grants naming it)
         if let Some(t) = t {
             ctx.register_table(datafusion::common::TableReference::bare(name), t)?;
@@ -1712,7 +1741,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
                 continue;
             }
             let meta = other.cat.parsed(&key, &raw)?;
-            let view = named(&ctx, table_view(&other, &ctx, name, &meta, named_sys, upto, scope).await?, &meta, names_deleted(&text))?;
+            let view = named(&ctx, table_view(&other, &ctx, name, &meta, named_sys, upto, scope).await?, &meta, deleted)?;
             let Some(view) = across(scope, &format!("{ns}.{name}"), view, listing, &locked, &asked) else { continue };
             let (s, t) = split(name);
             if old && s == PUBLIC {
@@ -1794,7 +1823,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
             ctx.register_table(name.as_str(), Arc::new(MemTable::try_new(schema, vec![batches.clone()])?))?;
         }
     }
-    crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
+    crate::temp::register(&ctx, &text, named_sys)?; // (the session's temporary tables, over the lake's)
     // A listing leaves out a table its user may not read, but a view over it is planned against it: the table is there
     // for the views' planning and taken out again after, unless the session has a table of that name already.
     let mut planned_only = vec![];
@@ -2151,7 +2180,7 @@ mod tests {
             let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
             let node = &crate::auth::Principal::node().scope;
             apply(&lake, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }, &crate::auth::Principal::node()).await?;
-            for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd"] {
+            for t in ["a", "b", "s.c", "MiXed", "x-y", "unused", "a$new-0123abcd", "s.c$new-0123abcd"] {
                 crate::write::create_table(&lake, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
             }
             let view = |name: &str, sql: &str| Ddl::CreateView { name: name.into(), sql: sql.into(), replace: false, facts: None, text: None };
@@ -2189,6 +2218,14 @@ mod tests {
             // (a table named unquoted as it is called, and looked up by that name after: `views::join`)
             let ctx = session_for(&lake, "SELECT x FROM MiXed, b", "", None, node).await?;
             assert!(ctx.table(table_ref("MiXed")).await.is_ok() && ctx.table(table_ref("b")).await.is_ok(), "{:?}", registered(&ctx));
+            // (what it names, `mentioned.rs`: a system column named gives the tables theirs, one only in a string gives none;
+            // a listing reads every table; a staged table is read where its name is written quoted, in a schema too)
+            let width = |sql: &'static str| { let lake = &lake; async move { anyhow::Ok(session_for(lake, sql, "", None, node).await?.table(table_ref("a")).await?.schema().fields().len()) } };
+            assert_eq!((width("SELECT _row_id FROM a").await?, width("SELECT x FROM a WHERE '_row_id' <> 'x'").await?), (1 + crate::text::NAMES.len(), 1));
+            let listing = session_for(&lake, "SELECT table_name FROM information_schema.tables", "", None, node).await?;
+            assert!(registered(&listing).is_superset(&["a", "unused", "s.c"].map(String::from).into()), "{:?}", registered(&listing));
+            let staged = session_for(&lake, "SELECT * FROM \"s\".\"c$new-0123abcd\"", "", None, node).await?;
+            assert_eq!(registered(&staged), ["s.c$new-0123abcd".to_string()].into());
             let unparsed = "SELECT * FROM a WHERE x = ANY(:list"; // (the parser doesn't take it: every table, as before)
             let ctx = session_for(&lake, unparsed, "", None, node).await?;
             assert!(registered(&ctx).contains("a") && !registered(&ctx).contains("b"), "{:?}", registered(&ctx));

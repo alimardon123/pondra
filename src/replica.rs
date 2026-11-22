@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 /// A follower's copies of the leader's changes that aren't in the bucket yet: in memory, and in

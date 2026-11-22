@@ -47,7 +47,8 @@ pub fn with_sys(meta: &TableMeta) -> TableMeta {
     m
 }
 
-/// Does `sql` name a system column? (A word match: one too many costs a few columns read.)
+/// Does `sql` name a system column? A word match, for an error's text (`App::query`); a statement's are its names
+/// (`mentioned::columns`).
 pub fn mentioned(sql: &str) -> bool {
     sql.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| NAMES.contains(&w))
 }
@@ -69,8 +70,8 @@ pub fn planned(sql: &str) -> anyhow::Result<Cow<'_, str>> {
 pub fn hide(sql: &str) -> Cow<'_, str> {
     use datafusion::sql::sqlparser::ast::*;
     use std::ops::ControlFlow;
-    let deleted = crate::query::names_deleted(sql);
-    if !mentioned(sql) && !deleted {
+    let (system, deleted) = crate::mentioned::columns(sql); // (as the session gives the tables theirs: `query::session_reading`)
+    if !system && !deleted {
         return Cow::Borrowed(sql);
     }
     let Ok(mut stmts) = crate::parsed::generic(sql) else { return Cow::Borrowed(sql) }; // (the front's, or a look's: `parsed.rs`)
@@ -99,7 +100,7 @@ pub fn hide(sql: &str) -> Cow<'_, str> {
             ControlFlow::Continue(())
         }
     }
-    let names = NAMES.iter().copied().filter(|_| mentioned(sql)).chain(deleted.then_some("_deleted")).collect();
+    let names = NAMES.iter().copied().filter(|_| system).chain(deleted.then_some("_deleted")).collect();
     let mut v = Hide { ctes: vec![], changed: false, names };
     let _ = crate::walk::visit_mut(&mut stmts, &mut v);
     match v.changed {

@@ -13,7 +13,8 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::Deserialize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::clock::Instant;
 
 #[derive(Deserialize)]
 pub struct Params {

@@ -52,9 +52,9 @@ type Flight = (std::sync::atomic::AtomicU64, Mutex<(u64, Option<bytes::Bytes>)>)
 
 struct Cached {
     version: u64,
-    at: datafusion::common::instant::Instant,
+    at: crate::clock::Instant,
     body: bytes::Bytes,
-    refreshing: Option<datafusion::common::instant::Instant>, // a request is computing a newer one (stale mode)
+    refreshing: Option<crate::clock::Instant>, // a request is computing a newer one (stale mode)
 }
 
 impl Default for Results {
@@ -83,7 +83,7 @@ impl Results {
             return Some(e.body.clone());
         }
         if stale.is_some() {
-            e.refreshing = Some(datafusion::common::instant::Instant::now()); // this caller recomputes; the rest wait on nobody
+            e.refreshing = Some(crate::clock::Instant::now()); // this caller recomputes; the rest wait on nobody
         }
         None
     }
@@ -93,7 +93,7 @@ impl Results {
             return;
         }
         let bytes = body.len();
-        let left = self.0.lock().unwrap().put(key, Cached { version, at: datafusion::common::instant::Instant::now(), body, refreshing: None }, bytes);
+        let left = self.0.lock().unwrap().put(key, Cached { version, at: crate::clock::Instant::now(), body, refreshing: None }, bytes);
         drop(left); // (let go of outside the lock)
     }
 }
@@ -132,7 +132,13 @@ impl App {
 tokio::task_local! {
     /// Set while this task holds one of the node's query turns (`App::query_listed`).
     static TURN: ();
+    /// Set around the query whose answer a door sends back (`answering`).
+    static ANSWERING: ();
 }
+
+/// `f`, a door's query whose rows it sends back: the one answer `MAX_ROWS` cuts (`App::run_query`). Any other query, one a
+/// write, a script's loop, a variable or a procedure reads, runs whole, wherever it runs (11-20 audit H1).
+pub async fn answering<F: std::future::Future>(f: F) -> F::Output { ANSWERING.scope((), f).await }
 
 /// The node's turns for queries: `PONDRA_QUERIES` run at once (4 a core, 16 at least), in the order
 /// they asked, and a query that waits `PONDRA_QUEUE_SECS` (60) for one is refused (53300). Without
@@ -225,13 +231,13 @@ impl App {
         if crate::pg_catalog::asked(query) {
             return crate::pg_catalog::over_http(&self.lake, query, scope).await; // (a request that speaks Postgres, reading its catalog: `?catalog=postgres`)
         }
-        let start = datafusion::common::instant::Instant::now();
+        let start = crate::clock::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
         let explained = crate::explain::asked(query);
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
         // (`MAX_ROWS`: the door's answer, at most this many rows, collected whole so its door can say it was cut before its
-        // first byte. Not a query inside another one, nor an INSERT's or a refresh's: those don't come here)
-        let cap = scope.max_rows().filter(|_| top);
+        // first byte. Only a door's answer (`answering`): never a query inside another one, nor one a write or a script reads)
+        let cap = scope.max_rows().filter(|_| top && ANSWERING.try_with(|_| ()).is_ok());
         let run = async {
             let nodes = if spread == Some("0") || self.here_only_for(query, scope).await { vec![] } else { self.members.nodes() };
             // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
@@ -248,7 +254,7 @@ impl App {
                 Ok(None) => {}
                 Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
             }
-            let here = datafusion::common::instant::Instant::now();
+            let here = crate::clock::Instant::now();
             let ctx = crate::query::session_for(&self.lake, query, "", None, scope).await?;
             crate::query::mark("session with its tables");
             let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
@@ -373,7 +379,7 @@ impl App {
         crate::tier::refresh(&self.lake, &self.tables).await?; // (what changed since the last round, before the lock: `tier::refresh`)
         let _guard = self.lock.lock().await;
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
-        let start = datafusion::common::instant::Instant::now();
+        let start = crate::clock::Instant::now();
         let hwm = *self.lake.hwm.borrow();
         let backlog = {
             // (each table's rows after its own mark: an idle table keeps an old one, `tier::expire`. Of the log, what the

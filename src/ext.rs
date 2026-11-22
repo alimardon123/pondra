@@ -1072,7 +1072,7 @@ pub async fn rest_token(lake: &Lake, url: &str, scope: &crate::rights::Scope) ->
 /// The tokens a lake's REST catalogs gave for their secrets' client credentials (`rest_token`, `lake_state.rs`), each kept
 /// until a minute before it expires, by its secret's name and sealed values (a changed secret asks again).
 #[derive(Default)]
-pub struct Tokens(Mutex<HashMap<String, (String, datafusion::common::instant::Instant)>>);
+pub struct Tokens(Mutex<HashMap<String, (String, crate::clock::Instant)>>);
 
 impl crate::lake_state::LakeState for Tokens {
     const NAME: &'static str = "catalog_tokens";
@@ -1086,12 +1086,12 @@ impl Tokens {
     /// The token kept for `key`, while it lives.
     fn live(&self, key: &str) -> Option<String> {
         let kept = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        kept.get(key).filter(|(_, until)| datafusion::common::instant::Instant::now() < *until).map(|(t, _)| t.clone())
+        kept.get(key).filter(|(_, until)| crate::clock::Instant::now() < *until).map(|(t, _)| t.clone())
     }
 
     /// `token` was given for `key`, for `life`.
     fn got(&self, key: String, token: String, life: std::time::Duration) {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, (token, datafusion::common::instant::Instant::now() + life));
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, (token, crate::clock::Instant::now() + life));
     }
 }
 

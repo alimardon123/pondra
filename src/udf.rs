@@ -60,7 +60,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
 /// of their servers (`channel`).
 #[derive(Default)]
 pub struct Kept {
-    seen: Mutex<Option<(datafusion::common::instant::Instant, Arc<Vec<(String, Udf)>>)>>,
+    seen: Mutex<Option<(crate::clock::Instant, Arc<Vec<(String, Udf)>>)>>,
     #[cfg(not(target_arch = "wasm32"))]
     open: Mutex<std::collections::HashMap<String, tonic::transport::Channel>>, // (by url)
 }
@@ -88,7 +88,7 @@ async fn listed(lake: &Lake, kept: &Kept) -> Result<Arc<Vec<(String, Udf)>>> {
         }
     }
     let fns = Arc::new(lake.cat.scan::<Udf>("f/", "f0").await?);
-    *kept.seen.lock().unwrap() = Some((datafusion::common::instant::Instant::now(), fns.clone()));
+    *kept.seen.lock().unwrap() = Some((crate::clock::Instant::now(), fns.clone()));
     Ok(fns)
 }
 
