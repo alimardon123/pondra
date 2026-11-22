@@ -58,6 +58,8 @@ pub struct Cluster {
     start: Mutex<crate::node::Start>,
     /// Each guest's faults, by its number, from its first statement on (`guest`).
     guests: Mutex<std::collections::BTreeMap<usize, Arc<Faults>>>,
+    /// The key of the program that starts the members, once `owned`: the test's requests come from it.
+    owner: Mutex<Option<String>>,
 }
 
 impl Cluster {
@@ -81,7 +83,7 @@ impl Cluster {
                 })
             })
             .collect();
-        Cluster { seed, name, bucket, net, members, start: Default::default(), guests: Default::default() }
+        Cluster { seed, name, bucket, net, members, start: Default::default(), guests: Default::default(), owner: Default::default() }
     }
 
     /// Member `m`'s lake (0-based): `sim://<cluster>-<member>/lake`, the cluster's one bucket through its faults.
@@ -133,6 +135,14 @@ impl Cluster {
         }
     }
 
+    /// From now on each member is started by a program with a key (`PONDRA_OWNER_KEY`, the harness's `owner_key`), and the
+    /// test's requests come from that program: they may read a path on the members' own disk (`ext::owners_only`).
+    pub fn owned(&self) {
+        let key = uuid::Uuid::new_v4().simple().to_string();
+        self.set_start(|s| s.auth = Arc::new((*s.auth).clone().owned_by(Some(key.clone()))));
+        *lock(&self.owner) = Some(key);
+    }
+
     /// Each start from now on is given these (`pondra serve`'s flags: `--flush-ms`, `--tier-secs`, …).
     pub fn set_start(&self, set: impl FnOnce(&mut crate::node::Start)) { set(&mut lock(&self.start)); }
 
@@ -160,13 +170,13 @@ impl Cluster {
         }
     }
 
-    /// One request to member `m`'s router, from no member: its status and whole body.
+    /// One request to member `m`'s router, from no member (from its owner, once `owned`): its status and whole body.
     /// Answered on a task its kill ends (`Net::answer`), within `ASKED` on the sim's clock, as the harness's `call` waits.
     pub async fn ask(&self, m: usize, method: &str, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
-        let name = &self.members[m].name;
+        let (name, owner) = (&self.members[m].name, lock(&self.owner).clone());
         let asked = async {
             self.members[m].faults.thawed().await; // (a frozen member answers no one until it is thawed)
-            let res = self.net.answer(name, crate::node::request(method, path, &[], body, None)?).await?;
+            let res = self.net.answer(name, crate::node::request(method, path, &[], body, owner.as_deref())?).await?;
             let status = res.status().as_u16();
             let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
             Ok((status, body.to_vec()))
