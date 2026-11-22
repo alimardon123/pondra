@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 /// What a stopped request answers (SQLSTATE 53200: `codes::by_words` reads "out of memory").
@@ -320,7 +320,7 @@ fn due(last_stop: Option<Instant>, resident: usize, line: usize, now: Instant) -
 /// Is a stop still holding: the node is over its line, and the last stop was less than [`HOLD`] ago. (A
 /// look that finds nothing to stop holds nothing: a request old enough by the next look is stopped then.)
 fn pending(last_stop: Option<Instant>, resident: usize, line: usize, now: Instant) -> bool {
-    resident >= line && last_stop.is_some_and(|at| now.saturating_duration_since(at) < HOLD)
+    resident >= line && last_stop.is_some_and(|at| now.duration_since(at) < HOLD)
 }
 
 // The request's memory. Each thread of jemalloc keeps two counters, the bytes it has allocated and the
@@ -540,7 +540,7 @@ pub fn pick(running: &std::collections::BTreeMap<u64, Running>, now: Instant, re
     let fit: Vec<(&u64, &Running)> = running
         .iter()
         .filter(|(_, r)| r.stop.is_some() && !r.stopped && !r.resting)
-        .filter(|(_, r)| now.saturating_duration_since(r.since) >= FIRST)
+        .filter(|(_, r)| now.duration_since(r.since) >= FIRST)
         .filter(|(_, r)| r.noted.saturating_add(margin) <= resident)
         .collect();
     let grew = fit.iter().min_by_key(|(_, r)| std::cmp::Reverse(r.used())).filter(|(_, r)| r.used() >= margin as i64);

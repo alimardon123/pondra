@@ -25,6 +25,7 @@ memo base
 metrics base
 parsed base
 context base
+mentioned base
 languages base
 lake_state base
 passes base
@@ -186,6 +187,7 @@ core_statements engine
 connections catalog
 string_agg engine
 sys engine
+signin engine
 tasks engine
 temp engine
 tier engine

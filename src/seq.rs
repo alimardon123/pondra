@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 // (the statement-side parts of an identity column and its options: `rules/create.rs`, which the page reads too)

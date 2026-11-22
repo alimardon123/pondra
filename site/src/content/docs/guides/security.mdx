@@ -298,8 +298,12 @@ A user signs in at every door: over HTTP with its name and password (Basic) or a
 `POST /login` gives a **session**, a token the lake signs and any node checks, for 12 hours
 (`PONDRA_SESSION_HOURS`), which the console uses; Postgres clients sign in with SCRAM-SHA-256, as
 they do with Postgres (a user with only tokens gives one as its password); Kafka's SASL/PLAIN takes
-the name and password; Flight's handshake turns them into a session. A password is kept only as
-SCRAM's verifier and a token as its hash, so the catalog gives neither away. An answer that goes on
+the name and password; Flight's handshake turns them into a session. A token sent as the password
+signs in its own user under any name, at every door, and the audit log names both (`a token signed
+in svc under the name anyone`); Postgres takes one where it asks for the password plainly, from a
+user with no password, since SCRAM can't carry a token. A token sent as the password never counts as
+a wrong guess, and a password can't begin `pt_`, `ps_`, `pn_` or `pb_`, the forms of Pondra's tokens.
+A password is kept only as SCRAM's verifier and a token as its hash, so the catalog gives neither away. An answer that goes on
 (`/watch`, a live query, a Kafka connection, the commit stream) checks its sign-in again every 5
 seconds: once the user is dropped, its grant revoked, its superuser taken away or its session expired,
 the answer ends, and a Kafka client's next fetch is refused.

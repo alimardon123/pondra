@@ -20,7 +20,7 @@ use futures::{Stream, StreamExt};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 pub const TABLE: &str = crate::records::AUDIT;
@@ -361,6 +361,34 @@ pub async fn refused_by(app: &App, user: &str, door: &'static str, from: Option<
     write(app, Line { at: now, user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message), ms: None });
 }
 
+/// A token that signed in under a name that isn't its principal's (redesign step 7: a token works under any name, and
+/// signs in its own principal): a line naming both, at most once a minute for a principal, a name, a door and a client
+/// (HTTP Basic signs in at every request).
+pub fn signed_as(app: &App, principal: &str, given: &str, door: &'static str, from: Option<std::net::SocketAddr>, client: Option<std::net::IpAddr>) {
+    if !on() || given.is_empty() || given.eq_ignore_ascii_case(principal) {
+        return;
+    }
+    let Ok(audit) = app.lake.state::<Audit>() else { return };
+    let now = crate::log::now_ms();
+    {
+        let mut seen = audit.signed_as.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.len() >= CLIENTS {
+            seen.retain(|_, at| now.saturating_sub(*at) < 60_000);
+        }
+        let key = (principal.to_string(), given.to_string(), door, client.map(range));
+        if seen.get(&key).is_some_and(|at| now.saturating_sub(*at) < 60_000) {
+            return;
+        }
+        if seen.len() < CLIENTS {
+            seen.insert(key, now);
+        }
+    }
+    let message = format!("a token signed in {principal} under the name {given}");
+    write(app, Line { at: now, user: principal.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: "sign in".into(), outcome: "ok", message: Some(message), ms: None });
+}
+
+type SignedAs = std::collections::HashMap<(String, String, &'static str, Option<std::net::IpAddr>), u64>; // (-> when last written)
+
 /// Refusals naming no user of the lake written a minute from one client (security pass 2: 400 anonymous `/sso/…` calls
 /// wrote 400 rows; audit 10-31 M6: as many with made-up user names did too).
 const KNOCKS: u32 = 60;
@@ -372,16 +400,18 @@ struct Knocks {
     swept: u64,                                                  // (when the minutes that ended were last counted out)
 }
 
-/// What the audit log keeps for its lake: the writer of its rows, and the refusals it counted by client (`knocked`).
+/// What the audit log keeps for its lake: the writer of its rows, the refusals it counted by client (`knocked`), and when
+/// it last named a token signed in under another name (`signed_as`).
 #[derive(Default)]
 pub struct Audit {
     knocked: std::sync::Mutex<Knocks>,
+    signed_as: std::sync::Mutex<SignedAs>,
     writer: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>>,
 }
 
 impl crate::lake_state::LakeState for Audit {
     const NAME: &'static str = "audit";
-    const ABOUT: &'static str = "its audit log's writer, and the refusals it counted by client";
+    const ABOUT: &'static str = "its audit log's writer, the refusals it counted by client, and the tokens it saw signed in under another name";
     fn make() -> Self { Audit::default() }
 }
 

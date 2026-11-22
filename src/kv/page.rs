@@ -8,7 +8,7 @@
 use super::{Error, Kv, Written};
 use crate::store::Store;
 use bytes::Bytes;
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
 use object_store::path::Path;

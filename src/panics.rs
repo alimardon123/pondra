@@ -11,7 +11,7 @@
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 
 /// Run a request of `node`'s: `Err` (the panic's message) if it panicked. It is counted in flight as it comes (its node
 /// stopping waits for it: `drain.rs`), and the future holds no borrow of the node.

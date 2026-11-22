@@ -61,14 +61,14 @@ pub struct Load {
     who: Principal, // (whose load it is: its audit line's)
     door: &'static str,
     table: String,
-    start: datafusion::common::instant::Instant,
+    start: crate::clock::Instant,
     end: Option<Option<String>>,
 }
 
 impl Load {
     /// A load into `table` through `door`, by `who` (None: the caller in scope).
     pub fn new(app: &App, who: Principal, door: &'static str, table: &str) -> Load {
-        Load { app: app.clone(), who, door, table: table.to_string(), start: datafusion::common::instant::Instant::now(), end: None }
+        Load { app: app.clone(), who, door, table: table.to_string(), start: crate::clock::Instant::now(), end: None }
     }
 
     /// It ended: well, or with `error`. The first end counts.

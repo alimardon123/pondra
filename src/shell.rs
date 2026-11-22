@@ -7,7 +7,8 @@ use anyhow::{bail, Result};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::clock::Instant;
 
 pub async fn run(dir: &str) -> Result<()> {
     let (mut node, base, key, log) = start(dir)?;

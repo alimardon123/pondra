@@ -1250,7 +1250,7 @@ fn changed(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -> String
 
 /// The time of day in UTC as HH:MM:SS (chrono is built without a clock, so it is worked out here).
 fn clock() -> String {
-    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() % 86_400);
+    let s = (crate::clock::wall_ms() / 1000) % 86_400;
     format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
 }
 

@@ -478,3 +478,43 @@ async fn guests_cut_off_from_the_leader_write_through_its_inbox_each_statement_o
         println!("seed {seed}: 300 rows from 6 guests, 3 through the leader's inbox, each once ({again} statements run again)");
     }
 }
+
+/// The 11-03 audit's M9: right after the leader moves a table's columns, an INSERT by position goes to a follower that
+/// may not have seen the move yet (the third of three, whose calls are slow). The follower fills the rows itself and the
+/// leader records them: they are refused and sent again, or land in the order the move made, never in the old one,
+/// where `a` would silently take `b`'s value.
+#[tokio::test(start_paused = true)]
+async fn an_insert_by_position_right_after_a_column_move_keeps_the_new_order() {
+    let rounds = 40i64;
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        c.start(0).await.unwrap();
+        c.sql(0, "CREATE TABLE t (a BIGINT, b BIGINT)").await.unwrap();
+        c.start(1).await.unwrap();
+        c.start(2).await.unwrap();
+        c.until("the third member hears its leader", Duration::from_secs(10), || async { c.known(2).await == 3 }).await.unwrap();
+        c.faults(2).everywhere(Odds { fail: 0.0, lost: 0.0, slow: Duration::from_millis(500) });
+        let mut refused = 0;
+        // (round k: an odd one puts b first, an even one a; then k goes in the first column, -k in the second)
+        for k in 1..=rounds {
+            let first = if k % 2 == 1 { "b" } else { "a" };
+            c.sql(0, &format!("ALTER TABLE t ALTER COLUMN {first} FIRST")).await.unwrap();
+            while let Err(e) = c.sql(2, &format!("INSERT INTO t VALUES ({k}, {})", -k)).await {
+                refused += 1;
+                assert!(refused < 1000, "seed {seed}: round {k}'s INSERT never went: {e:#}\n{}", c.met());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let a = c.sql(0, "SELECT a, b FROM t").await.unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for r in rows(&a) {
+            let (x, y) = (r["a"].as_i64().unwrap_or(0), r["b"].as_i64().unwrap_or(0));
+            let k = x.max(y);
+            let (want_a, want_b) = if k % 2 == 1 { (-k, k) } else { (k, -k) };
+            assert_eq!((x, y), (want_a, want_b), "seed {seed}: round {k}'s row is in the wrong order\n{}", c.met());
+            assert!(seen.insert(k), "seed {seed}: round {k}'s row is there twice");
+        }
+        assert_eq!(seen.len() as i64, rounds, "seed {seed}: rows");
+        println!("seed {seed}: {rounds} INSERTs by position right after a column move, each in the new order ({refused} refused first)");
+    }
+}

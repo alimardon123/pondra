@@ -12539,6 +12539,16 @@ def max_rows():
     cnt = as_(boss, "SELECT count(*) AS n FROM u")
     info["insert"] = {"status": ins[0], "count": cnt}
     checks["ann's INSERT INTO u SELECT id FROM t inserts all 10 rows: boss counts 10 in u"] = cnt == [{"n": 10}]
+    # (11-20 audit H1: only a door's answer is cut. A query a write reads, beside a writing WITH or in a script's FOR loop,
+    # runs whole)
+    fed = {}
+    for name, q in [("WITH", "WITH src AS (SELECT id FROM t), ins AS (INSERT INTO u SELECT id FROM src RETURNING id) SELECT count(*) AS n FROM ins"),
+                    ("FOR", "FOR r IN (SELECT id FROM t) DO INSERT INTO u VALUES ($r.id); END FOR")]:
+        as_(boss, "DELETE FROM u")
+        fed[name] = {"said": raw(ann, q)[2][:200].decode(errors="replace"), "count": as_(boss, "SELECT count(*) AS n FROM u")}
+    info["writes fed"] = fed
+    checks["a write reads whole: ann's writing WITH and a script's FOR loop each insert all 10 rows into u (11-20 audit H1)"] = \
+        all(f["count"] == [{"n": 10}] for f in fed.values())
 
     # A superuser takes no option from a role
     sb, hb, body_b = raw(boss, "SELECT id FROM t ORDER BY id")
@@ -14471,6 +14481,8 @@ def owned():
         pg_tries = {"the key": pg(f"user=admin password={owner}"), "nothing": pg("user=admin"), "another key": pg(f"user=admin password={uuid.uuid4().hex}"),
                     "the key as another name's": pg(f"user=writer password={owner}")}
         info["postgres"] = pg_tries
+        # (another built-in name is asked for SCRAM against its own token, which the key can't answer: a token signs in under any
+        # name where the port asks for a password in the clear, redesign step 7 piece 2)
         checks["its Postgres port takes the program's key as admin's password, and refuses no password, another key or another name"] = \
             pg_tries["the key"] == [(1,)] and all(isinstance(pg_tries[k], str) for k in ("nothing", "another key", "the key as another name's"))
         b = Node(new_lake(), A.port + 1).start()  # (no program's key: open on this machine, as before)
@@ -14599,7 +14611,8 @@ def guesses():
     a bearer token, or a token sent as a password, isn't counted. Behind a proxy of
     PONDRA_TRUSTED_PROXIES and behind `pondra serve --lakes`, each client is counted by its own address, and
     only a page on this machine saves the console's settings or chooses the Python (S28). Flight signs every call in
-    from its headers before reading its body, and counts a password sent with any call (S32)."""
+    from its headers before reading its body, and counts a password sent with any call (S32). Every door signs in
+    alike (redesign step 7): a token under any name signs in its own principal, audited naming both."""
     import base64, socket
     P = A.port
     token = "gss-admin-token-1"
@@ -14677,9 +14690,9 @@ def guesses():
     # once saying why, and so is the right password; eli signs in at once. A token isn't counted: ten wrong tokens
     # for svc stay wrong passwords, and svc's right token signs in. Each refusal is audited.
     import psycopg, adbc_driver_flightsql.dbapi as adbc
-    c = Node(new_lake(), P + 3, admin_token=token, pg=f"127.0.0.1:{P + 13}", flight=f"127.0.0.1:{P + 33}").start()
+    c = Node(new_lake(), P + 3, admin_token=token, pg=f"127.0.0.1:{P + 13}", flight=f"127.0.0.1:{P + 33}", kafka=f"127.0.0.1:{P + 23}").start()
     try:
-        for q in ["CREATE USER dana PASSWORD 'dana-password-1'", "CREATE USER eli PASSWORD 'eli-password-1'", "CREATE USER fran PASSWORD 'fran-password-1'", "CREATE USER gil PASSWORD 'gil-password-1'", "CREATE USER svc"]:
+        for q in ["CREATE USER dana PASSWORD 'dana-password-1'", "CREATE USER eli PASSWORD 'eli-password-1'", "CREATE USER fran PASSWORD 'fran-password-1'", "CREATE USER gil PASSWORD 'gil-password-1'", "CREATE USER svc", "CREATE USER bot"]:
             reply(P + 3, "POST", "/sql", q.encode(), headers=bearer)
         svc_token = call(P + 3, "POST", "/sql", b"CREATE TOKEN pg FOR USER svc", headers=bearer)["token"]
         def pg_said(user, password):  # ("ok", or the server's message: psycopg gives no SQLSTATE for a failed connection)
@@ -14736,6 +14749,46 @@ def guesses():
         info["made-up names"] = {"refused": made_up[0][:140], "written": len(nobody)}
         checks["seventy sign-ins with made-up user names from one client are refused, and no more than sixty are written one by one (the rest counted, as anonymous ones are)"] = \
             all("FATAL" in m for m in made_up) and len(nobody) <= 60
+        # One sign-in for every door (redesign step 7, piece 2): a token works under any name and signs in its own
+        # principal, and the audit names both; a Flight call with a Bearer that signs no one in is refused, never taken
+        # for no one, after the pause every refusal costs; a wrong password is told the same words at every door.
+        # Postgres takes a token where it asks for a password in the clear: a user with no password (bot here). A name
+        # no user has is asked for SCRAM, as a user with a password is (the port never says whether a name is a user),
+        # and SCRAM can't carry a token, so the token is refused there as a wrong password.
+        import pyarrow.flight as fl
+        K3 = P + 23
+        anyone = {"http": reply(P + 3, "GET", "/whoami", headers={"Authorization": basic("anyone", svc_token)}),
+                  "postgres": pg_said("bot", svc_token), "flight": fl_said("anyone", svc_token), "kafka": kafka_sign_in(K3, "anyone", svc_token)}
+        pg_anyone = pg_said("anyone", svc_token)
+        started = time.time()
+        try:
+            fl.FlightClient(f"grpc://127.0.0.1:{P + 33}").do_get(fl.Ticket(b'{"sql": "SELECT 1 AS one"}'),
+                options=fl.FlightCallOptions(headers=[(b"authorization", b"Bearer pt_c3Zj_not-a-token")])).read_all()
+            bad_bearer = "answered"
+        except Exception as e:
+            bad_bearer = str(e).strip()
+        bad_bearer_took = time.time() - started
+        hal = {"http": reply(P + 3, "GET", "/whoami", headers={"Authorization": basic("hal", "a-wrong-one")}), "flight": fl_said("hal", "a-wrong-one"),
+               "kafka": kafka_sign_in(K3, "hal", "a-wrong-one")}
+        both = []
+        for _ in range(40):
+            both = call(P + 3, "POST", "/sql", b"SELECT door, \"user\", message FROM pondra.audit WHERE outcome = 'ok' AND statement = 'sign in' ORDER BY door", headers=bearer)
+            if len(both) >= 4:
+                break
+            time.sleep(0.5)
+        info["one sign-in"] = {"anyone": {k: (v if isinstance(v, (str, tuple)) else [v[0], v[2][:80]]) for k, v in anyone.items()},
+                               "postgres, a name no user has": pg_anyone[:140], "bad bearer": [bad_bearer[:140], round(bad_bearer_took, 2)], "hal": {k: (v if isinstance(v, (str, tuple)) else [v[0], v[2][:80]]) for k, v in hal.items()}, "audited": both}
+        checks["a token works under any name at every door, signing in its own principal (HTTP Basic, Flight, Kafka; Postgres under a user with no password)"] = \
+            anyone["http"][0] == 200 and '"svc"' in anyone["http"][2] and anyone["postgres"] == "ok" and anyone["flight"] == "ok" and anyone["kafka"] == (0, None)
+        checks["…and Postgres asks a name no user has for SCRAM, which a token can't answer: refused as a wrong password"] = \
+            'uthentication failed for user "anyone"' in pg_anyone
+        checks["…and the audit names both, once per door: the token's principal and the name it came under"] = \
+            [r["door"] for r in both] == ["flight", "http", "kafka", "postgres"] and all(r["user"] == "svc" for r in both) \
+            and all(f"under the name {'bot' if r['door'] == 'postgres' else 'anyone'}" in (r["message"] or "") for r in both)
+        checks["Flight: a call with a Bearer that signs no one in is refused (wrong token), not taken for no one, after the 400 ms every refusal costs"] = \
+            "wrong token" in bad_bearer and bad_bearer_took >= 0.35
+        checks["a wrong password is told the same words at HTTP, Flight and Kafka"] = \
+            hal["http"][0] == 401 and "wrong user name or password" in hal["http"][2] and "wrong user name or password" in hal["flight"] and hal["kafka"] == (58, "wrong user name or password")
         # A name and password sent with any Flight call count the same, not only with the handshake: ten wrong
         # passwords for gil sent with DoGet itself, then the right one is refused saying why; eli's right one answers.
         import pyarrow as pa, pyarrow.flight as fl
@@ -15023,8 +15076,9 @@ def sso():
         eve_who, eve_read = whoami(bearer_of(eve_t)), read_t(bearer_of(eve_t))
         checks["a token for eve@acme.com (made here, granted nothing on t) signs in, and its SELECT of t is answered as of a table that isn't there"] = \
             eve_who == (200, eve) and eve_read[0] == 404 and "not found" in str(eve_read[1])
+        # (a token signs in its own principal under any name, at every door: redesign step 7, piece 2)
         mismatch = whoami({"Authorization": basic(ana, eve_t)})
-        checks["Basic as ana with eve's token is refused (401): a token signs in only the user it names"] = mismatch[0] == 401
+        checks["Basic as ana with eve's token signs in eve, whose token it is"] = mismatch == (200, eve)
 
         # 6. USERS 'any': anyone the provider vouches for signs in, with public's grants and the roles its claim names
         # that are roles here (a claimed name that is a login user gives nothing).
@@ -15716,13 +15770,16 @@ def sso_pg():
             signed_in.get("then") == 0 and "told" not in signed_in and signed_in.get("rows") == [["7"]]
 
         # 3. Refused, saying why, after being told where the provider is.
-        refused = {"eve's token as ana": by_hand(ana, token_for(eve)), "a stranger's key": by_hand(ana, token_for(ana, sign_with="stranger")),
+        refused = {"a stranger's key": by_hand(ana, token_for(ana, sign_with="stranger")),
                    "expired": by_hand(ana, token_for(ana, ttl=-600)), "not a token": by_hand(ana, "pt_nope")}
         info["refused"] = refused
-        checks["refused with 28000, each saying why (another user's token, a stranger's key, an expired one, not a token at all), told where the provider is first"] = \
+        checks["refused with 28000, each saying why (a stranger's key, an expired one, not a token at all), told where the provider is first"] = \
             all(r.get("told", {}).get("openid-configuration") == discovery and r.get("error", {}).get("C") == "28000" for r in refused.values()) \
-            and "doesn't sign in ana@acme.com" in refused["eve's token as ana"]["error"]["M"] \
             and "isn't its issuer's" in refused["a stranger's key"]["error"]["M"] and "expired" in refused["expired"]["error"]["M"]
+        # (a token signs in its own principal under any name, at every door: redesign step 7, piece 2)
+        eve_as_ana = by_hand(ana, token_for(eve), "SELECT current_user")
+        info["eve's token as ana"] = eve_as_ana
+        checks["eve's token under ana's name signs in eve, whose token it is"] = eve_as_ana.get("then") == 0 and eve_as_ana.get("rows") == [[eve]]
 
         # 4. One way a connection: a user with a password still signs in with SCRAM; a name no user has is asked what a
         # user with no password is (so the port never says whether a name is a user here: the 10-18 audit's L12), and

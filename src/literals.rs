@@ -50,7 +50,7 @@ pub fn literal_rows(sql: &str, target: &Schema) -> Option<RecordBatch> {
     // (the statement's time is taken once, here: every row's now() is this one, as in a planned query)
     let ctx = SimplifyContext::builder()
         .with_config_options(Arc::clone(options))
-        .with_query_execution_start_time(Some(chrono::Utc::now()))
+        .with_query_execution_start_time(Some(chrono::DateTime::from_timestamp_micros(crate::clock::wall_us() as i64).unwrap_or_default()))
         .build();
     let values = rows.into_iter().map(|row| row.into_iter().map(|v| plan(&planner, v, &ctx)).collect::<Option<Vec<_>>>()).collect::<Option<Vec<_>>>()?;
     columns(typed(values, target)?)

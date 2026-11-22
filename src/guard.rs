@@ -15,7 +15,7 @@
 use datafusion::physical_plan::ExecutionPlan;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 /// A link to another node: round trip (s), bytes per second.

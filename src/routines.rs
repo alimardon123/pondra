@@ -951,10 +951,15 @@ pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) 
     if let Some((rows, _)) = Box::pin(crate::txn::point_read(&app.lake, sql, &who.scope)).await? {
         return Ok(Outcome::Rows(rows)); // (a key lookup in a transaction: no planning)
     }
-    Ok(Outcome::Rows(match who.files {
-        true => app.query_as(&crate::sys::planned(sql)?, Some("0"), true, &who.scope).await?, // (a file here: this node only)
-        false => app.query(sql, None, &who.scope).await?,
-    }))
+    // (the statement's own answer, as a script, a transaction or a CALL gives it to its door: what `MAX_ROWS` cuts,
+    // `app::answering`. A FOR loop's query, a variable's and a writing WITH's reads never come here, and run whole)
+    let answer = crate::app::answering(async {
+        match who.files {
+            true => app.query_as(&crate::sys::planned(sql)?, Some("0"), true, &who.scope).await, // (a file here: this node only)
+            false => app.query(sql, None, &who.scope).await,
+        }
+    });
+    Ok(Outcome::Rows(answer.await?))
 }
 
 /// A statement Postgres does in one go that is taken one part at a time, each part a statement of its

@@ -31,7 +31,7 @@ use datafusion::sql::sqlparser::ast;
 use serde_json::{json as j, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 tokio::task_local! {
@@ -394,10 +394,9 @@ pub fn columns_of(name: &str) -> Option<Vec<(String, Option<String>)>> {
 }
 
 /// The session's temporary tables `text` names, as tables of `ctx` (over the lake's of the same
-/// name), with their system columns if `text` names one.
-pub fn register(ctx: &SessionContext, text: &str) -> Result<()> {
+/// name), with their system columns if `sys` (the statement names one: `query::session_reading`).
+pub fn register(ctx: &SessionContext, text: &str, sys: bool) -> Result<()> {
     let Some(n) = here() else { return Ok(()) };
-    let sys = crate::sys::mentioned(text);
     let mut all = n.at.all.lock().unwrap();
     let Some(x) = all.get_mut(&n.name) else { return Ok(()) };
     x.used = Some(Instant::now());

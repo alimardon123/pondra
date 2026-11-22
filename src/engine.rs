@@ -5,7 +5,7 @@ use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StringAr
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::format::{ExplainFormat, MetricCategory, MetricType};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use datafusion::common::{internal_err, DFSchema, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
