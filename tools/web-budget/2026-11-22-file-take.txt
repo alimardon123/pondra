@@ -1,0 +1,7 @@
++4_000
+
+The module's code order (#868, step 5 piece 15b-2: late rows and filtering while decoding go through the file format's
+entry). Measured on CI with main 79b8fef3 merged in: its wasm 1,527 B over #867's run on the same main (59,731,119
+against 59,729,592), its brotli 63.2 KB over (9,472,378 against 9,409,209), as #837's, #798's and #709's were: brotli's
+window finds fewer matches when the same code lands in another order. The budget was 62.4 KB above that main, so this is
+the rest plus 3 KB of room.
