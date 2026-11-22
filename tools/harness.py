@@ -12168,6 +12168,22 @@ def row_filters():
         and wrote["after keyed"] == [{"id": 1, "region": "eu", "v": 1}, {"id": 2, "region": "us", "v": 0}] \
         and wrote["grants"] == [{"privilege": "DELETE", "on_name": "w", "rows": "v > 5"}, {"privilege": "UPDATE", "on_name": "w", "rows": "region = 'eu'"},
                                 {"privilege": "UPDATE", "on_name": "wk", "rows": "region = 'eu'"}]
+    # An UPDATE's new versions meet SELECT's filter too (11-20 audit M1, as Postgres checks a SELECT policy on an UPDATE's
+    # new rows): with a filter on SELECT only and a plain UPDATE grant, an UPDATE, a MERGE or an upsert moves no row out of
+    # what its writer may read; a change that keeps a row in it is made
+    for q in ["CREATE USER sel PASSWORD 'sel-password-1'", "CREATE TABLE ws (id BIGINT PRIMARY KEY, region VARCHAR, v BIGINT)",
+              "INSERT INTO ws VALUES (1, 'eu', 0), (2, 'us', 0)", "GRANT SELECT ON ws TO sel WHERE region = 'eu'",
+              "GRANT UPDATE, INSERT ON ws TO sel"]:
+        r = as_(boss, q)
+        assert "ERROR" not in str(r), (q, r)
+    sel = basic("sel", "sel-password-1")
+    out = {"kept": n_of(as_(sel, "UPDATE ws SET v = 5 WHERE id = 1")), "update": as_(sel, "UPDATE ws SET region = 'us' WHERE id = 1"),
+           "merge": as_(sel, "MERGE INTO ws USING (SELECT 1 AS id) AS s ON ws.id = s.id WHEN MATCHED THEN UPDATE SET region = 'us'"),
+           "upsert": as_(sel, "INSERT INTO ws VALUES (1, 'eu', 0) ON CONFLICT (id) DO UPDATE SET region = 'us'"),
+           "after": as_(boss, "SELECT id, region, v FROM ws ORDER BY id")}
+    checks["with a filter on SELECT only, an UPDATE, a MERGE and an upsert that move a row out of it are refused (42501), and one that keeps it is made"] = \
+        out["kept"] == 1 and all(out[k].startswith("ERROR 403") and "new row violates the filter on ws's rows of your SELECT grant" in out[k] for k in ("update", "merge", "upsert")) \
+        and out["after"] == [{"id": 1, "region": "eu", "v": 5}, {"id": 2, "region": "us", "v": 0}]
     # A writer's filter on INSERT's rows (piece 5c-2): each row it inserts must meet it, or the INSERT is refused and writes
     # nothing (VALUES, a SELECT, a MERGE's insert, in a transaction too); a load's rows aren't checked, so it is refused
     assert "ERROR" not in str(as_(boss, "GRANT INSERT ON w TO dee WHERE region = 'eu'"))
@@ -12303,6 +12319,9 @@ def read_only():
             "delete": as_(bot, "DELETE FROM notes WHERE id = 1"), "create": as_(bot, "CREATE TABLE more (a BIGINT)")}
     checks["...and its INSERT, UPDATE, DELETE and CREATE TABLE are each refused (ERROR 403, naming READ ONLY)"] = \
         all(v.startswith("ERROR 403") and "is READ ONLY" in v for v in http.values())
+    branches = {"clone": as_(bot, "CREATE DATABASE bot_branch CLONE lake"), "drop": as_(bot, "DROP DATABASE IF EXISTS bot_branch")}
+    checks["...and it makes and drops no branch, whatever CLONE it holds (ERROR 403, naming READ ONLY; 11-20 audit L1)"] = \
+        all(v.startswith("ERROR 403") and "is READ ONLY" in v for v in branches.values())
     # Postgres: INSERT and COPY FROM STDIN are refused (42501, naming READ ONLY)
     c = pg("bot", "bot-password-1")
     pg_refused = {"insert": pg_said(c, "INSERT INTO notes VALUES (3, 'pg')"), "copy": copied("notes", "4\tcopy\n")}

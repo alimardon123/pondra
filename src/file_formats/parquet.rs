@@ -1,6 +1,14 @@
 //! Parquet's entry: the format every table's files are in today, and the default.
 
-use super::{FileStats, Finished, Rows, TableFileFormat, TableWriter};
+use super::{FileStats, Finished, Rows, TableFileFormat, TableWriter, Take};
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
+use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, ParquetRowSelection};
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::TaskContext;
+use datafusion::parquet::file::metadata::PageIndexPolicy;
+use datafusion::physical_plan::ExecutionPlan;
+use futures::future::{BoxFuture, FutureExt};
 use datafusion::catalog::Session;
 use datafusion::datasource::file_format::{parquet::ParquetFormat, FileFormat};
 use datafusion::datasource::listing::PartitionedFile;
@@ -29,7 +37,41 @@ impl TableFileFormat for Parquet {
     fn reader(&self, state: &dyn Session) -> Arc<dyn FileFormat> { Arc::new(ParquetFormat::default().with_options(state.default_table_options().parquet)) }
     /// (Parquet's row selection: the pages and row groups no selected row is in are skipped unread)
     fn select(&self, file: PartitionedFile, rows: &Rows) -> Option<PartitionedFile> {
-        Some(file.with_extension(datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(selection(rows))))
+        Some(file.with_extension(ParquetRowSelection::new(selection(rows))))
+    }
+    fn take(&self) -> Option<&dyn Take> { Some(self) }
+    fn filtering(&self, scan: &DataSourceExec) -> Option<Arc<dyn ExecutionPlan>> {
+        let (config, parquet) = scan.downcast_to_file_source::<ParquetSource>()?;
+        if parquet.table_parquet_options().global.pushdown_filters {
+            return None;
+        }
+        let parquet = parquet.clone().with_pushdown_filters(true).with_reorder_filters(true);
+        Some(DataSourceExec::from_data_source(FileScanConfigBuilder::from(config.clone()).with_source(Arc::new(parquet)).build()))
+    }
+}
+
+impl Take for Parquet {
+    fn again(&self, scan: &DataSourceExec) -> Option<(FileScanConfig, Arc<dyn ExecutionPlan>)> {
+        let (files, parquet) = scan.downcast_to_file_source::<ParquetSource>()?;
+        if files.file_groups.iter().flat_map(|g| g.files()).any(|f| f.extension::<ParquetAccessPlan>().is_some()) {
+            return None; // (a row selection could not join a file's own access plan)
+        }
+        let all = DataSourceExec::from_data_source(FileScanConfigBuilder::from(files.clone()).with_source(Arc::new(parquet.with_predicate(datafusion::physical_expr::expressions::lit(true)))).build());
+        Some((files.clone(), all))
+    }
+
+    fn at(&self, ctx: Arc<TaskContext>, files: FileScanConfig, file: PartitionedFile, rows: Vec<usize>) -> BoxFuture<'static, datafusion::error::Result<Arc<dyn ExecutionPlan>>> {
+        async move {
+            let store = ctx.runtime_env().object_store(&files.object_store_url)?;
+            let cache = ctx.runtime_env().cache_manager.get_file_metadata_cache();
+            // (with its page index, so only the rows' pages are read: in the cache once read)
+            let meta = DFParquetMetadata::new(store.as_ref(), &file.object_meta).with_file_metadata_cache(Some(cache)).with_page_index_policy(Some(PageIndexPolicy::Optional)).fetch_metadata().await?;
+            let selection = RowSelection::from_consecutive_ranges(rows.iter().map(|r| *r..*r + 1), meta.file_metadata().num_rows() as usize);
+            let mut file = file.with_extension(ParquetRowSelection::new(selection));
+            file.range = None;
+            Ok(DataSourceExec::from_data_source(FileScanConfigBuilder::from(files).with_file_groups(vec![FileGroup::new(vec![file])]).build()) as Arc<dyn ExecutionPlan>)
+        }
+        .boxed()
     }
 }
 

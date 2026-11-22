@@ -21,14 +21,10 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{internal_datafusion_err, Result, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
-use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, ParquetRowSelection};
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::parquet::arrow::arrow_reader::RowSelection;
-use datafusion::parquet::file::metadata::PageIndexPolicy;
-use datafusion::physical_expr::expressions::{lit, CastExpr, Column};
+use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, ScalarFunctionExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
@@ -96,11 +92,11 @@ fn late(p: &Arc<dyn ExecutionPlan>, config: &Arc<ConfigOptions>) -> Result<Optio
     };
     let Some(k) = sort.fetch().filter(|k| (1..=MOST).contains(k)) else { return Ok(None) };
     let scan = sort.input();
-    let Some((files, parquet)) = scan.downcast_ref::<DataSourceExec>().and_then(|s| s.downcast_to_file_source::<ParquetSource>()) else { return Ok(None) };
+    // (a scan of a format that reads rows again by their places: its files, and the scan again with no filter)
+    let Some((take, files, all)) = scan.downcast_ref::<DataSourceExec>().and_then(|s| crate::file_formats::all().find_map(|f| f.take().and_then(|t| t.again(s)).map(|(files, all)| (f.take().expect("a take"), files, all)))) else { return Ok(None) };
     let schema = scan.schema();
     let width = schema.fields().len();
-    let planned = files.file_groups.iter().flat_map(|g| g.files()).any(|f| f.extension::<ParquetAccessPlan>().is_some()); // (a row selection could not join it)
-    if width < WIDE || files.limit.is_some() || planned || schema.fields().iter().any(|f| f.name() == ROW || f.name() == FILE) {
+    if width < WIDE || files.limit.is_some() || schema.fields().iter().any(|f| f.name() == ROW || f.name() == FILE) {
         return Ok(None);
     }
     let mut keys: Vec<usize> = vec![];
@@ -148,11 +144,10 @@ fn late(p: &Arc<dyn ExecutionPlan>, config: &Arc<ConfigOptions>) -> Result<Optio
     }
 
     // The scan the rows are read again by: every column and the row's place, no filter.
-    let all: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(FileScanConfigBuilder::from(files.clone()).with_source(Arc::new(parquet.with_predicate(lit(true)))).build());
     let mut wide: Vec<_> = (0..width).map(column).collect();
     wide.push((row, ROW.into()));
     let Some(wide) = all.try_swapping_with_projection(&ProjectionExec::try_new(wide, all.clone())?)? else { return Ok(None) };
-    Ok(Some(Arc::new(LateRowsExec { input: top, wide, properties: p.properties().clone(), keys: keys.len(), k })))
+    Ok(Some(Arc::new(LateRowsExec { input: top, wide, take, properties: p.properties().clone(), keys: keys.len(), k })))
 }
 
 /// The rows of a narrow top-N (`input`: its keys, then each row's place), read again with all their
@@ -163,6 +158,8 @@ pub struct LateRowsExec {
     input: Arc<dyn ExecutionPlan>,
     /// A scan of every file the top-N reads, with its columns and then each row's place.
     wide: Arc<dyn ExecutionPlan>,
+    /// What `wide`'s files are read again with, by their rows' places (their format's: `file_formats::Take`).
+    take: &'static dyn crate::file_formats::Take,
     properties: Arc<PlanProperties>,
     /// The top-N's key columns: the rows' places come after them.
     keys: usize,
@@ -218,15 +215,15 @@ impl ExecutionPlan for LateRowsExec {
 
     fn execute(&self, partition: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let kept = self.input.execute(partition, ctx.clone())?;
-        let (wide, schema, keys) = (self.wide.clone(), self.schema(), self.keys);
-        let out = futures::stream::once(async move { read_again(kept, wide, schema, keys, ctx).await.transpose() }).filter_map(futures::future::ready); // (no rows: no batch, as the top-N's)
+        let (wide, take, schema, keys) = (self.wide.clone(), self.take, self.schema(), self.keys);
+        let out = futures::stream::once(async move { read_again(kept, wide, take, schema, keys, ctx).await.transpose() }).filter_map(futures::future::ready); // (no rows: no batch, as the top-N's)
         Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema(), out)))
     }
 }
 
 /// The rows `kept` names (their places after its `keys` columns), read from `wide`'s files, in
 /// `kept`'s order, as `schema`; none if it names none.
-async fn read_again(kept: SendableRecordBatchStream, wide: Arc<dyn ExecutionPlan>, schema: SchemaRef, keys: usize, ctx: Arc<TaskContext>) -> Result<Option<RecordBatch>> {
+async fn read_again(kept: SendableRecordBatchStream, wide: Arc<dyn ExecutionPlan>, take: &'static dyn crate::file_formats::Take, schema: SchemaRef, keys: usize, ctx: Arc<TaskContext>) -> Result<Option<RecordBatch>> {
     let kept: Vec<RecordBatch> = kept.try_collect().await?;
     let mut places: Vec<(String, u64)> = vec![];
     for b in &kept {
@@ -238,7 +235,7 @@ async fn read_again(kept: SendableRecordBatchStream, wide: Arc<dyn ExecutionPlan
     if places.is_empty() {
         return Ok(None);
     }
-    let (config, _) = wide.downcast_ref::<DataSourceExec>().and_then(|s| s.downcast_to_file_source::<ParquetSource>()).ok_or_else(|| internal_datafusion_err!("LateRowsExec reads a Parquet scan"))?;
+    let config = wide.downcast_ref::<DataSourceExec>().and_then(|s| s.data_source().downcast_ref::<FileScanConfig>()).ok_or_else(|| internal_datafusion_err!("LateRowsExec reads a scan of files"))?;
     let known: HashMap<&str, &PartitionedFile> = config.file_groups.iter().flat_map(|g| g.files()).map(|f| (f.object_meta.location.as_ref(), f)).collect();
     let mut wanted: Vec<(&str, Vec<usize>)> = vec![];
     for (file, row) in &places {
@@ -247,27 +244,14 @@ async fn read_again(kept: SendableRecordBatchStream, wide: Arc<dyn ExecutionPlan
             None => wanted.push((file.as_str(), vec![*row as usize])),
         }
     }
-    let store = ctx.runtime_env().object_store(&config.object_store_url)?;
-    let cache = ctx.runtime_env().cache_manager.get_file_metadata_cache();
     let names: Vec<&str> = wanted.iter().map(|(name, _)| *name).collect();
     let mut reads = vec![];
     for (name, mut rows) in wanted {
         let file = (*known.get(name).ok_or_else(|| internal_datafusion_err!("LateRowsExec: {name} is not one of the scan's files"))?).clone();
-        let (store, cache, ctx, config) = (store.clone(), cache.clone(), ctx.clone(), config.clone());
-        reads.push(
-            async move {
-                // (with its page index, so only the rows' pages are read: in the cache once read)
-                let meta = DFParquetMetadata::new(store.as_ref(), &file.object_meta).with_file_metadata_cache(Some(cache)).with_page_index_policy(Some(PageIndexPolicy::Optional)).fetch_metadata().await?;
-                rows.sort_unstable();
-                rows.dedup();
-                let selection = RowSelection::from_consecutive_ranges(rows.iter().map(|r| *r..*r + 1), meta.file_metadata().num_rows() as usize);
-                let mut file = file.with_extension(ParquetRowSelection::new(selection));
-                file.range = None;
-                let one = DataSourceExec::from_data_source(FileScanConfigBuilder::from(config).with_file_groups(vec![FileGroup::new(vec![file])]).build());
-                one.execute(0, ctx)?.map_ok(crate::answer::compact).try_collect::<Vec<RecordBatch>>().await
-            }
-            .boxed(),
-        );
+        rows.sort_unstable();
+        rows.dedup();
+        let (one, ctx) = (take.at(ctx.clone(), config.clone(), file, rows), ctx.clone());
+        reads.push(async move { one.await?.execute(0, ctx)?.map_ok(crate::answer::compact).try_collect::<Vec<RecordBatch>>().await }.boxed());
     }
     let at_once = ctx.session_config().target_partitions().max(AT_ONCE);
     let read: Vec<Vec<RecordBatch>> = futures::stream::iter(reads).buffered(at_once).try_collect().await?;

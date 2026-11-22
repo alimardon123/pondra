@@ -41,6 +41,20 @@ impl Mentioned {
         Some(Mentioned { tables, quoted: names.quoted, functions: names.functions, every: names.every, system_columns, deleted })
     }
 
+    /// What `sql` names, its statements' read as the engine reads them (`parsed::generic`, kept in the statement's context);
+    /// None for a text the parser doesn't take.
+    pub(crate) fn of_text(sql: &str, normalize: bool) -> Option<Mentioned> {
+        let mut all: Option<Mentioned> = None;
+        for s in crate::parsed::generic(sql).ok()? {
+            let m = Mentioned::of(sql, &DFStatement::Statement(Box::new(s)), normalize)?;
+            match &mut all {
+                Some(a) => a.union(m),
+                None => all = Some(m),
+            }
+        }
+        all
+    }
+
     /// `other`'s names added: a view's, or a temporary view's, the statement reads. `every` stays the statement's own.
     pub(crate) fn union(&mut self, other: Mentioned) {
         self.tables.extend(other.tables);
@@ -90,6 +104,9 @@ impl Visitor for Names {
 
     fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
         self.every |= matches!(s, Statement::ShowTables { .. } | Statement::ShowColumns { .. });
+        if let Statement::Call(f) = s {
+            self.functions.extend(last(&f.name)); // (`CALL p(…)`: its function is no expression)
+        }
         ControlFlow::Continue(())
     }
 
@@ -150,6 +167,7 @@ mod tests {
         let m = of("SELECT upper(s), count(*), row_number() OVER () FROM read_parquet('f.parquet'), generate_series(1, 3) WHERE pondra.my_fn(x)");
         assert_eq!(m.functions, set(&["upper", "count", "row_number", "read_parquet", "generate_series", "my_fn"].map(String::from)));
         assert!(of("SELECT 'upper(s)' -- lower(t)").functions.is_empty(), "a string's and a comment's words call nothing");
+        assert_eq!(of("CALL s.refresh(1)").functions, set(&["refresh".to_string()]), "a procedure called");
     }
 
     #[test]

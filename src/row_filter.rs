@@ -1,8 +1,8 @@
 //! A grant's filter on its rows (step 6 piece 5, `users::Grant::rows`): checked when it is set (`check`), and filled in
 //! for whoever reads (`filled`), as `rights::Scope::rows` gives it to planning. It may use the table's own columns,
 //! literals, `current_user` (and `current_role` and `session_user`, the same name here, as in Postgres with no SET ROLE),
-//! `current_claim('x')` (a claim of the token signed in with: NULL until sign-in carries claims, step 7, so it shows no
-//! row) and immutable functions. So one reader's filter answers alike for every reading of a row, and planning may push
+//! `current_claim('x')` (a claim of the token signed in with: until sign-in carries claims, step 7, a filter naming one
+//! shows no row) and immutable functions. So one reader's filter answers alike for every reading of a row, and planning may push
 //! it into a scan.
 
 use crate::codes::coded;
@@ -46,13 +46,26 @@ pub fn check(ctx: &SessionContext, table: &str, schema: &Schema, text: &str) -> 
 }
 
 /// The filter `text` (as `check` keeps it) for `reader` (None: a scope made without a principal, which names no one): its
-/// reader's words as literals. One that no longer parses shows no row (`FALSE`).
+/// reader's words as literals. One that no longer parses shows no row (`FALSE`), and so does one that names a reader
+/// when no one reads, or a claim, which sign-in doesn't carry yet (`unknowable`).
 pub fn filled(text: &str, reader: Option<&str>) -> String {
     match parsed(text) {
+        Ok(e) if unknowable(&e, reader) => "FALSE".into(),
         Ok(e) => filled_expr(e, reader).to_string(),
         Err(_) => "FALSE".into(),
     }
 }
+
+/// Does `e` name what isn't known of its reader: a reader when no one reads, or any claim? It shows no row then, as a
+/// whole: filled in as NULL, `owner IS DISTINCT FROM current_user` or `current_claim('dept') IS NULL` would show every
+/// row (11-20 audit L2).
+fn unknowable(e: &Expr, reader: Option<&str>) -> bool {
+    let unknown = |x: &Expr| (reader.is_none() && names_reader(x)) || is_claim(x);
+    crate::walk::visit_expressions(e, |x: &Expr| if unknown(x) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }).is_break()
+}
+
+/// A call of `current_claim`.
+fn is_claim(x: &Expr) -> bool { matches!(x, Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("current_claim")) }
 
 /// Do the rows a write gives `table` (`new`, under SQL's names) meet `filter`, its writer's filter on them for `privilege`
 /// (as `Scope::rows` fills it in)? UPDATE's are its new versions (a row with a `_row_id`); INSERT's its new rows (none, or a
@@ -60,10 +73,16 @@ pub fn filled(text: &str, reader: Option<&str>) -> String {
 /// CHECK, which is a policy's USING when it gives none. NULL fails it, as in a WHERE. `ctx` names the functions it may
 /// call: the lake's own session's, as `check`'s.
 pub async fn holds(ctx: &SessionContext, table: &str, new: &[RecordBatch], filter: &str, privilege: &str) -> Result<()> {
+    held(ctx, table, new, filter, privilege == "UPDATE", privilege).await
+}
+
+/// `holds`, of an UPDATE's new versions (`versions`) or of new rows, under the filter of the `grant` named: an UPDATE's
+/// versions meet SELECT's filter too (`change::rows_of`).
+pub async fn held(ctx: &SessionContext, table: &str, new: &[RecordBatch], filter: &str, versions: bool, grant: &str) -> Result<()> {
     let ctx = &filters_ctx(ctx);
     let id = format!("\"{}\"", crate::text::ROW_ID);
     for b in new.iter().filter(|b| b.num_rows() > 0) {
-        let which = match (privilege == "UPDATE", b.column_by_name(crate::text::ROW_ID).is_some()) {
+        let which = match (versions, b.column_by_name(crate::text::ROW_ID).is_some()) {
             (true, false) => continue, // (new rows only: no version)
             (true, true) => format!("{id} IS NOT NULL AND "),
             (false, true) => format!("{id} IS NULL AND "),
@@ -73,7 +92,7 @@ pub async fn holds(ctx: &SessionContext, table: &str, new: &[RecordBatch], filte
         let sql = format!("SELECT 1 FROM __pondra_written WHERE {which}NOT coalesce(({filter}), false) LIMIT 1");
         let failed = async { anyhow::Ok(crate::engine::sql(ctx, &sql).await?.collect().await?.iter().any(|b| b.num_rows() > 0)) }.await;
         ctx.deregister_table("__pondra_written")?; // (the lake's session is a copy, its tables its own: this one goes with the check)
-        ensure!(!failed?, coded("42501", format!("new row violates the filter on {table}'s rows of your {privilege} grant")));
+        ensure!(!failed?, coded("42501", format!("new row violates the filter on {table}'s rows of your {grant} grant")));
     }
     Ok(())
 }
@@ -185,12 +204,13 @@ fn claim(x: &Expr) -> Option<&str> {
     }
 }
 
-/// `e` with its reader's words as literals: the reader's name (NULL for no one's), and NULL for every claim.
+/// `e` with its reader's words as literals: the reader's name (NULL for no one's), and NULL for every claim, which `check`
+/// plans to see its type (`filled` shows no row for either: `unknowable`).
 fn filled_expr(mut e: Expr, reader: Option<&str>) -> Expr {
     let _ = crate::walk::visit_expressions_mut(&mut e, |x: &mut Expr| {
         if names_reader(x) {
             *x = Expr::Value(reader.map_or(Value::Null, |r| Value::SingleQuotedString(r.to_string())).into());
-        } else if matches!(x, Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("current_claim")) {
+        } else if is_claim(x) {
             *x = Expr::Value(Value::Null.into());
         }
         ControlFlow::<()>::Continue(())
@@ -289,8 +309,11 @@ mod tests {
     fn a_filter_is_filled_in_for_whoever_reads() {
         assert_eq!(filled("owner = CURRENT_USER OR owner = current_role", Some("ann")), "owner = 'ann' OR owner = 'ann'");
         assert_eq!(filled("owner = current_user", Some("o'brien")), "owner = 'o''brien'");
-        assert_eq!(filled("owner = current_user", None), "owner = NULL", "no one's reading names no one");
-        assert_eq!(filled("dept = current_claim('dept')", Some("ann")), "dept = NULL", "no claim is carried yet: no row");
+        assert_eq!(filled("owner = current_user", None), "FALSE", "no one's reading names no one: no row");
+        assert_eq!(filled("owner IS DISTINCT FROM current_user", None), "FALSE", "not every row (11-20 audit L2)");
+        assert_eq!(filled("dept = 'x'", None), "dept = 'x'", "a filter that names no reader is the same for no one");
+        assert_eq!(filled("dept = current_claim('dept')", Some("ann")), "FALSE", "no claim is carried yet: no row");
+        assert_eq!(filled("current_claim('dept') IS NULL OR owner = current_user", Some("ann")), "FALSE", "not every row");
         assert_eq!(filled("not sql (", Some("ann")), "FALSE", "a filter that no longer parses shows no row");
     }
 }

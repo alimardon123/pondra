@@ -9,7 +9,6 @@ use datafusion::optimizer::{analyzer::{Analyzer, AnalyzerRule}, optimizer::Apply
 use datafusion::common::config::ConfigOptions;
 use datafusion::physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule};
 use datafusion::physical_expr::expressions::{lit, Column as PhysicalColumn, DynamicFilterPhysicalExpr};
-use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -1669,15 +1668,13 @@ impl PhysicalOptimizerRule for WideTopN {
     }
 }
 
-/// `p` with its wide Parquet scans filtering as they decode, through nodes that keep rows as they are.
+/// `p` with its wide scans filtering as they decode, through nodes that keep rows as they are.
 fn late(p: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
     if let Some(scan) = p.downcast_ref::<DataSourceExec>() {
-        return Ok(match scan.downcast_to_file_source::<ParquetSource>() {
-            Some((config, parquet)) if p.schema().fields().len() >= WIDE && !parquet.table_parquet_options().global.pushdown_filters => {
-                let parquet = parquet.clone().with_pushdown_filters(true).with_reorder_filters(true);
-                DataSourceExec::from_data_source(FileScanConfigBuilder::from(config.clone()).with_source(Arc::new(parquet)).build())
-            }
-            _ => p,
+        // (its format's way of filtering as it decodes: Parquet's filter pushdown, `file_formats::TableFileFormat::filtering`)
+        return Ok(match p.schema().fields().len() >= WIDE {
+            true => crate::file_formats::all().find_map(|f| f.filtering(scan)).unwrap_or(p),
+            false => p,
         });
     }
     if !(p.is::<ProjectionExec>() || p.is::<FilterExec>() || p.is::<RepartitionExec>() || p.is::<CoalescePartitionsExec>() || p.is::<UnionExec>()) {
