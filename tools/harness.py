@@ -23757,7 +23757,7 @@ def registry():
     checks["CREATE OR ALTER TABLE: made, then nothing to do, a column added, options taken away, a type widened; what would lose rows refused"] = \
         first.get("created") is True and same.get("unchanged") is True and "+ note" in grown.get("altered", []) \
         and any(a.startswith("CLUSTER BY") for a in grown.get("altered", [])) and any(a.startswith("retention") for a in grown.get("altered", [])) \
-        and "n BIGINT" in widened2.get("altered", []) and [r[0] for r in refused] == [500] * 5 \
+        and "n BIGINT" in widened2.get("altered", []) and [r[0] for r in refused] == [500, 500, 500, 400, 500] and "can only widen" in refused[3][1] \
         and q("SELECT id, kind, note, n FROM events") == [{"id": 1, "kind": "a"}] \
         and q("SELECT * FROM recent") == [{"id": 1, "kind": "a"}] and "CLUSTER BY" not in show("table", "events")
     q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR)")
