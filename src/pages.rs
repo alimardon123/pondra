@@ -12,7 +12,7 @@ use crate::ledger::ByteLru;
 use crate::store::Lake;
 use datafusion::arrow::record_batch::RecordBatch;
 use std::sync::{Arc, Mutex};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 struct Kept {

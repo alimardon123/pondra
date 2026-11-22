@@ -20,10 +20,10 @@ runtime's handle) outside `spawns.rs`, which `Node::stop` can't end (start it on
 state), and `std::env::set_var` anywhere (the environment is the process's: the next
 node and every child process would read it, and beside a library's host it is a data race).
 
-And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
-there, so those modules read the time through `crate::clock` (its `Instant`, tokio's, which a test's paused
-time moves too, and `wall_us` or `wall_ms`, which `log::now_us` and `now_ms` call), and a std clock in one
-fails (CLOCKS below names a file that may, and why).
+And every module, the doors' too (ADR-072), reads the time through `crate::clock`: its `Instant` (tokio's, which
+a test's paused time moves) or `wall_us` and `wall_ms`. std's `Instant` and `SystemTime::now` panic on a page, and
+datafusion's `Instant`, chrono's `Utc::now` and `web_time` are other clocks that paused time doesn't move, so a read
+of any of them outside clock.rs fails here (CLOCKS below names a file that may, and why).
 
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
 anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name the table (`settings.rs`) doesn't list, and a name the table
@@ -189,11 +189,11 @@ TABLE = re.compile(r"\bconst\s+[A-Z_]+\s*:\s*&\[(?:crate::settings::)?Setting\]\
 STATIC = re.compile(r"\bstatic\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)\s*:")
 
 
-# Files a page builds that may read std's clock, each with why.
+# Files that may read another clock than crate::clock's, each with why.
 CLOCKS = {
     "clock.rs": "the one clock itself: the machine's on a node (a page's is the browser's, tokio::clock), ahead by what paused time passed in a test",
 }
-STD_CLOCK = re.compile(r"\bstd::time::(?:Instant|SystemTime)\b|\bstd::time::\{[^}]*\b(?:Instant|SystemTime)\b|(?<![\w:])SystemTime::now\(")
+STD_CLOCK = re.compile(r"\bstd::time::(?:Instant|SystemTime)\b|\bstd::time::\{[^}]*\b(?:Instant|SystemTime)\b|(?<![\w:])SystemTime::now\(|\bdatafusion::common::instant\b|(?<![\w:])(?:chrono::)?Utc::now\(|\bweb_time::")
 
 
 def tests_cut(text):
@@ -357,23 +357,20 @@ def settings():
 
 
 def clocks():
-    """std's clocks in a module a page builds (all but the `doors` ones, lib.rs's or a module's own): they panic on a page."""
-    sources, doors = {}, {"main"}
+    """Every module reads the time through crate::clock: a std, datafusion, chrono or web_time clock fails (CLOCKS names a file that may)."""
+    sources = {}
     for base, _, files in os.walk(SRC):
         for f in sorted(files):
             if f.endswith(".rs"):
                 rel = os.path.relpath(os.path.join(base, f), SRC).replace(os.sep, "/")
                 sources[rel] = open(os.path.join(base, f), encoding="utf-8").read()
-                parent = "" if rel == "lib.rs" else rel.removesuffix("/mod.rs").removesuffix(".rs") + "/"
-                doors |= {parent + m for m in re.findall(r'#\[cfg\([^\]]*"doors"[^\]]*\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;', sources[rel])}
     bad = []
     for rel, text in sorted(sources.items()):
-        module = rel.removesuffix("/mod.rs").removesuffix(".rs")
-        if rel in CLOCKS or any(module == d or module.startswith(d + "/") for d in doors):
+        if rel in CLOCKS:
             continue
         for n, line in enumerate(tests_cut(text).split("\n"), 1):
             if STD_CLOCK.search(line.split("//", 1)[0]):
-                bad.append(f"src/{rel}:{n}: std's clock panics on a page: use crate::clock::Instant (tokio's: std's on a node, paused in a test) or crate::clock::wall_us / wall_ms (or add the file to CLOCKS in tools/per_node_check.py with why)")
+                bad.append(f"src/{rel}:{n}: read the time through crate::clock (its Instant, which a test's paused time moves, or wall_us / wall_ms) (or add the file to CLOCKS in tools/per_node_check.py with why)")
     return bad
 
 

@@ -1,6 +1,6 @@
 //! Single sign-on (ADR-074): a lake's identity providers (`CREATE IDENTITY PROVIDER`, catalog `ip/`)
-//! and the tokens they sign. Every door already asks `users::who` (a bearer token) or `users::sign_in`
-//! (a name and a password); a token shaped like a JWT goes from there to `check`. It is checked where
+//! and the tokens they sign. Every door signs in through `signin::Attempt` (`users::who_or_why`: a bearer
+//! token, or a name and a password); a token shaped like a JWT goes from there to `check`. It is checked where
 //! it arrives, by the node it reaches, against its provider's published keys alone: nothing is
 //! written and the leader isn't asked (invariant 409). It signs in as its provider's user claim: a
 //! user made here, or anyone when the provider says so, with the roles its roles claim names
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use datafusion::common::instant::Instant;
+use crate::clock::Instant;
 use std::time::Duration;
 
 /// The lake's format that knows identity providers: a node from before takes their tokens for nobody's

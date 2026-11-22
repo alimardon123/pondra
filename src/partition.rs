@@ -78,7 +78,7 @@ impl Spec {
                 t.starts_with("Decimal128"),
             );
             let fits = match f.transform {
-                Transform::Identity => true,
+                Transform::Identity => !t.starts_with("Struct(") && !t.starts_with("Map("), // (a part is named by its value's text: a FILE's struct has none to name it by)
                 Transform::Time(_) => time,
                 Transform::Bucket(_) => int || time || clock || text || bytes || decimal,
                 Transform::Truncate(_) => int || text || decimal,
@@ -353,6 +353,8 @@ mod tests {
         assert!(Spec::parse("bucket(0, id)").is_err() && Spec::parse("bucket(id)").is_err() && Spec::parse("week(ts)").is_err() && Spec::parse("day(ts").is_err());
         assert!(Spec::parse("id, id").unwrap().check(&cols("Utf8")).is_err(), "a field twice");
         assert!(Spec::parse("day(id)").unwrap().check(&cols("Utf8")).is_err(), "day of a number");
+        let file = crate::column_types::stored("file").map(|t| crate::answer::type_name(&t)).expect("FILE's struct");
+        assert!(Spec::parse("Name").unwrap().check(&cols(&file)).is_err(), "a FILE's struct names no part");
     }
 
     /// A one-field spec's part is its value as lakes written before name it; several are escaped and joined.

@@ -330,7 +330,7 @@ fn table_columns(l: &TableMeta) -> Vec<(String, DataType, bool, Option<String>)>
     }).collect()
 }
 
-/// The columns whose type their Arrow type doesn't say: a uuid, JSON, JSONB, INET or VARCHAR(n) column (`types.rs`), as
+/// The columns whose type their Arrow type doesn't say: a uuid, JSON, JSONB, INET, FILE or VARCHAR(n) column (`types.rs`), as
 /// Postgres types them. Enum columns are the lake's own (`lakes`).
 fn held_types(l: &TableMeta) -> impl Iterator<Item = (String, (u32, i32))> + '_ {
     l.list().columns.iter().filter_map(|c| Some((c.name.clone(), c.held.as_deref()?))).filter_map(|(c, t)| match t {
@@ -338,6 +338,7 @@ fn held_types(l: &TableMeta) -> impl Iterator<Item = (String, (u32, i32))> + '_ 
         "json" => Some((c, (JSON, -1))),
         "jsonb" => Some((c, (JSONB, -1))),
         "inet" => Some((c, (crate::pg_oids::INET, -1))),
+        "file" => Some((c, (JSONB, -1))), // (a FILE is a jsonb at the Postgres door: `pg::field_type`)
         t => crate::rules::typed::length(t).map(|n| (c, (1043, n as i32 + 4))),
     })
 }

@@ -321,7 +321,10 @@ pub async fn alive(store: &Store, t: &Term, claims: Option<&Claims>) -> bool {
         // (a leader that stepped down isn't alive, whatever its mark says: its last mark, in flight
         // as it stepped down, can land after `release` took it away)
         Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000 && !stepped_down(store, t.n).await,
-        Err(_) => false,
+        Err(object_store::Error::NotFound { .. }) => false,
+        // (a mark that can't be read just now says nothing of its leader: a failed or lost read must not make a live
+        // leader look gone, or a `pondra sql` writing beside it claims the next term and fences it out. The sim found it)
+        Err(_) => true,
     }
 }
 

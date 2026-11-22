@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::text::{first_word, head, ident, object};
+use crate::file_formats::{TableFileFormat, TableWriter};
 pub(crate) use crate::rules::fit::{by_position, implicit};
 pub(crate) use crate::rules::create::{definition, option_text};
 #[cfg(test)] pub(crate) use crate::rules::fit::fit;
@@ -159,7 +160,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         }
         let holds = |t: &str| crate::column_types::stored(t).map_or_else(|| "Utf8".to_string(), |s| crate::answer::type_name(&s)); // (INET: its bytes)
         if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && *ty == holds(t))) {
-            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, and an INET its address (a column of the table, of type {})", holds(t));
+            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text, an INET its address and a FILE its parts (a column of the table, of type {})", holds(t));
         }
         for (c, expr) in &defaults {
             ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
@@ -291,7 +292,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     // to a published table has no type there; left out of the node's --publish with a notice)
     let notice = if defaulted { crate::delta::left_out(name, &meta) } else { None };
     if let Some((f, why)) = meta.publish.iter().find_map(|f| crate::delta::refused(&meta, f).map(|why| (f, why))) {
-        ensure!(defaulted, "{name} can't be published as {f}: {why}");
+        if !defaulted {
+            return Err(crate::codes::coded("0A000", format!("{name} can't be published as {f}: {why}"))); // (not yet: a feature, not a fault)
+        }
     }
     meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect();
     let (mut puts, readers) = kept;
@@ -1695,8 +1698,8 @@ pub async fn seen_here(app: &crate::app::App) {
         404 => {
             // (a leader older than this release: its log's end, which a table's commit doesn't move)
             let Ok(upto) = async { ask("/cluster/visible").await?.checked()?.json::<u64>().await }.await else { return };
-            let deadline = datafusion::common::instant::Instant::now() + cap;
-            while app.lake.visible() < upto && datafusion::common::instant::Instant::now() < deadline {
+            let deadline = crate::clock::Instant::now() + cap;
+            while app.lake.visible() < upto && crate::clock::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
         }
@@ -1711,12 +1714,12 @@ pub async fn seen_here(app: &crate::app::App) {
 /// Waits, `cap` at most, until this node's reads include its leader's commit `c` (`Catalog::holds`), moving its view's mark
 /// as it goes when the stream isn't the whole catalog here. Does it hold `c` now?
 pub(crate) async fn holds(lake: &Lake, c: u64, cap: std::time::Duration) -> bool {
-    let deadline = datafusion::common::instant::Instant::now() + cap;
+    let deadline = crate::clock::Instant::now() + cap;
     loop {
         if lake.cat.holds(c) {
             return true;
         }
-        if datafusion::common::instant::Instant::now() >= deadline {
+        if crate::clock::Instant::now() >= deadline {
             return false;
         }
         let _ = lake.cat.settle().await; // (the mirror's: nothing to do)
@@ -1749,8 +1752,8 @@ fn no_table(table: &str) -> anyhow::Error {
 /// (`mark`: its job's progress, or the table made), 5 s at most.
 async fn seen_there(other: &Lake, mark: Option<String>) {
     let Some(key) = mark else { return };
-    let deadline = datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(5);
-    while !matches!(other.cat.get::<Value>(&key).await, Ok(Some(_))) && datafusion::common::instant::Instant::now() < deadline {
+    let deadline = crate::clock::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(other.cat.get::<Value>(&key).await, Ok(Some(_))) && crate::clock::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     // (and how far this node reads it, which its refresh moves every 250 ms: a read before then
@@ -2107,7 +2110,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
             if next.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 // (no rows: one file of none, so the node answers it as any INSERT of none)
                 let stored = crate::answer::storable(&RecordBatch::new_empty(schema))?.schema();
-                stage_put(lake, dir, crate::tier::writer(stored, &[])?, next).await?;
+                stage_put(lake, dir, crate::file_formats::parquet::PARQUET.writer(stored, &[])?, next).await?;
             }
             Ok(names)
         }
@@ -2138,7 +2141,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
 /// One partition's rows, written as the staged files of `dir`: each file is cut once it holds `STAGE_BYTES` and put as the next.
 async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: datafusion::execution::SendableRecordBatchStream, next: &std::sync::atomic::AtomicU64) -> Result<()> {
     use futures::StreamExt;
-    let mut open: Option<datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>> = None;
+    let mut open: Option<Box<dyn TableWriter>> = None;
     while let Some(batch) = rows.next().await.transpose()? {
         if batch.num_rows() == 0 {
             continue;
@@ -2146,11 +2149,11 @@ async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: dataf
         // (as Parquet holds it: an INTERVAL as its text, which the node's INSERT casts back exactly, as a tier file's is)
         let batch = crate::answer::storable(&RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?)?;
         if open.is_none() {
-            open = Some(crate::tier::writer(batch.schema(), &[])?); // (the properties `write_files`' files have: no system columns, no statistics kept)
+            open = Some(crate::file_formats::parquet::PARQUET.writer(batch.schema(), &[])?); // (the properties `write_files`' files have: no system columns, no statistics kept)
         }
         let w = open.as_mut().expect("a file is open");
         w.write(&batch)?;
-        if w.bytes_written() + w.in_progress_size() >= STAGE_BYTES {
+        if w.bytes() >= STAGE_BYTES {
             stage_put(lake, dir, open.take().expect("a file is open"), next).await?;
         }
     }
@@ -2165,9 +2168,8 @@ pub(crate) const STAGED_FILES_MOST: u64 = 1_000_000;
 
 /// One staged file, finished, put as the next `<n>.parquet` of `dir`: a create, so a file that is there is an earlier try's and is
 /// refused, not overwritten.
-async fn stage_put(lake: &Lake, dir: &str, mut w: datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>, next: &std::sync::atomic::AtomicU64) -> Result<()> {
-    w.finish()?;
-    let bytes = std::mem::take(w.inner_mut());
+async fn stage_put(lake: &Lake, dir: &str, w: Box<dyn TableWriter>, next: &std::sync::atomic::AtomicU64) -> Result<()> {
+    let bytes = w.finish()?.bytes;
     let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= STAGED_FILES_MOST {
         return Err(crate::codes::coded("54000", "a staged INSERT takes a million files at most")); // (Postgres's program limit exceeded)

@@ -328,7 +328,8 @@ mod os {
     /// Input/output error" (`deploy_check.py service`, installed again, now and then on CI's macOS).
     /// Waits as long as the plist lets the node take to stop (`ExitTimeOut`), and a little more.
     fn bootout(domain: &str, name: &str) {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
+        use crate::clock::Instant;
         let target = format!("{domain}/{name}");
         let _ = Run::new("launchctl").args(["bootout", &target]).output();
         let deadline = Instant::now() + Duration::from_secs(65);
@@ -402,7 +403,8 @@ mod os {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{mpsc, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use crate::clock::Instant;
     use windows_service::service::{
         ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
         ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,

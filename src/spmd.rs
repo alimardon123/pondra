@@ -453,7 +453,7 @@ async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::Ta
 
 /// `f`, a part of the query on `node`, its time in the statement's trace (`history::span`).
 async fn timed<T>(what: impl Into<String>, node: &str, f: impl std::future::Future<Output = T>) -> T {
-    let began = datafusion::common::instant::Instant::now();
+    let began = crate::clock::Instant::now();
     let out = f.await;
     crate::history::span(what, node, began);
     out
@@ -796,7 +796,7 @@ struct Job {
     buckets: Mutex<HashMap<(usize, usize), Vec<Spill>>>, // (exchange, node) -> its rows for that node, by partition
     subqueries: Vec<Subquery>, // answered as soon as the exchanges they need are done
     joins: Vec<crate::skew::Join>, // shuffled joins that may share out a hot partition
-    at: datafusion::common::instant::Instant,
+    at: crate::clock::Instant,
     done: std::sync::atomic::AtomicBool, // its last step ran here (others may still fetch)
     node: Arc<NodeState>, // its lake's node: its folder (`spill::dir`), and the counters of what its steps spill, take in and wait for
 }
@@ -818,7 +818,7 @@ pub struct Shuffles(Mutex<Held>);
 #[derive(Default)]
 struct Held {
     jobs: HashMap<String, Arc<Job>>,
-    dropped: HashMap<String, datafusion::common::instant::Instant>,
+    dropped: HashMap<String, crate::clock::Instant>,
 }
 
 impl crate::lake_state::LakeState for Shuffles {
@@ -849,7 +849,7 @@ pub fn forget(lake: &Lake, id: &str) {
     let _ = held(lake, |held| {
         // (marked and taken out at once: `Job::open` checks under the same hold)
         held.dropped.retain(|_, at| at.elapsed().as_secs() < 600);
-        held.dropped.insert(id.to_string(), datafusion::common::instant::Instant::now());
+        held.dropped.insert(id.to_string(), crate::clock::Instant::now());
         held.jobs.remove(id);
     });
     crate::spill::clear(id, &lake.node);
@@ -907,7 +907,7 @@ impl Job {
             if let Some(open) = held.jobs.get(&id) {
                 return Ok(Some(open.clone()));
             }
-            let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape, buckets: Default::default(), subqueries, joins, at: datafusion::common::instant::Instant::now(), done: Default::default(), node: lake.node.clone() });
+            let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape, buckets: Default::default(), subqueries, joins, at: crate::clock::Instant::now(), done: Default::default(), node: lake.node.clone() });
             held.jobs.insert(id, job.clone());
             Ok(Some(job))
         })?
@@ -1362,7 +1362,7 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
         let k = job.exchanges.iter().position(|e| Arc::ptr_eq(&e.plan, &x)).context("an unknown exchange")?;
         let own = job.exchanges[k].own;
         let fetches = sh.nodes.iter().enumerate().filter(|(i, _)| !own || *i == sh.me).map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sh.me, None, r));
-        let waited = datafusion::common::instant::Instant::now();
+        let waited = crate::clock::Instant::now();
         let from = futures::future::try_join_all(fetches).await?;
         crate::metrics::add(&job.node.metrics.wait_us, waited.elapsed().as_micros() as u64);
         let mut parts: Vec<Vec<Spill>> = (0..x.output_partitioning().partition_count()).map(|q| from.iter().map(|f| f.get(q).cloned().unwrap_or_default()).collect()).collect();

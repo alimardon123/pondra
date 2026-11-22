@@ -105,7 +105,7 @@ impl Held {
     /// left running would write the leader's mark again).
     pub(crate) async fn stop(&self) {
         let (term, lake) = (self.term.get(), self.lake.get());
-        let t0 = std::time::Instant::now();
+        let t0 = crate::clock::Instant::now();
         let tr = |w: &str| if crate::env::is_set("PONDRA_TRACE_START") { eprintln!("stop: {w} {:.2} s", t0.elapsed().as_secs_f64()) };
         // (a lake in memory goes with its node: no other node will read what it made durable)
         if let (Some(_), Some(l)) = (term, lake.filter(|l| !crate::memory_lake::in_memory(&l.url))) {

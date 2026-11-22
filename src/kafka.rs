@@ -38,7 +38,8 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::clock::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -342,8 +343,8 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
     Ok(w)
 }
 
-/// SASL/PLAIN: "\0user\0password": a user and its password (or one of its tokens), or a role's
-/// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`). As on HTTP, a password crosses
+/// SASL/PLAIN: "\0user\0password": a user and its password, or any name and a token, which signs in the
+/// token's principal (`signin::Attempt`, as every door signs in). As on HTTP, a password crosses
 /// only TLS from another machine, a token may under `PONDRA_TLS=optional` (`tls::may_send_password`), and
 /// past ten failures a minute for a user from one address, that pair is refused (`auth::guessing`).
 async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
@@ -355,58 +356,34 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
         Some(token) => crate::auth::Credential::Token(token),
         None => crate::auth::Credential::of_sasl_plain(&auth),
     };
-    let (mut user, password) = match &credential {
+    let (user, password) = match &credential {
         crate::auth::Credential::Password { user, password } => (user.clone(), password.clone()),
         _ => (String::new(), String::new()),
     };
-    let ip = Some(peer.addr.ip());
-    let refused = if let Some(why) = credential.malformed() {
-        Some(why) // (never taken for no sign-in, an open node's included)
-    } else if app.open().await {
+    // (one sign-in at every door, `signin::Attempt`: the lock, whom it signs in, the count, 400 ms and the audit line. An open
+    // node takes anyone, but never a credential that can't be read; a password crosses only TLS from another machine)
+    let attempt = crate::signin::Attempt::at(app, "kafka", who.from);
+    let open = credential.malformed().is_none() && app.open().await;
+    let refused = if open {
         *who = made(crate::auth::Principal::of(Role::Admin)).at("kafka", who.from);
         *said = Some(Said::Open);
         None
-    } else if let Some(token) = credential.token() {
-        // (a bearer token, as HTTP takes one: an identity provider's, or Pondra's own; never a guess)
-        match crate::users::who(&app.lake, &app.auth, &credential).await {
-            Some(p) => {
-                user = p.name.clone();
-                *who = made(p).at("kafka", who.from);
-                *said = Some(Said::Bearer(token.to_string()));
-                None
-            }
-            None => Some(crate::sso::why(&app.lake, token).await.unwrap_or_else(|| "wrong token".to_string())),
-        }
-    } else if !peer.may_send_password() && !crate::users::is_token(&user, &password) {
+    } else if credential.user().is_some() && !peer.may_send_password() && !crate::users::is_token(&user, &password) && app.auth.token_role(&password) == Role::None {
+        crate::audit::refused(app, &user, "kafka", who.from, "sign in", PASSWORD_PLAIN).await; // (not a guess: no pause)
         Some(PASSWORD_PLAIN.to_string())
-    } else if let Some(wait) = crate::auth::guessing(&app.lake, ip, &user) {
-        Some(crate::auth::guessing_says(&user, wait))
     } else {
-        match crate::users::sign_in(&app.lake, &app.auth, &user, &password).await {
-            Some(p) => {
+        match attempt.sign_in(&credential).await {
+            Ok(p) => {
+                *said = Some(match credential.token() {
+                    Some(token) => Said::Bearer(token.to_string()),
+                    None => Said::Plain(user.clone(), password.clone()),
+                });
                 *who = made(p).at("kafka", who.from);
-                *said = Some(Said::Plain(user.clone(), password.clone()));
                 None
             }
-            None => {
-                let by_token = crate::users::is_token(&user, &password);
-                if !by_token {
-                    crate::auth::guessed(&app.lake, ip, &user); // (a token isn't guessed: it is random, as on HTTP and Postgres)
-                }
-                let why = match by_token {
-                    true => crate::sso::why(&app.lake, &password).await, // (an identity provider's says why)
-                    false => None,
-                };
-                Some(why.unwrap_or_else(|| "wrong user name or password".to_string()))
-            }
+            Err(r) => Some(r.words),
         }
     };
-    if let Some(why) = &refused {
-        crate::audit::refused(app, &user, "kafka", who.from, "sign in", why).await;
-        if why != PASSWORD_PLAIN {
-            tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time, as on HTTP)
-        }
-    }
     let mut w = vec![];
     w.put_i16(if refused.is_none() { 0 } else { SASL_FAILED });
     put_nstr(&mut w, refused.as_deref());
@@ -1274,7 +1251,7 @@ fn encode_batch(base: i64, ts: i64, recs: &[(Option<Vec<u8>>, Option<Vec<u8>>)])
     b
 }
 
-fn now_ms() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64) }
+fn now_ms() -> i64 { crate::clock::wall_ms() as i64 }
 
 // ---------------------------------------------------------------- consumer groups
 //
@@ -1327,7 +1304,7 @@ struct Group {
 struct Member {
     protocols: Vec<(String, Bytes)>,
     session: Duration,
-    seen: std::time::Instant,
+    seen: crate::clock::Instant,
     joined: bool,
     assignment: Bytes,
 }
@@ -1351,7 +1328,7 @@ impl Group {
         }
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
-        let (kept, group, round, start) = (kept.clone(), group.to_string(), self.round, std::time::Instant::now());
+        let (kept, group, round, start) = (kept.clone(), group.to_string(), self.round, crate::clock::Instant::now());
         tasks.spawn_node(crate::spawns::Vital::Own, async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1519,8 +1496,8 @@ async fn join_group(app: &App, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static
             return Ok(async move { answer(Joined { error: UNKNOWN_MEMBER_ID, member, ..Default::default() }) }.boxed());
         }
         let id = if member.is_empty() { format!("pondra-{}", uuid::Uuid::new_v4()) } else { member };
-        let m = g.members.entry(id.clone()).or_insert(Member { protocols: vec![], session, seen: std::time::Instant::now(), joined: false, assignment: Bytes::new() });
-        (m.protocols, m.session, m.seen) = (protocols, session, std::time::Instant::now());
+        let m = g.members.entry(id.clone()).or_insert(Member { protocols: vec![], session, seen: crate::clock::Instant::now(), joined: false, assignment: Bytes::new() });
+        (m.protocols, m.session, m.seen) = (protocols, session, crate::clock::Instant::now());
         g.rebalance(&kept, &group, rebalance, &app.lake.node.tasks);
         g.members.get_mut(&id).expect("just added").joined = true;
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1557,7 +1534,7 @@ async fn sync_group(app: &App, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static
     if error != 0 {
         return Ok(async move { answer(error, Bytes::new()) }.boxed());
     }
-    g.members.get_mut(&member).expect("checked").seen = std::time::Instant::now();
+    g.members.get_mut(&member).expect("checked").seen = crate::clock::Instant::now();
     if member == g.leader {
         for (id, a) in assignments {
             if let Some(m) = g.members.get_mut(&id) {
@@ -1594,7 +1571,7 @@ fn heartbeat(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
             let g = groups.entry(group.clone()).or_default();
             g.expire(&kept, &group, &app.lake.node.tasks);
             if let Some(m) = g.members.get_mut(&member) {
-                m.seen = std::time::Instant::now();
+                m.seen = crate::clock::Instant::now();
             }
             g.check(&member, generation)
         }

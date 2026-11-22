@@ -89,7 +89,7 @@ async fn attempt(source: &impl Source, target: &Lake, table: &str, sql: &str, jo
     let at_once = copies(target);
     let total: u64 = listed.files.iter().map(|f| f.bytes).sum();
     let share = usize::try_from(total / at_once as u64).unwrap_or(usize::MAX).clamp(SHARE_FLOOR, tier::FILE_BYTES);
-    let limits = Limits { file: tier::FILE_BYTES, group: tier::ROW_GROUP_BYTES };
+    let limits = Limits { file: tier::FILE_BYTES, group: crate::file_formats::parquet::ROW_GROUP_BYTES };
     let shared = Limits { file: share, ..limits };
     let mut jobs = vec![];
     for f in &listed.files {
@@ -547,7 +547,7 @@ mod tests {
             })
             .collect();
         // What the writer keeps as it goes (`tier::Encoding`), and its footer.
-        let (mut w, mut seen, mut sketches) = (tier::writer(schema.clone(), &[]).unwrap(), Seen::new(schema.clone()), Sketches::new(&schema));
+        let (mut w, mut seen, mut sketches) = (crate::file_formats::parquet::writer(schema.clone(), &[]).unwrap(), Seen::new(schema.clone()), Sketches::new(&schema));
         for b in &batches {
             seen.add(b).unwrap();
             sketches.add(b);

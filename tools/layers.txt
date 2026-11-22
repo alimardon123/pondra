@@ -76,6 +76,7 @@ scan catalog
 sketch catalog
 store catalog
 column_types catalog
+file_formats catalog
 frozen catalog
 naming catalog
 pins catalog
@@ -186,6 +187,7 @@ core_statements engine
 connections catalog
 string_agg engine
 sys engine
+signin engine
 tasks engine
 temp engine
 tier engine

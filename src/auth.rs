@@ -560,7 +560,7 @@ const PAIRS: usize = 10_000; // (the pairs held at once: when full, the one whos
 // (a node's own: two nodes in one process count apart, ADR-061 §3)
 #[derive(Default)]
 pub struct Guesses {
-    failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<datafusion::common::instant::Instant>>>,
+    failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<crate::clock::Instant>>>,
 }
 
 impl crate::lake_state::LakeState for Guesses {
@@ -573,13 +573,13 @@ impl crate::lake_state::LakeState for Guesses {
 /// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0. Each node
 /// counts its own, so a cluster of N nodes allows N times the guesses until 1.1 (redesign step 11's shared state).
 pub fn guessing(lake: &crate::store::Lake, addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> {
-    lake.state::<Guesses>().ok()?.guessing_at(addr, user, datafusion::common::instant::Instant::now())
+    lake.state::<Guesses>().ok()?.guessing_at(addr, user, crate::clock::Instant::now())
 }
 
 /// A failed sign-in of this address and user name, now.
 pub fn guessed(lake: &crate::store::Lake, addr: Option<std::net::IpAddr>, user: &str) {
     if let Ok(g) = lake.state::<Guesses>() {
-        g.guessed_at(addr, user, datafusion::common::instant::Instant::now());
+        g.guessed_at(addr, user, crate::clock::Instant::now());
     }
 }
 
@@ -591,11 +591,11 @@ impl Guesses {
         (addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)), user.to_string())
     }
 
-    fn guessing_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: datafusion::common::instant::Instant) -> Option<u64> {
+    fn guessing_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: crate::clock::Instant) -> Option<u64> {
         let key = Self::key(addr, user);
         let mut all = self.failures.lock().unwrap();
         let times = all.get_mut(&key)?;
-        while times.front().is_some_and(|t| now.saturating_duration_since(*t) >= MINUTE) {
+        while times.front().is_some_and(|t| now.duration_since(*t) >= MINUTE) {
             times.pop_front();
         }
         let n = times.len();
@@ -608,11 +608,11 @@ impl Guesses {
         // (the pair has fewer than ten again once its (n - 9)th failure, the one `TRIES` back from the
         // newest, is a minute old)
         let until = times[n - TRIES];
-        let left = MINUTE.saturating_sub(now.saturating_duration_since(until));
+        let left = MINUTE.saturating_sub(now.duration_since(until));
         Some(left.as_secs_f64().ceil().max(1.0) as u64)
     }
 
-    fn guessed_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: datafusion::common::instant::Instant) {
+    fn guessed_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: crate::clock::Instant) {
         let key = Self::key(addr, user);
         let mut all = self.failures.lock().unwrap();
         if !all.contains_key(&key) && all.len() >= PAIRS {
@@ -623,7 +623,7 @@ impl Guesses {
             }
         }
         let times = all.entry(key).or_default();
-        while times.front().is_some_and(|t| now.saturating_duration_since(*t) >= MINUTE) {
+        while times.front().is_some_and(|t| now.duration_since(*t) >= MINUTE) {
             times.pop_front();
         }
         times.push_back(now);
@@ -728,15 +728,6 @@ impl Credential {
         }
     }
 
-    /// The secret itself: a token, or a password (which may be a token).
-    pub fn secret(&self) -> Option<&str> {
-        match self {
-            Credential::Token(t) => Some(t),
-            Credential::Password { password, .. } => Some(password),
-            _ => None,
-        }
-    }
-
     /// What a door answers it when it can't be read (`MALFORMED`, and why).
     pub fn malformed(&self) -> Option<String> {
         match self {
@@ -750,7 +741,8 @@ impl Credential {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use crate::clock::Instant;
 
     #[test]
     fn a_credential_is_read_alike_at_every_door() {
