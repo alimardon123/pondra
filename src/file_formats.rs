@@ -43,6 +43,49 @@ pub trait TableFileFormat: Sync + std::fmt::Debug {
     /// `scan`, if it is this format's, filtering its rows as it decodes them (a filter's columns first, the others only
     /// for the rows it keeps), when it doesn't already: what a wide scan is read with (`optimize::late`). None: as it is.
     fn filtering(&self, _scan: &DataSourceExec) -> Option<Arc<dyn ExecutionPlan>> { None }
+    /// Its files read a block at a time by their own index, if it can (`Blocks`): what a key lookup reads. None: a lookup
+    /// can't read its files (`serve.rs`).
+    fn blocks(&self) -> Option<&dyn Blocks> { None }
+    /// Its files' columns decoded from their bytes one at a time, if it can (`Columns`): what the hot tier keeps in memory.
+    /// None: its files aren't kept there (`hot.rs`).
+    fn columns(&self) -> Option<&dyn Columns> { None }
+}
+
+/// A file's bytes where they are, read by range: a lookup reads only a file's index and the blocks it needs.
+pub struct Stored {
+    pub store: Arc<dyn datafusion::object_store::ObjectStore>,
+    pub path: datafusion::object_store::path::Path,
+    pub bytes: u64, // its size
+}
+
+/// A file read a block at a time by its format's own index (`serve.rs`: a key's newest row, block by block).
+pub trait Blocks: Sync + std::fmt::Debug {
+    /// `file`'s index: what a lookup keeps of a file, once read (files never change).
+    fn index<'a>(&'a self, file: &'a Stored) -> BoxFuture<'a, Result<Arc<dyn BlockIndex>>>;
+}
+
+/// A file's blocks, as its index tells them.
+pub trait BlockIndex: Send + Sync {
+    /// The blocks that may hold `key` in column `column`, in the file's order (a block its index says nothing of: may).
+    fn holding(&self, column: &str, key: &ScalarValue) -> Result<Vec<usize>>;
+    /// Block `b`'s rows, decoded.
+    fn read<'a>(&'a self, file: &'a Stored, b: usize) -> BoxFuture<'a, Result<RecordBatch>>;
+}
+
+/// A file's columns decoded from its bytes (`hot.rs`: a file's columns kept in memory, decoded one at a time).
+pub trait Columns: Sync + std::fmt::Debug {
+    /// `bytes`, a whole file, open for its columns: strings read as views (no copy of their bytes).
+    fn open(&self, bytes: bytes::Bytes) -> Result<Box<dyn OpenFile>>;
+}
+
+/// A file open for its columns.
+pub trait OpenFile: Send {
+    /// Its columns.
+    fn schema(&self) -> SchemaRef;
+    /// About the bytes its columns at `columns` (places in `schema`) decode to.
+    fn estimate(&self, columns: &[usize]) -> usize;
+    /// Its columns at `columns`, in batches of `batch` rows (no columns: only how many rows each batch has).
+    fn read(&self, columns: &[usize], batch: usize) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + Send>>;
 }
 
 /// Rows read again by their places: what a top-N of a wide scan reads its rows' other columns with, once it has sorted
@@ -71,17 +114,21 @@ pub struct Rows<'a> {
 /// Files of `format` at `paths` (full URLs), as one read, as DataFusion's own `read_parquet` reads Parquet ones: `schema`
 /// theirs, or none to take it from the first.
 pub async fn read(ctx: &datafusion::prelude::SessionContext, format: &dyn TableFileFormat, paths: Vec<String>, schema: Option<SchemaRef>) -> Result<datafusion::prelude::DataFrame> {
-    use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
+    use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
     anyhow::ensure!(!paths.is_empty(), "no files to read");
     let state = ctx.state();
     let urls = paths.iter().map(ListingTableUrl::parse).collect::<datafusion::error::Result<Vec<_>>>()?;
-    let options = ListingOptions::new(format.reader(&state)).with_file_extension(format!(".{}", format.ending()));
-    let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options);
+    let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(listing(format, &state));
     let config = match schema {
         Some(s) => config.with_schema(s),
         None => config.infer_schema(&state).await?,
     };
     Ok(ctx.read_table(Arc::new(ListingTable::try_new(config)?))?)
+}
+
+/// How a listing of files of `format` reads them: as `read_parquet` reads Parquet ones (`ParquetReadOptions`'s).
+pub fn listing(format: &dyn TableFileFormat, state: &dyn Session) -> datafusion::datasource::listing::ListingOptions {
+    datafusion::datasource::listing::ListingOptions::new(format.reader(state)).with_file_extension(format!(".{}", format.ending()))
 }
 
 /// One file being written.
