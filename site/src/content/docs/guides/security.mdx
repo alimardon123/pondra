@@ -373,7 +373,8 @@ print(ann.sql("SELECT id FROM regional ORDER BY id").rows())
 - UPDATE's and DELETE's own filters (`GRANT UPDATE ON t TO r WHERE condition`) say which rows a writer changes: its
   UPDATE or DELETE changes the rows both its SELECT filter and that one hold, and leaves the rest as they are, as
   Postgres's policy `USING` does; a MERGE's UPDATE and DELETE clauses keep theirs. An UPDATE whose new version its
-  filter doesn't hold is refused (42501), as Postgres's `WITH CHECK`. A subquery of the same table in the statement
+  filter doesn't hold is refused (42501), as Postgres's `WITH CHECK`, and so is one whose new version its SELECT filter
+  doesn't hold, a MERGE's or an upsert's too: no write moves a row out of what its writer may read. A subquery of the same table in the statement
   reads those rows too.
 - INSERT's filter says which rows a writer adds: each row an INSERT, a MERGE's insert or an upsert proposes must meet
   it, or the statement is refused (42501) and writes nothing, as Postgres's `WITH CHECK`. Such an INSERT's rows are
@@ -466,7 +467,7 @@ A role's options reach its members, and the tightest wins: a member runs at most
 statements at once, each for the shortest time, that it, a role it holds or `public` sets, so
 nothing a member sets lifts a role's (each member's statements are counted on their own). One more
 option makes a role an agent's guardrail: **`READ ONLY`**, which reads and writes nothing to the
-lake, whatever it is granted, at every door. Its session's temporary tables and `$variables` still
+lake, whatever it is granted, at every door: CLONE makes it no branch, and it drops none. Its session's temporary tables and `$variables` still
 work, and a `CALL` runs, each of its statements checked as the caller's. `READ WRITE` takes it back.
 
 ```python

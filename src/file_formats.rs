@@ -1,15 +1,21 @@
 //! The registry's file formats section (redesign §6, step 5 piece 15; `designs/redesign/table-file-formats.md`): what a
 //! table's data files are written with. Parquet is the one built in (`parquet.rs`); another format (Vortex, Lance) is one
 //! more entry, so what writes a table's files (`tier::Encoding`, a page's staged INSERT) and what scans them
-//! (`scan::Files`, `read`) names no format's own types. Plans that look inside a scan (`take`: late rows, key lookups),
+//! (`scan::Files`, `read`) names no format's own types. What a plan does inside a format's scan is the format's too: rows
+//! read again by their places (`take`: late rows) and filters applied as rows are decoded (`filtering`). Key lookups and
 //! the hot tier's reads, and a file's statistics from bytes another engine wrote (`stats`, `copy_blocks`) move behind the
-//! entry next (pieces 15b-2, 15b-3 and 15c).
+//! entry next (pieces 15b-3 and 15c).
 
 use anyhow::Result;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::ExecutionPlan;
+use futures::future::BoxFuture;
 use std::sync::Arc;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -33,6 +39,27 @@ pub trait TableFileFormat: Sync + std::fmt::Debug {
     /// `file`, to be read for only these of its rows. None: the format can't read rows by their places (a table whose
     /// files have deleted rows, or a scan of a file's part, is refused naming it).
     fn select(&self, file: PartitionedFile, rows: &Rows) -> Option<PartitionedFile>;
+    /// Its rows read again by their places, if it can (`Take`). None: a top-N of a wide scan of its files reads every
+    /// column as it sorts (`late_rows.rs`).
+    fn take(&self) -> Option<&dyn Take> { None }
+    /// `scan`, if it is this format's, filtering its rows as it decodes them (a filter's columns first, the others only
+    /// for the rows it keeps), when it doesn't already: what a wide scan is read with (`optimize::late`). None: as it is.
+    fn filtering(&self, _scan: &DataSourceExec) -> Option<Arc<dyn ExecutionPlan>> { None }
+}
+
+/// Rows read again by their places: what a top-N of a wide scan reads its rows' other columns with, once it has sorted
+/// only its keys and each row's place (`late_rows.rs`).
+pub trait Take: Sync + std::fmt::Debug {
+    /// `scan`, if it is this format's and its files can be read again at places: its files, and the same scan with no
+    /// filter. Each row's place is DataFusion's `file_row_index()`, which its scans give.
+    fn again(&self, scan: &DataSourceExec) -> Option<(FileScanConfig, Arc<dyn ExecutionPlan>)>;
+    /// `file`, one of `files`', read for only its rows at `rows` (sorted, each once): a scan of that file alone.
+    fn at(&self, ctx: Arc<TaskContext>, files: FileScanConfig, file: PartitionedFile, rows: Vec<usize>) -> BoxFuture<'static, datafusion::error::Result<Arc<dyn ExecutionPlan>>>;
+}
+
+/// Every file format this build has.
+pub fn all() -> impl Iterator<Item = &'static dyn TableFileFormat> {
+    crate::registry::get().find::<FileFormats>().into_iter().flat_map(|f| f.0.iter().copied())
 }
 
 /// The rows of a file a scan reads, by their places in it: those its deletes leave, in its range; or those at `only`.

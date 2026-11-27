@@ -715,8 +715,8 @@ pub(crate) fn lakes_own(p: &dyn TableProvider) -> bool {
     p.is::<Pruned>()
 }
 
-/// Does a query (with the stored views it reads) name a keyed table's `_deleted` (`named`)? As a
-/// word: a column of the query's own named `dbt_is_deleted` isn't it (dbt's snapshots write one).
+/// Does a text name a keyed table's `_deleted`, as a word (a column named `dbt_is_deleted` isn't it: dbt's snapshots write
+/// one)? For an error's text (`App::query`); a statement's is its names (`mentioned::columns`).
 pub fn names_deleted(text: &str) -> bool { text.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == "_deleted") }
 
 /// A table as its users see it: append tables as files + log; keyed tables their current rows.
@@ -1535,6 +1535,9 @@ pub async fn named_records(lake: &Lake, ctx: &SessionContext, texts: &[&str], sc
             let mut names = vec![];
             for text in pending.drain(..) {
                 let Some(m) = refers(&text) else { return Ok(None) };
+                if own && m.every {
+                    return Ok(Some(Named { mentioned: m, ..Named::default() })); // (a listing: every table is read, `session_reading`)
+                }
                 names.extend(local(&catalog, &m.tables).filter(|n| asked.insert(n.clone())));
                 match std::mem::take(&mut own) { // (the statement's own, then each text it reads)
                     true => named.mentioned = m,
@@ -1579,6 +1582,17 @@ pub struct Named {
     pub tables: std::collections::BTreeMap<String, bytes::Bytes>,
     pub views: Vec<(String, String)>,
     pub(crate) mentioned: crate::mentioned::Mentioned,
+}
+
+/// The names in a lake attached as `ns` of what `tables` names there (`ns.t`, a public table, and `ns.s.t`), as that lake
+/// keys them, lower-cased (`mentioned.rs`; matched as the text's words were, whatever their case).
+fn names_in(ns: &str, tables: &std::collections::BTreeSet<datafusion::common::TableReference>) -> std::collections::BTreeSet<String> {
+    use datafusion::common::TableReference;
+    tables.iter().filter_map(|r| match r {
+        TableReference::Full { catalog, schema, table } if catalog.eq_ignore_ascii_case(ns) => Some(crate::text::join(schema, table)),
+        TableReference::Partial { schema, table } if schema.eq_ignore_ascii_case(ns) => Some(table.to_string()),
+        _ => None,
+    }).map(|n| n.to_lowercase()).collect()
 }
 
 /// The names of `tables` in the session's default catalog, as the lake keys them (`schema.table`, or `table` in public).
@@ -1647,8 +1661,13 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
-    crate::extension::functions(lake, &ctx, &text).await?; // the installed extensions' functions it names (`INSTALL … FROM`, ADR-075; a page refuses them)
-    if crate::pattern::wanted(&text) || text.contains("pondra_match") || text.contains("pondra_open") {
+    // (each function it calls, `mentioned.rs`; an unparsed text's words)
+    let calls = |f: &str| match &mentioned {
+        Some(m) => m.functions.contains(&f.to_lowercase()),
+        None => mentions(&text, f),
+    };
+    crate::extension::functions(lake, &ctx, &calls).await?; // the installed extensions' functions it names (`INSTALL … FROM`, ADR-075; a page refuses them)
+    if crate::pattern::wanted(&text) || calls("pondra_match") || calls("pondra_open") {
         crate::matcher::register(&ctx); // (again, last: a DEFINE's glue sees the session's every function, the lake's own and Python ones too)
     }
     // (a system column named: the tables get theirs; `_deleted` named: a keyed table's deleted rows are read too. What the
@@ -1657,7 +1676,7 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         Some(m) => (m.system_columns, m.deleted),
         None => crate::mentioned::columns(&text),
     };
-    let catalog = ctx.state().config().options().catalog.clone();
+    let (catalog, normalize) = (ctx.state().config().options().catalog.clone(), ctx.state().config().options().sql_parser.enable_ident_normalization);
     let quoted: std::collections::BTreeSet<String> = mentioned.iter().flat_map(|m| local(&catalog, &m.quoted)).collect();
     let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
@@ -1717,7 +1736,9 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
     }
     let attached = lake.attached.read().unwrap().clone();
     for (ns, other) in attached {
-        if !listing && !mentions(&text, &ns) {
+        // (what it names there, `ns.t` and `ns.s.t`, lower-cased; an unparsed text's words)
+        let mut there = mentioned.as_ref().map(|m| names_in(&ns, &m.tables));
+        if !listing && !there.as_ref().map_or_else(|| mentions(&text, &ns), |n| !n.is_empty()) {
             continue;
         }
         let locked = crate::users::across(&other, &ns, scope).await.err().map(|e| e.to_string()); // (its own sign-in: `users::across`)
@@ -1732,12 +1753,18 @@ async fn session_reading(lake: &Lake, sql: &str, except: &str, upto: Option<u64>
         let entries = other.cat.scan_raw("t/", "t0").await?;
         other.cat.settle().await?; // (as this lake's own, above)
         let upto = Some(other.visible()); // (one end for its tables too, as this lake's above)
-        // (its views the statement names, their names read in it: the tables they read are named then, below)
-        let theirs = their_views(&other, &ns, &text, listing, scope).await?;
+        // (its views the statement names: the tables they read are named then, below)
+        let theirs = their_views(&other, &ns, &|n| there.as_ref().map_or_else(|| mentions(&text, n), |t| t.contains(&n.to_lowercase())), listing, scope).await?;
         let read = theirs.iter().fold(text.clone(), |t, (_, s)| format!("{t} {s}"));
+        for (_, sql) in &theirs {
+            match (&mut there, crate::mentioned::Mentioned::of_text(sql, normalize)) {
+                (Some(t), Some(m)) => t.extend(names_in(&ns, &m.tables)),
+                _ => there = None, // (a view's text the parser doesn't take: the words of them all, as before)
+            }
+        }
         for (key, raw) in entries {
             let name = &key[2..];
-            if crate::sys::hidden(name) || !(listing || mentions(&read, name)) {
+            if crate::sys::hidden(name) || !(listing || there.as_ref().map_or_else(|| mentions(&read, name), |t| t.contains(&name.to_lowercase()))) {
                 continue;
             }
             let meta = other.cat.parsed(&key, &raw)?;
@@ -1982,15 +2009,15 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool, scope: &crate::
     }
 }
 
-/// The stored views of `other`, attached as `ns`, that `text` names (every one, for a listing), by their names in it, each
-/// as the query it reads there: its macros expanded as its own lake's views are (`stored_views`), its tables named in
-/// `ns` and the views of `other` it reads inlined (`redirect.rs`). So `ns.sales.v` reads as `sales.v` does in `other`.
-async fn their_views(other: &Lake, ns: &str, text: &str, listing: bool, scope: &crate::rights::Scope) -> Result<Vec<(String, String)>> {
+/// The stored views of `other`, attached as `ns`, that a statement names (`named`, by their names in `other`; every one, for
+/// a listing), each as the query it reads there: its macros expanded as its own lake's views are (`stored_views`), its tables
+/// named in `ns` and the views of `other` it reads inlined (`redirect.rs`). So `ns.sales.v` reads as `sales.v` does in `other`.
+async fn their_views(other: &Lake, ns: &str, named: &(dyn Fn(&str) -> bool + Sync), listing: bool, scope: &crate::rights::Scope) -> Result<Vec<(String, String)>> {
     let host = crate::host::Asking::of(other, scope);
     let mut out = vec![];
     for (key, raw) in other.cat.scan_raw("q/", "q0").await? {
         let name = &key[2..];
-        if !(listing || crate::text::mentions(text, name)) {
+        if !(listing || named(name)) {
             continue;
         }
         let v: crate::ddl::StoredView = serde_json::from_slice(&raw)?;
@@ -2231,6 +2258,49 @@ mod tests {
             assert!(registered(&ctx).contains("a") && !registered(&ctx).contains("b"), "{:?}", registered(&ctx));
             lake.cat.close().await?;
             let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        })
+        .await
+    }
+    /// A lake attached as `ext` is read for what a statement names there (`mentioned.rs`): `ext.t`, `ext.s.u`, a view of it
+    /// and the tables that view reads. A statement that names it only in a string reads nothing of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attached_lake_is_read_for_what_a_statement_names_there() -> anyhow::Result<()> {
+        crate::auth::as_node(async move {
+            use super::*;
+            use crate::ddl::{apply, Ddl};
+            use std::collections::BTreeSet;
+            let open = |tag: &'static str| async move {
+                let dir = std::env::temp_dir().join(format!("pondra-{tag}-{}", uuid::Uuid::new_v4()));
+                anyhow::Ok((crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?, dir))
+            };
+            let ((lake, here), (other, there)) = (open("here").await?, open("there").await?);
+            let (node, me) = (&crate::auth::Principal::node().scope, &crate::auth::Principal::node());
+            apply(&other, Ddl::CreateSchema { name: "s".into(), if_not_exists: false }, me).await?;
+            for t in ["t", "s.u", "under", "unused"] {
+                crate::write::create_table(&other, t, r#"{"columns": [["x", "Int64"]]}"#).await?;
+            }
+            apply(&other, Ddl::CreateView { name: "w".into(), sql: "SELECT x FROM under".into(), replace: false, facts: None, text: None }, me).await?;
+            lake.attach("ext", other.clone())?;
+            let read = |sql: &'static str| {
+                let lake = &lake;
+                async move {
+                    let ctx = session_for(lake, sql, "", None, node).await?;
+                    let Some(c) = ctx.catalog("ext") else { return anyhow::Ok(BTreeSet::new()) };
+                    anyhow::Ok(c.schema_names().into_iter().flat_map(|s| {
+                        let schema = c.schema(&s).expect("listed");
+                        schema.table_names().into_iter().map(move |t| crate::text::join(&s, &t))
+                    }).collect::<BTreeSet<String>>())
+                }
+            };
+            let set = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<BTreeSet<String>>();
+            assert_eq!(read("SELECT * FROM ext.t").await?, set(&["t"]));
+            assert_eq!(read("SELECT * FROM ext.s.u JOIN ext.T ON true").await?, set(&["s.u", "t"]), "as written, whatever its case");
+            assert_eq!(read("SELECT * FROM ext.w").await?, set(&["under", "w"]), "a view of it, and what the view reads");
+            assert_eq!(read("SELECT 'ext.t' AS s").await?, set(&[]), "a word in a string reads nothing there");
+            lake.cat.close().await?;
+            other.cat.close().await?;
+            let _ = (std::fs::remove_dir_all(&here), std::fs::remove_dir_all(&there));
             Ok(())
         })
         .await

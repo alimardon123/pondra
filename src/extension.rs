@@ -477,17 +477,17 @@ async fn part(lake: &Lake, name: &str, r: &Installed) -> Result<Arc<crate::wasm:
     Ok(part)
 }
 
-/// The functions of the lake's installed extensions that `text` names (the query and the views it reads), in its session
-/// (`query::session_for`): each a scalar function by its own name, run by its extension's part. An extension no query names
-/// is never loaded, so one whose file can't be read fails only the queries that call it. On every node a spread query
-/// reaches, its session registers the same, from the same records.
+/// The functions of the lake's installed extensions a statement `calls` (the query and the views it reads: `mentioned.rs`), in
+/// its session (`query::session_for`): each a scalar function by its own name, run by its extension's part. An extension no
+/// query names is never loaded, so one whose file can't be read fails only the queries that call it. On every node a spread
+/// query reaches, its session registers the same, from the same records.
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
-pub async fn functions(lake: &Lake, ctx: &datafusion::prelude::SessionContext, text: &str) -> Result<()> {
+pub async fn functions(lake: &Lake, ctx: &datafusion::prelude::SessionContext, calls: &(dyn Fn(&str) -> bool + Sync)) -> Result<()> {
     let installed = listed(lake).await?;
     if installed.is_empty() {
         return Ok(());
     }
-    for (name, r) in &named(installed, text) {
+    for (name, r) in &named(installed, calls) {
         let part = part(lake, name, r).await?;
         for f in &part.functions {
             if f.is_table() {
@@ -503,8 +503,8 @@ pub async fn functions(lake: &Lake, ctx: &datafusion::prelude::SessionContext, t
 /// A page has no host for an extension's part (X3 in the plan: after 1.0): a query naming a function of one of the lake's
 /// installed extensions is refused by its name, as INSTALL is, not as an unknown function (audit 11-01 L2).
 #[cfg(all(feature = "lake", target_arch = "wasm32"))]
-pub async fn functions(lake: &Lake, _: &datafusion::prelude::SessionContext, text: &str) -> Result<()> {
-    match named(listed(lake).await?, text).first() {
+pub async fn functions(lake: &Lake, _: &datafusion::prelude::SessionContext, calls: &(dyn Fn(&str) -> bool + Sync)) -> Result<()> {
+    match named(listed(lake).await?, calls).first() {
         Some((name, _)) => Err(coded("0A000", format!("{name} is an extension, and extensions in the page come after 1.0 (X3 in the plan): run its functions on a node"))),
         None => Ok(()),
     }
@@ -774,12 +774,10 @@ pub async fn listed(lake: &Lake) -> Result<Vec<(String, Installed)>> {
     Ok(all.to_vec())
 }
 
-/// The installed extensions with a function `text` names (a query and the views it reads), as words.
+/// The installed extensions with a function a statement `calls`.
 #[cfg(feature = "lake")]
-fn named(installed: Vec<(String, Installed)>, text: &str) -> Vec<(String, Installed)> {
-    let text = text.to_lowercase();
-    let words: std::collections::HashSet<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
-    installed.into_iter().filter(|(_, r)| r.functions.iter().any(|f| words.contains(f.name.as_str()))).collect()
+fn named(installed: Vec<(String, Installed)>, calls: &(dyn Fn(&str) -> bool + Sync)) -> Vec<(String, Installed)> {
+    installed.into_iter().filter(|(_, r)| r.functions.iter().any(|f| calls(&f.name))).collect()
 }
 
 /// Where a record says its file came from: the file or URL as INSTALL named it, without a URL's query or fragment (a presigned
