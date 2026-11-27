@@ -2392,7 +2392,7 @@ pub fn lambdas(sql: &str) -> Option<datafusion::sql::parser::Statement> {
     if !sql.contains("->") {
         return None;
     }
-    let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let mut stmts = crate::parsed::generic(sql).ok()?; // (the statement's kept parse, its own copy)
     let [stmt @ Statement::Query(_)] = stmts.as_mut_slice() else { return None };
     let mut found = false;
     let _ = crate::walk::visit_expressions_mut(stmt, |e| {
