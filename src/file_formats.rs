@@ -263,6 +263,45 @@ mod tests {
         assert!(!serde_json::to_string(&a).unwrap().contains("format"), "an entry written as before");
     }
 
+    /// Parquet under another name: a second format, for a table whose files are in two.
+    #[derive(Debug)]
+    struct Renamed;
+
+    impl TableFileFormat for Renamed {
+        fn name(&self) -> &'static str { "renamed" }
+        fn ending(&self) -> &'static str { "renamed" }
+        fn writer(&self, schema: SchemaRef, keys: &[String]) -> Result<Box<dyn TableWriter>> { parquet::PARQUET.writer(schema, keys) }
+        fn reader(&self, state: &dyn Session) -> Arc<dyn FileFormat> { parquet::PARQUET.reader(state) }
+        fn select(&self, _: PartitionedFile, _: &Rows) -> Option<PartitionedFile> { None }
+    }
+
+    /// A scan of files in two formats is one scan of each format's, side by side, with every file's rows; a file's rows
+    /// read by their places in a format that can't is refused, naming it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_of_two_formats_reads_each_by_its_own() {
+        let dir = std::env::temp_dir().join(format!("pondra-two-formats-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
+        let file = |from: i64, format: &'static dyn TableFileFormat, deleted: Option<Vec<u64>>| {
+            let mut w = format.writer(schema.clone(), &[]).unwrap();
+            w.write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(from..from + 10))]).unwrap()).unwrap();
+            let path = dir.join(format!("{from}.{}", format.ending()));
+            std::fs::write(&path, w.finish().unwrap().bytes).unwrap();
+            let key = path.to_str().unwrap().trim_start_matches('/').to_string();
+            let stats = Arc::new(datafusion::common::Statistics::new_unknown(&schema));
+            crate::scan::File { key, size: std::fs::metadata(&path).unwrap().len(), rows: 10, partition: vec![], deleted: deleted.map(Arc::new), range: None, only: None, stats, modified: None, format }
+        };
+        let files = |files| crate::scan::Files { store: datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(), file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None };
+        let ctx = datafusion::prelude::SessionContext::new();
+        let two = ctx.read_table(Arc::new(files(vec![file(0, &parquet::PARQUET, None), file(10, &Renamed, None), file(20, &parquet::PARQUET, Some(vec![0, 1]))]))).unwrap();
+        let plan = datafusion::physical_plan::displayable(two.clone().create_physical_plan().await.unwrap().as_ref()).indent(true).to_string();
+        assert!(plan.contains("UnionExec") && plan.matches("DataSourceExec").count() == 2, "{plan}");
+        assert_eq!(two.count().await.unwrap(), 28, "every file's rows but the two deleted");
+        let refused = ctx.read_table(Arc::new(files(vec![file(30, &Renamed, Some(vec![3]))]))).unwrap().count().await.err().expect("refused").to_string();
+        assert!(refused.contains("which this build's renamed can't"), "{refused}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Files are read through the entry as `read_parquet` read them: their schema given, or taken from the first.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn files_are_read_through_the_entry() {
