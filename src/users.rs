@@ -1686,9 +1686,11 @@ async fn of_token(lake: &Lake, auth: &crate::auth::Auth, token: &str, vouched: b
 /// pass 2 found a bucket reader signing in as admin on a node with users and no token).
 pub fn nodes_key(admin_set: bool, sealed: bool, vouched: bool) -> bool { !admin_set && (sealed || vouched) }
 
-/// Is this sign-in's password a token, by `sign_in`'s own rule (a token's name, or a user's `pt_…`)? A token
-/// may cross a plain connection under `PONDRA_TLS=optional`, a password never (`tls::may_send_password`).
-pub fn is_token(user: &str, password: &str) -> bool { BUILT_IN.contains(&user) || password.starts_with("pt_") || crate::sso::shaped(password) }
+/// Is this sign-in's password a token, by `sign_in`'s own rule: a token's name (`admin`, `writer`, `reader`), or a token's
+/// form (`token_form`)? Every door asks this one question (11-22 audit H1: four forms of it differed, and the Postgres
+/// door's missed `ps_`). A token may cross a plain connection under `PONDRA_TLS=optional`, a password never
+/// (`tls::may_send_password`).
+pub fn is_token(auth: &crate::auth::Auth, user: &str, password: &str) -> bool { BUILT_IN.contains(&user) || token_form(auth, password) }
 
 /// The forms of Pondra's own tokens: a user's (`pt_`), a session (`ps_`), the nodes' key (`pn_`), a branch's key (`pb_`).
 /// A password can't begin with one (`CREATE | ALTER USER … PASSWORD`).
@@ -1706,10 +1708,19 @@ pub fn token_form(auth: &crate::auth::Auth, password: &str) -> bool {
 /// a user's own password; a token's name (`admin`, `writer`, `reader`) takes none.
 pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> { signed_in(lake, auth, user, password).await.ok() }
 
-/// `sign_in`, or why not when a token says (`who_or_why`).
+/// `sign_in`, or why not when a token says (`who_or_why`). A value in a token's form that signs no one in as a token is
+/// still the user's password when it is one: a password set before such were refused (#864) signs in at every door, as
+/// SCRAM and `/login` take it (11-22 audit L1), and its miss is a guess (`signin::Attempt::refuse`).
 async fn signed_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Result<Principal, Option<String>> {
     if token_form(auth, password) {
-        return of_token(lake, auth, password, false).await;
+        let why = match of_token(lake, auth, password, false).await {
+            Ok(p) => return Ok(p),
+            Err(why) => why,
+        };
+        return match !BUILT_IN.contains(&user) && password_ok(lake, user, password).await {
+            true => principal(lake, user).await.map_err(|_| None),
+            false => Err(why),
+        };
     }
     if BUILT_IN.contains(&user) || !password_ok(lake, user, password).await {
         return Err(None);
@@ -1799,6 +1810,28 @@ mod tests {
         assert!(made("a-good-password_pt_").is_ok(), "a token's form inside a password is a password");
         let altered = parse(Words::of("ALTER USER ann PASSWORD 'pt_0123456789'").unwrap(), None).map(|_| ()).unwrap_err().to_string();
         assert!(altered.contains("can't begin pt_"), "ALTER too: {altered}");
+    }
+
+    /// One "is this a token" for every door: a token's name, or a token's form, a session's `ps_` among them (11-22 audit H1).
+    /// A password set in a token's form before such were refused still signs its user in, and no one else (11-22 audit L1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_is_one_test_and_an_old_password_in_its_form_is_still_its_users() -> Result<()> {
+        let auth = crate::auth::Auth::new(None, None, Some("an-admin-token-1".into()));
+        for (user, password, token) in [("bob", "ps_0123456789", true), ("bob", "pt_0123456789", true), ("bob", "an-admin-token-1", true),
+            ("admin", "a-wrong-one", true), ("bob", "a-password-1", false), ("bob", "pn_0123456789", false)] {
+            assert_eq!(is_token(&auth, user, password), token, "{user} {password}");
+        }
+        let dir = std::env::temp_dir().join(format!("pondra-old-password-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        let old = "ps_an-old-password-1";
+        for (name, verifier) in [("ann", Some(Verifier::of(old))), ("svc", None)] {
+            apply(&lake, Change::Create { name: name.into(), login: true, if_not_exists: false, verifier, superuser: false, limits: Limits::default() }).await?;
+        }
+        assert_eq!(sign_in(&lake, &auth, "ann", old).await.map(|p| p.name), Some("ann".into()), "its own user's password still");
+        assert!(sign_in(&lake, &auth, "svc", old).await.is_none(), "and no one else's");
+        assert!(sign_in(&lake, &auth, "ann", "ps_another-one-1").await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

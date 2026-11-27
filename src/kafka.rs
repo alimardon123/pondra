@@ -368,7 +368,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
         *who = made(crate::auth::Principal::of(Role::Admin)).at("kafka", who.from);
         *said = Some(Said::Open);
         None
-    } else if credential.user().is_some() && !peer.may_send_password() && !crate::users::is_token(&user, &password) && app.auth.token_role(&password) == Role::None {
+    } else if credential.user().is_some() && !peer.may_send_password() && !crate::users::is_token(&app.auth, &user, &password) {
         crate::audit::refused(app, &user, "kafka", who.from, "sign in", PASSWORD_PLAIN).await; // (not a guess: no pause)
         Some(PASSWORD_PLAIN.to_string())
     } else {

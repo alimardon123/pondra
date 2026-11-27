@@ -12568,6 +12568,19 @@ def max_rows():
     info["writes fed"] = fed
     checks["a write reads whole: ann's writing WITH and a script's FOR loop each insert all 10 rows into u (11-20 audit H1)"] = \
         all(f["count"] == [{"n": 10}] for f in fed.values())
+    # (11-22 audit M1: a live query's answer is a door's answer too, cut as the others are, and its line says so)
+    c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+    try:
+        c.request("GET", "/live?sql=" + urllib.parse.quote("SELECT id FROM t ORDER BY id"), headers={"Authorization": ann})
+        r = c.getresponse()
+        while (line := r.readline()) and not line.strip():
+            pass
+        live_line = json.loads(line) if r.status == 200 else f"{r.status}: {r.read()[:300]!r}"
+    finally:
+        c.close()
+    info["live"] = live_line
+    checks["GET /live as ann answers 3 rows, its line saying \"cut\": 3 (11-22 audit M1)"] = \
+        isinstance(live_line, dict) and live_line.get("cut") == 3 and [r["id"] for r in live_line.get("rows", [])] == [1, 2, 3]
 
     # A superuser takes no option from a role
     sb, hb, body_b = raw(boss, "SELECT id FROM t ORDER BY id")
@@ -14808,6 +14821,22 @@ def guesses():
             "wrong token" in bad_bearer and bad_bearer_took >= 0.35
         checks["a wrong password is told the same words at HTTP, Flight and Kafka"] = \
             hal["http"][0] == 401 and "wrong user name or password" in hal["http"][2] and "wrong user name or password" in hal["flight"] and hal["kafka"] == (58, "wrong user name or password")
+        # (11-22 audit H1: a session's ps_ token sent as the password under another name, a user with no password's, signs in
+        # its own user and stays it: current_user says so, and so it does after a GRANT, which signs the connection in again)
+        for q in ["CREATE USER hy PASSWORD 'hy-password-1'", "CREATE TABLE hy_t (x BIGINT)"]:
+            reply(P + 3, "POST", "/sql", q.encode(), headers=bearer)
+        hy_session = call(P + 3, "POST", "/login", json.dumps({"user": "hy", "password": "hy-password-1"}).encode(), headers={"Content-Type": "application/json"})["token"]
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={P + 13} user=bot password={hy_session} dbname=lake connect_timeout=10", autocommit=True) as conn:
+                first = conn.execute("SELECT current_user").fetchone()[0]
+                reply(P + 3, "POST", "/sql", b"GRANT SELECT ON hy_t TO bot", headers=bearer)
+                after = conn.execute("SELECT current_user").fetchone()[0]
+            under_bot = (first, after)
+        except psycopg.Error as e:
+            under_bot = str(e).strip()
+        info["a session under another name"] = under_bot
+        checks["Postgres: hy's session token under bot's name (no password) signs in hy, and still hy after a GRANT signs it in again (11-22 audit H1)"] = \
+            under_bot == ("hy", "hy")
         # A name and password sent with any Flight call count the same, not only with the handshake: ten wrong
         # passwords for gil sent with DoGet itself, then the right one is refused saying why; eli's right one answers.
         import pyarrow as pa, pyarrow.flight as fl

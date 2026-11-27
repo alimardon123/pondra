@@ -249,7 +249,7 @@ fn allowed<T>(_: &App, req: &Request<T>, need: Role) -> Result<Role, Status> {
 async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, peer: Option<Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
     if let crate::auth::Credential::Password { user, password } = &credential {
-        let token = crate::users::is_token(user, password) || app.auth.token_role(password) > Role::None;
+        let token = crate::users::is_token(&app.auth, user, password);
         if !token && !peer.is_some_and(|p| p.may_send_password()) && !app.open().await {
             return Err(refused("28000", crate::tls::PASSWORD_PLAIN));
         }
