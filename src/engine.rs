@@ -167,6 +167,7 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
             states.add_at_open::<crate::serve::Groups>();
             states.add_at_open::<std::sync::Mutex<crate::query::Tails>>();
             states.add::<crate::seq::Blocks>();
+            states.add::<crate::seq::Takers>();
             states.add::<crate::pages::Pages>();
             states.add::<crate::readings::Readings>();
             states.add::<crate::page_records::Unsent>();

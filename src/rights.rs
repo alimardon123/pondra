@@ -233,6 +233,15 @@ impl From<Refusal> for anyhow::Error {
     fn from(r: Refusal) -> anyhow::Error { crate::codes::coded(r.code, r.text) }
 }
 
+/// READ ONLY, its own option or a role's: it reads, whatever it is granted. The session's temporary tables and its
+/// `$variables` write nothing to the lake and never ask (`may_run`); a CALL asks nothing itself, and its statements ask.
+fn reads_only(who: &Principal, action: Action) -> Result<(), Refusal> {
+    match who.scope.access.as_ref().is_some_and(|a| a.limits.read_only()) && !matches!(action, Action::Select | Action::SelectAll) {
+        true => Err(Refusal::new(format!("permission denied: {} is READ ONLY (an option of its own or of a role it holds), so it may not {}", who.name, action.words()))),
+        false => Ok(()),
+    }
+}
+
 /// May `who` do `action` to `object`?
 pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusal> { may_in(who, action, object, false) }
 
@@ -240,11 +249,7 @@ pub fn may(who: &Principal, action: Action, object: Object) -> Result<(), Refusa
 /// them (`change.rs`). Every other door's UPDATE or DELETE replaces or deletes rows by their key, unread (`writer::may`).
 fn may_in(who: &Principal, action: Action, object: Object, sql: bool) -> Result<(), Refusal> {
     let superuser = who.superuser();
-    // (READ ONLY, its own option or a role's: it reads, whatever it is granted. The session's temporary tables and its
-    // `$variables` write nothing to the lake and never ask (`may_run`); a CALL asks nothing itself, and its statements ask)
-    if who.scope.access.as_ref().is_some_and(|a| a.limits.read_only()) && !matches!(action, Action::Select | Action::SelectAll) {
-        return Err(Refusal::new(format!("permission denied: {} is READ ONLY (an option of its own or of a role it holds), so it may not {}", who.name, action.words())));
-    }
+    reads_only(who, action)?;
     // (a role first: a token's, a user's for what no grant names, and whoever isn't signed in, which sees nothing)
     let need = action.role();
     let token = who.scope.whole() || who.role == Role::None;
@@ -340,8 +345,9 @@ pub fn may_run(role: Role, stmt: &Stmt) -> anyhow::Result<()> {
     let (table, actions) = asks(stmt);
     let Some(&first) = actions.first() else { return Ok(()) };
     let who = as_role(role, first)?;
-    // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks)
+    // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks. Not READ ONLY's: 11-20 audit L1)
     if !who.scope.whole() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
+        reads_only(&who, first)?;
         return Ok(());
     }
     let object = if table.is_empty() { Object::Lake } else { Object::Table(&table) };
@@ -817,7 +823,7 @@ mod tests {
         assert_eq!(bob.scope.rows(&Privilege::Select, "t").as_deref(), Some("(dept = 'x') OR (owner = 'bob')"));
         assert_eq!(ann.scope.rows(&Privilege::Select, "u").as_deref(), Some("dept = 'x'"), "the schema's grant, for every table of it");
         assert_eq!(ann.scope.rows(&Privilege::Insert, "t"), None, "another privilege's grant, with no filter: every row");
-        assert_eq!(Scope::granted(mine.clone()).rows(&Privilege::Select, "t").as_deref(), Some("(dept = 'x') OR (owner = NULL)"), "no reader: no one's rows");
+        assert_eq!(Scope::granted(mine.clone()).rows(&Privilege::Select, "t").as_deref(), Some("(dept = 'x') OR (FALSE)"), "no reader: no one's rows");
         assert_eq!(Principal::node().scope.rows(&Privilege::Select, "t"), None);
         let every = access(vec![grant("select", t(), Some("owner = current_user")), grant("select", On::Lake, None)]);
         assert_eq!(as_("ann", &every).scope.rows(&Privilege::Select, "t"), None, "one grant with no filter: every row");
