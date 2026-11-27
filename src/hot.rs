@@ -534,13 +534,12 @@ fn base(key: &str) -> &str { key.rsplit_once('#').map_or(key, |(path, _)| path) 
 async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool, fits: impl FnOnce(usize) -> bool + Send + 'static) -> Result<std::result::Result<Decoded, usize>> {
     let bytes = lake.object(&file.path).await?;
     let gone = if deletes && !file.deletes.is_empty() { crate::lake_scan::deleted_rows(lake, file).await? } else { vec![] };
-    let (fields, lineage) = (fields.to_vec(), file.lineage);
-    tokio::task::spawn_blocking(move || read_columns(bytes, &gone, &fields, lineage, fits)).await?
+    let (fields, lineage, format) = (fields.to_vec(), file.lineage, crate::file_formats::of(file)?);
+    tokio::task::spawn_blocking(move || read_columns(format, bytes, &gone, &fields, lineage, fits)).await?
 }
 
-/// `decode`'s reading, of a file's `bytes` whose rows `gone` are deleted.
-fn read_columns(bytes: bytes::Bytes, gone: &[u64], fields: &[FieldRef], lineage: Option<Lineage>, fits: impl FnOnce(usize) -> bool) -> Result<std::result::Result<Decoded, usize>> {
-    let format = crate::file_formats::default();
+/// `decode`'s reading, of a file's `bytes` (in `format`) whose rows `gone` are deleted.
+fn read_columns(format: &dyn crate::file_formats::TableFileFormat, bytes: bytes::Bytes, gone: &[u64], fields: &[FieldRef], lineage: Option<Lineage>, fits: impl FnOnce(usize) -> bool) -> Result<std::result::Result<Decoded, usize>> {
     let file = format.columns().with_context(|| format!("{}: the hot tier decodes files' columns, which this format's aren't", format.name()))?.open(bytes)?;
     let schema = file.schema();
     // (the file's column each field is read from: none for one its lineage makes or the file lacks)
@@ -815,11 +814,14 @@ impl TableProvider for HotFiles {
         }
         if !footed.is_empty() {
             crate::metrics::add(&self.lake.node.metrics.footers_planned, footed.len() as u64);
-            let urls = footed.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
-            let options = crate::file_formats::listing(crate::file_formats::default(), state);
-            let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
-            let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
-            plans.push(gated(told(table.scan(state, projection, filters, limit).await?, &self.known)?, &holder)?);
+            let by_format = crate::file_formats::by_format(footed.iter().copied()).map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+            for (format, footed) in by_format {
+                let urls = footed.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
+                let options = crate::file_formats::listing(format, state);
+                let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
+                let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
+                plans.push(gated(told(table.scan(state, projection, filters, limit).await?, &self.known)?, &holder)?);
+            }
         }
         if !special.is_empty() {
             let state = state.as_any().downcast_ref::<datafusion::execution::SessionState>().ok_or_else(|| datafusion::error::DataFusionError::Internal("a session without its state".into()))?;
@@ -1462,7 +1464,7 @@ mod tests {
         let lineage = Some(Lineage { first: 100, version: 7, ms: 5 });
         let gone = [0u64, 5, 8_191, 8_192, 19_999];
 
-        let (rows, out, ranges) = read_columns(body.clone(), &gone, &fields, lineage, |_| true).unwrap().unwrap();
+        let (rows, out, ranges) = read_columns(&crate::file_formats::parquet::PARQUET, body.clone(), &gone, &fields, lineage, |_| true).unwrap().unwrap();
         let kept: Vec<i64> = (0..n).filter(|i| !gone.contains(&(*i as u64))).collect();
         assert_eq!(rows.iter().sum::<usize>(), kept.len());
         for (f, arrays) in fields.iter().zip(&out) {
@@ -1478,7 +1480,7 @@ mod tests {
         assert!(ranges[0].is_some());
 
         let guess = crate::file_formats::Columns::open(&crate::file_formats::parquet::PARQUET, body.clone()).unwrap().estimate(&[0, 1]);
-        match read_columns(body, &gone, &fields, lineage, |_| false).unwrap() {
+        match read_columns(&crate::file_formats::parquet::PARQUET, body, &gone, &fields, lineage, |_| false).unwrap() {
             Err(estimate) => assert!(estimate > 0 && estimate <= guess, "{estimate} of {guess}"),
             Ok(_) => panic!("read though it doesn't fit"),
         }

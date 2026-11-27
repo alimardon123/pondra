@@ -1,0 +1,8 @@
++15_000
+
+Each file's format on the page as in every form (#876, step 5 piece 15c-1: a file's entry records its format, a scan
+of files in two formats is one scan of each's, and lookups, the hot tier, footed files and dead rows read each file by
+its own). Measured on CI against main's module as #874's run built it (a05f5366, merged as main): its wasm 12,609 B over
+(59,730,803 against 59,718,194), its brotli 72.5 KB over (9,483,038 against 9,410,564). Most of the brotli is code
+order, as with #837's, #798's and #709's: brotli's window finds fewer matches when the same code lands in another
+order. The budget was 61 KB above that main, so this is the rest plus 3.5 KB of room.

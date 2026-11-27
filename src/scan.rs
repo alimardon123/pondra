@@ -127,9 +127,9 @@ pub(crate) fn own(full: impl Fn(&str) -> String, files: &[&crate::data_file::Dat
         fn exact(v: &datafusion::common::stats::Precision<datafusion::common::ScalarValue>) -> datafusion::common::stats::Precision<datafusion::common::ScalarValue> {
             match v { Inexact(x) => Exact(x.clone()), v => v.clone() }
         }
-        Ok(File { key: key_of(&full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range: None, only: None, stats: Arc::new(stats), modified: None })
+        Ok(File { key: key_of(&full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range: None, only: None, stats: Arc::new(stats), modified: None, format: crate::file_formats::of(f)? })
     }).collect::<Result<Vec<_>>>()?;
-    Ok(Files { store, file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None, format: crate::file_formats::default() })
+    Ok(Files { store, file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None })
 }
 
 /// Another engine's files (`files`, of one table) read as `schema` says: its columns in its
@@ -169,10 +169,10 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::da
             (_, None) => (f.rows, !f.outside.as_ref().is_some_and(|o| o.guessed)),
         };
         let stats = Arc::new(statistics(f, rows, counted, gone.as_ref().map_or(0, |g| g.len()), table.is_none(), &file_schema));
-        out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats, modified: f.modified });
+        out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats, modified: f.modified, format: crate::file_formats::parquet() });
     }
     let adapter = (!ids.is_empty()).then(|| Arc::new(ById { ids: ids.clone(), mapping: table.and_then(|t| t.name_mapping.as_deref()).map(name_mapping).unwrap_or_default() }) as _);
-    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter, row: None, format: &crate::file_formats::parquet::PARQUET }))?;
+    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter, row: None }))?;
     let df = if equality { without_equal(ctx, df, files).await? } else { df };
     Ok(df.select(schema.fields().iter().map(|f| cast(ident(f.name()), f.data_type().clone()).alias(f.name())).collect::<Vec<_>>())?)
 }
@@ -439,7 +439,6 @@ pub struct Files {
     pub files: Vec<File>,
     pub adapter: Option<Arc<dyn datafusion::physical_expr_adapter::PhysicalExprAdapterFactory>>, // (columns matched by field id)
     pub row: Option<FieldRef>, // Parquet's row number, last, under this name (`adopted`)
-    pub format: &'static dyn crate::file_formats::TableFileFormat, // what they are written in (`file_formats.rs`)
 }
 
 #[derive(Debug, Clone)]
@@ -453,6 +452,7 @@ pub struct File {
     pub only: Option<Arc<Vec<u64>>>,    // only its rows at these positions, sorted
     pub stats: Arc<datafusion::common::Statistics>, // (its file columns': partition values add theirs)
     pub modified: Option<i64>, // its listing's time, nanoseconds (`DataFile::modified`); a lake file's none
+    pub format: &'static dyn crate::file_formats::TableFileFormat, // what it is written in (`file_formats::of`)
 }
 
 #[async_trait::async_trait]
@@ -471,7 +471,7 @@ impl TableProvider for Files {
         // A file whose ranges hold no row the filters keep is left out unopened: over the web, a footer is a request.
         let schema = self.schema();
         let kept = may_match(&Known { files: &self.files, schema: &schema, in_files: self.file_schema.fields().len() }, filters, &schema);
-        let mut files: Vec<File> = self.files.iter().zip(kept).filter(|(_, k)| *k).map(|(f, _)| f.clone()).collect();
+        let files: Vec<File> = self.files.iter().zip(kept).filter(|(_, k)| *k).map(|(f, _)| f.clone()).collect();
         if files.is_empty() {
             let projected = match projection {
                 Some(p) => Arc::new(schema.project(p)?),
@@ -479,7 +479,29 @@ impl TableProvider for Files {
             };
             return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(projected)));
         }
-        let format = self.format.reader(state);
+        // (a table whose files are in more than one format: one scan of each format's, side by side)
+        let mut by_format: Vec<(&'static dyn crate::file_formats::TableFileFormat, Vec<File>)> = vec![];
+        for f in files {
+            match by_format.iter_mut().find(|(g, _)| g.name() == f.format.name()) {
+                Some((_, group)) => group.push(f),
+                None => by_format.push((f.format, vec![f])),
+            }
+        }
+        let mut plans = vec![];
+        for (format, files) in by_format {
+            plans.push(self.plan(state, format, files, &schema, projection, limit).await?);
+        }
+        match plans.len() {
+            1 => Ok(plans.pop().expect("a plan")),
+            _ => datafusion::physical_plan::union::UnionExec::try_new(plans),
+        }
+    }
+}
+
+impl Files {
+    /// A scan of `files`, all of them in `entry`'s format.
+    async fn plan(&self, state: &dyn Session, entry: &'static dyn crate::file_formats::TableFileFormat, mut files: Vec<File>, schema: &SchemaRef, projection: Option<&Vec<usize>>, limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let format = entry.reader(state);
         let table = datafusion::datasource::table_schema::TableSchema::builder(self.file_schema.clone()).with_table_partition_cols(self.partition.clone()).with_virtual_columns(self.row.clone().into_iter().collect::<Vec<_>>()).build();
         let source = format.file_source(table);
         // Files dealt to the partitions by size, each partition a run of them.
@@ -502,7 +524,7 @@ impl TableProvider for Files {
             }
             if f.deleted.is_some() || f.range.is_some() || f.only.is_some() {
                 let rows = crate::file_formats::Rows { count: f.rows, gone: f.deleted.as_deref().map_or(&[], |g| g.as_slice()), range: f.range, only: f.only.as_deref().map(|o| o.as_slice()) };
-                pf = self.format.select(pf, &rows).ok_or_else(|| datafusion::common::DataFusionError::NotImplemented(format!("{}: its rows are read by their places (deleted rows, or a part of it), which this build's {} can't", f.key, self.format.name())))?;
+                pf = entry.select(pf, &rows).ok_or_else(|| datafusion::common::DataFusionError::NotImplemented(format!("{}: its rows are read by their places (deleted rows, or a part of it), which this build's {} can't", f.key, entry.name())))?;
             }
             let least = groups.iter_mut().min_by_key(|g| g.0).expect("a partition");
             least.0 += f.size;
@@ -510,8 +532,8 @@ impl TableProvider for Files {
         }
         let known: Vec<_> = groups.iter().flat_map(|g| g.1.iter()).filter_map(|f| f.statistics.clone()).collect();
         let stats = match known.len() == count {
-            true => datafusion::common::Statistics::try_merge_iter(known.iter().map(|s| s.as_ref()), &schema)?,
-            false => datafusion::common::Statistics::new_unknown(&schema),
+            true => datafusion::common::Statistics::try_merge_iter(known.iter().map(|s| s.as_ref()), schema)?,
+            false => datafusion::common::Statistics::new_unknown(schema),
         };
         let groups = groups.into_iter().filter(|g| !g.1.is_empty()).map(|g| FileGroup::new(g.1)).collect();
         let config = FileScanConfigBuilder::new(self.store.clone(), source).with_file_groups(groups).with_statistics(stats).with_projection_indices(projection.cloned())?.with_limit(limit).with_expr_adapter(self.adapter.clone()).build();

@@ -10,7 +10,7 @@ use datafusion::arrow::array::{make_comparator, Array, BooleanArray, RecordBatch
 use datafusion::arrow::compute::kernels::cmp::{eq, lt_eq};
 use datafusion::arrow::compute::{and, cast, SortOptions};
 use datafusion::datasource::listing::ListingTableUrl;
-use crate::file_formats::{BlockIndex, Blocks, Stored};
+use crate::file_formats::{BlockIndex, Stored};
 use datafusion::scalar::ScalarValue;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -477,10 +477,8 @@ pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &
 async fn newest_in_files(lake: &Lake, meta: &TableMeta, keys: &[(&str, ScalarValue)]) -> Result<Option<RecordBatch>> {
     let mut files: Vec<&DataFile> = meta.files.iter().collect();
     files.sort_by_key(|f| std::cmp::Reverse(f.ord));
-    let format = crate::file_formats::default();
-    let blocks = format.blocks().with_context(|| format!("{}: a key lookup reads files by blocks, which this format's aren't", format.name()))?;
     for f in files {
-        let index = index(lake, blocks, f).await?;
+        let index = index(lake, f).await?;
         for g in index.holding(keys[0].0, &keys[0].1)? {
             let (batch, sorted) = block(lake, f, index.as_ref(), g, keys[0].0).await?;
             if let Some(i) = last_match(&batch, keys, sorted)? {
@@ -528,11 +526,13 @@ fn first(n: usize, before: impl Fn(usize) -> bool) -> usize {
     lo
 }
 
-/// A file's index, read once per node (files never change).
-async fn index(lake: &Lake, blocks: &dyn Blocks, f: &DataFile) -> Result<Arc<dyn BlockIndex>> {
+/// A file's index, read once per node (files never change), by its format's own index.
+async fn index(lake: &Lake, f: &DataFile) -> Result<Arc<dyn BlockIndex>> {
     if let Some(m) = lake.groups().indexes.lock().unwrap().get(&f.path) {
         return Ok(m.clone());
     }
+    let format = crate::file_formats::of(f)?;
+    let blocks = format.blocks().with_context(|| format!("{}: a key lookup reads a file by its blocks, which the {} format's can't be", f.path, format.name()))?;
     let m = blocks.index(&stored(lake, f)?).await?;
     lake.groups().indexes.lock().unwrap().insert(f.path.clone(), m.clone());
     Ok(m)

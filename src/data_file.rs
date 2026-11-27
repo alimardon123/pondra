@@ -81,6 +81,10 @@ pub struct DataFile {
     /// changes under its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified: Option<i64>,
+    /// Its file format's name (`file_formats.rs`): none for Parquet, the default, so a file written before formats were
+    /// kept per file reads as it did (`file_formats::of`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub format: String,
 }
 
 fn is_zero(n: &u64) -> bool { *n == 0 }

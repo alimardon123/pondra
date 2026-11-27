@@ -61,11 +61,11 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
         let values = vec![ScalarValue::Int64(Some(l.first)), ScalarValue::Int64(Some(l.version as i64)), ScalarValue::TimestampMicrosecond(Some(l.ms as i64 * 1000), Some("UTC".into()))];
         let stats = Arc::new(statistics(f, f.rows, true, deleted.as_ref().map_or(0, |d| d.len()), true, &file_schema));
         let (range, only) = pick.of();
-        out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: values, deleted, range, only, stats, modified: None });
+        out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: values, deleted, range, only, stats, modified: None, format: crate::file_formats::of(f)? });
     }
     let adapter = Some(Arc::new(ById { ids, mapping }) as _);
     let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber));
-    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition, files: out, adapter, row: Some(row), format: &crate::file_formats::parquet::PARQUET }))?;
+    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition, files: out, adapter, row: Some(row) }))?;
     Ok(df.select(schema.fields().iter().map(|f| match f.name().as_str() {
         crate::text::ROW_ID => (col("__first") + col("__row")).alias(f.name()),
         crate::text::VERSION => col("__version").alias(f.name()),
@@ -82,9 +82,9 @@ pub async fn placed(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let deleted = lake_gone(lake, ctx, &[f]).await?.pop().flatten();
     let stats = Arc::new(statistics(f, f.rows, true, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
-    let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats, modified: None };
+    let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats, modified: None, format: crate::file_formats::of(f)? };
     let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber)); // (its places: Parquet's row number, so its format is Parquet's until the entry numbers rows, 15b-2)
-    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: Some(row), format: &crate::file_formats::parquet::PARQUET }))?)
+    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: Some(row) }))?)
 }
 
 /// A lake's own files that hold their rows' system columns, some of their rows deleted by
@@ -96,9 +96,9 @@ pub async fn with_deletes(lake: &crate::store::Lake, ctx: &datafusion::prelude::
     let mut out = vec![];
     for (f, deleted) in files.iter().zip(lake_gone(lake, ctx, files).await?) {
         let stats = Arc::new(statistics(f, f.rows, true, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
-        out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats, modified: None });
+        out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats, modified: None, format: crate::file_formats::of(f)? });
     }
-    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: out, adapter: None, row: None, format: crate::file_formats::default() }))?)
+    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: out, adapter: None, row: None }))?)
 }
 
 /// A lake's files' deleted rows (positions), from their deletes (whose paths are in the lake).
@@ -124,8 +124,8 @@ pub async fn file_rows(lake: &crate::store::Lake, ctx: &datafusion::prelude::Ses
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let stats = Arc::new(datafusion::common::Statistics::new_unknown(schema));
     let (range, only) = pick.of();
-    let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range, only, stats, modified: None };
-    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: None, format: crate::file_formats::default() }))?)
+    let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range, only, stats, modified: None, format: crate::file_formats::of(f)? };
+    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: None }))?)
 }
 
 /// A lake's file's deleted rows (positions, sorted), from its deletes.
