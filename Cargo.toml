@@ -32,6 +32,9 @@ heap-profile = ["tikv-jemallocator?/profiling", "tikv-jemallocator?/stats"]
 # The sim (redesign step 3): a test's cluster in one process, on tokio's paused time, which the core's wall clock follows
 # too (`clock.rs`). The library's own tests have it without asking (`cfg(test)`).
 sim = ["server"]
+# Vortex's file format, an entry beside Parquet's (`file_formats/vortex.rs`): the spike (step 5, piece 15) builds it to
+# measure it against Parquet; `PONDRA_FILE_FORMAT=vortex` makes it what new files are written in.
+vortex = ["lake", "dep:vortex-datafusion", "dep:vortex"]
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
@@ -97,6 +100,10 @@ tokio = { version = "1", features = ["sync", "rt", "time", "test-util"] }
 # What a page can't build, though the lake names it: a page has its own catalog store (`kv`), seal and hashes (`crypto`),
 # memory reading and no gRPC or TLS sockets (designs/page-same-core.md §5). Each is still `lake`'s, in `[features]`.
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)
+# Vortex (designs/redesign/table-file-formats.md): a table's data files in Vortex's format, an entry beside Parquet's
+# (`file_formats/vortex.rs`). Off unless built with the `vortex` feature: the spike's A/B (step 5, piece 15).
+vortex-datafusion = { version = "0.93", optional = true }
+vortex = { version = "0.93", optional = true }
 slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"], optional = true } # moka: in-memory block cache (foyer adds a disk tier we don't need)
 slatedb-common = { version = "0.16", default-features = false, optional = true } # (slatedb's own: its clock's trait, `kv::slate::Clock`)
 wasmtime = { version = "50", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "anyhow", "parallel-compilation"], optional = true } # extensions' WebAssembly parts, sandboxed (`wasm.rs`, ADR-075 §2); a page's host comes after 1.0

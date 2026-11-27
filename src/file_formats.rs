@@ -16,6 +16,8 @@ use datafusion::common::ScalarValue;
 use std::collections::BTreeMap;
 
 pub mod parquet;
+#[cfg(feature = "vortex")]
+pub mod vortex;
 
 /// One file format a table's data files may be kept in.
 pub trait TableFileFormat: Sync + std::fmt::Debug {
@@ -112,7 +114,13 @@ pub fn named(name: &str) -> Option<&'static dyn TableFileFormat> {
 }
 
 /// The format a table's new files are written in: Parquet, until a table's `file_format` names another (piece 15c).
+/// (The Vortex spike's A/B, for now: `PONDRA_FILE_FORMAT` names this build's format to write and read every table's files
+/// in, on a lake of its own; a lake's files are all one format until 15c keeps each file's.)
 pub fn default() -> &'static dyn TableFileFormat {
+    static CHOSEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(f) = CHOSEN.get_or_init(|| crate::env::get("PONDRA_FILE_FORMAT")).as_deref().and_then(named) {
+        return f;
+    }
     named(parquet::PARQUET.name()).unwrap_or(&parquet::PARQUET) // (a registry without the engine's entries: Parquet is built in here)
 }
 
@@ -129,7 +137,7 @@ mod tests {
     fn parquet_is_the_default_and_its_file_keeps_ranges() {
         let f = default();
         assert_eq!((f.name(), f.ending()), ("parquet", "parquet"));
-        assert!(named("parquet").is_some() && named("vortex").is_none());
+        assert!(named("parquet").is_some() && named("vortex").is_some() == cfg!(feature = "vortex"));
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true), Field::new("s", DataType::Utf8, true)]));
         let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(3), None, Some(-2)])), Arc::new(StringArray::from(vec!["b", "a", "c"]))];
         let mut w = f.writer(schema.clone(), &[]).unwrap();

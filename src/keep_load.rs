@@ -59,6 +59,9 @@ async fn attempt(source: &impl Source, target: &Lake, table: &str, sql: &str, jo
     if crate::env::get("PONDRA_KEEP_PARQUET").as_deref() == Some("0") {
         return Ok(Err("PONDRA_KEEP_PARQUET=0".into()));
     }
+    if crate::file_formats::default().name() != "parquet" {
+        return Ok(Err(format!("the table's files are {}, not Parquet", crate::file_formats::default().name()))); // (the Vortex spike's A/B)
+    }
     let Some(stamp) = stamp else { return Ok(Err("no commit number reserved: the rows take a lineage".into())) };
     // The table: this statement's own, with nothing in it, and nothing a file as it is can't keep.
     let Some(meta) = stored else { return Ok(Err("no table".into())) };

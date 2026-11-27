@@ -137,6 +137,8 @@ pub static ENGINE: crate::registry::BuiltIn = crate::registry::BuiltIn {
         r.section_mut::<crate::column_types::ColumnTypes>().add(&crate::column_types::INET); // (INET: an address in 17 bytes)
         r.section_mut::<crate::column_types::ColumnTypes>().add(&crate::column_types::FILE); // (FILE: a path, a version and a content type)
         r.section_mut::<crate::file_formats::FileFormats>().add(&crate::file_formats::parquet::PARQUET); // (a table's data files: Parquet, the default)
+        #[cfg(feature = "vortex")]
+        r.section_mut::<crate::file_formats::FileFormats>().add(&crate::file_formats::vortex::VORTEX); // (Vortex's, built with the feature: the spike)
         r.section_mut::<crate::answer::Shown>().set(crate::column_types::show_of); // (a JSON or CSV answer shows it as text)
         let passes = r.section_mut::<crate::passes::Passes>();
         for p in [crate::kept::pass(), crate::dialect_stmts::pass(), crate::diff::pass(), crate::past_names::pass(), crate::text::types_pass(), crate::grouping::pass()].into_iter().chain(crate::friendly::passes()) {
