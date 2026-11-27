@@ -518,3 +518,115 @@ async fn an_insert_by_position_right_after_a_column_move_keeps_the_new_order() {
         println!("seed {seed}: {rounds} INSERTs by position right after a column move, each in the new order ({refused} refused first)");
     }
 }
+
+/// How many rows member `m` sees with `seq = k`, or none while it can't say.
+async fn seen_with(c: &Cluster, m: usize, k: i64) -> Option<i64> {
+    let a = c.sql(m, &format!("SELECT count(*) AS n FROM events WHERE seq = {k}")).await.ok()?;
+    rows(&a).first()?["n"].as_i64()
+}
+
+/// Row `k` of producer `r`, inserted on member `m` until it is taken (sent again after 100 ms, as a leader changing asks).
+async fn insert_round(c: &Cluster, m: usize, k: i64) {
+    let mut tries = 0;
+    while let Err(e) = c.sql(m, &format!("INSERT INTO events VALUES ('r', {k})")).await {
+        tries += 1;
+        assert!(tries < 50, "seed {}: row {k} on member {m} was never taken: {e}\n{}", c.seed, c.met());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A reader (a member that never leads, runs no tasks and takes no writes) sees each write within 10 s: twenty rows
+/// written to the leader, then the leader is killed, and twenty more written to the new leader, each seen on the reader
+/// as it lands. The reader then counts exactly the forty rows.
+#[tokio::test(start_paused = true)]
+async fn a_reader_sees_each_write_soon_also_after_a_failover() {
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        c.start(0).await.unwrap();
+        c.sql(0, "CREATE TABLE events (producer TEXT, seq BIGINT)").await.unwrap();
+        c.start(1).await.unwrap();
+        c.set_start(|s| s.reader = true);
+        c.start(2).await.unwrap();
+        c.set_start(|s| s.reader = false);
+        assert_eq!(c.role(2).await.as_deref(), Some("reader"), "seed {seed}\n{}", c.met());
+        let (mut before, mut after) = (Duration::ZERO, Duration::ZERO);
+        for k in 1..=20 {
+            insert_round(&c, 0, k).await;
+            let waited = c.until(&format!("the reader sees row {k}"), Duration::from_secs(10), || async { seen_with(&c, 2, k).await == Some(1) }).await.unwrap();
+            before = before.max(waited);
+        }
+        c.until("the second member hears its leader", Duration::from_secs(30), || async { c.known(1).await == 2 }).await.unwrap(); // (a reader beats to no one: the leader knows its two members)
+        c.kill(0);
+        let took = c.until("the second member leads", Duration::from_secs(30), || async { c.role(1).await.as_deref() == Some("leader") }).await.unwrap();
+        for k in 21..=40 {
+            insert_round(&c, 1, k).await;
+            let waited = c.until(&format!("the reader sees row {k}"), Duration::from_secs(10), || async { seen_with(&c, 2, k).await == Some(1) }).await.unwrap();
+            after = after.max(waited);
+        }
+        let n = count(&c, 2, "events").await;
+        assert_eq!(n, Some(40), "seed {seed}: the reader's rows\n{}", c.met());
+        println!(
+            "seed {seed}: 40 rows, each seen on the reader within 10 s: the longest wait {} ms before the failover, {} ms after (the second member led {:.1} s after the kill)",
+            before.as_millis(),
+            after.as_millis(),
+            took.as_secs_f64()
+        );
+    }
+}
+
+/// The harness's `loads`, its COPY part: two members load one folder's files at once, each file once. Then six more
+/// files are copied with the first member due to be stopped after a commit, and each copy goes on until a leader has
+/// it: whoever leads holds all 90 rows once, and the sum of the amounts is ten times the sum of the ids.
+#[tokio::test(start_paused = true)]
+async fn copy_into_from_two_members_and_through_a_kill_loads_each_file_once() {
+    for seed in seeds() {
+        let dir = std::env::temp_dir().join(format!("pondra-copy-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, first: i64| {
+            let text: String = std::iter::once("id,amount\n".to_string()).chain((first..first + 5).map(|id| format!("{id},{}\n", id * 10))).collect();
+            std::fs::write(dir.join(name), text).unwrap();
+        };
+        (0..12).for_each(|f| write(&format!("f{f:02}.csv"), f * 5));
+        let copy = format!("COPY INTO t FROM '{}/*.csv' (FORMAT csv, HEADER true)", dir.display());
+        let c = Cluster::new(seed, 2);
+        c.owned(); // (a path on the members' own disk is their owner's to read, as the harness's `owner_key` reads it)
+        c.start(0).await.unwrap();
+        c.sql(0, "CREATE TABLE t (id BIGINT, amount BIGINT)").await.unwrap();
+        c.start(1).await.unwrap();
+        let (a, b) = futures::join!(c.sql(0, &copy), c.sql(1, &copy));
+        assert!(a.is_ok() && b.is_ok(), "seed {seed}: the COPYs at once: {a:?} and {b:?}\n{}", c.met());
+        (0..6).for_each(|g| write(&format!("g{g:02}.csv"), 60 + g * 5));
+        c.faults(0).stop_at("after_commit", 0.5);
+        let _ = c.sql(0, &copy).await; // (its answer is not waited for: it may be stopped first)
+        let stopped = !c.up(0);
+        if stopped {
+            c.until("the second member leads", Duration::from_secs(30), || async { c.role(1).await.as_deref() == Some("leader") }).await.unwrap();
+            let mut tries = 0;
+            while let Err(e) = c.sql(1, &copy).await {
+                tries += 1;
+                assert!(tries < 20, "seed {seed}: the COPY to the second member was never taken: {e}\n{}", c.met());
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        } else {
+            c.faults(0).stop_at("after_commit", 0.0); // (the copy again must be answered: its member is not to stop now)
+            let again = c.sql(0, &copy).await;
+            assert!(again.is_ok(), "seed {seed}: the COPY to the first member again: {again:?}\n{}", c.met());
+        }
+        let mut lead = None;
+        for m in 0..2 {
+            if c.role(m).await.as_deref() == Some("leader") {
+                lead = Some(m);
+            }
+        }
+        let lead = lead.unwrap_or_else(|| panic!("seed {seed}: no member leads\n{}", c.met()));
+        let total = c.sql(lead, "SELECT count(*) AS n, count(DISTINCT id) AS d, sum(amount) AS s FROM t").await;
+        std::fs::remove_dir_all(&dir).ok();
+        let total = total.unwrap();
+        assert_eq!(rows(&total).first(), Some(&serde_json::json!({"n": 90, "d": 90, "s": 40050})), "seed {seed}: the rows of t on member {lead}\n{}", c.met());
+        println!(
+            "seed {seed}: member 1 {} mid-way; 90 rows, 90 distinct, sum 40050, read on member {} (the leader)",
+            if stopped { "was stopped" } else { "was not stopped" },
+            lead + 1
+        );
+    }
+}

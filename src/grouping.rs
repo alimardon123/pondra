@@ -11,7 +11,7 @@
 //!   and no error. Postgres and DuckDB end the right side at anything as loose as `IS` or looser (`AND`, `OR`,
 //!   `IS NULL`, …), and read `(a IS DISTINCT FROM b) OR c`.
 use datafusion::sql::sqlparser::ast::{self, BinaryOperator, VisitorMut};
-use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use std::borrow::Cow;
 use std::ops::ControlFlow;
@@ -26,7 +26,8 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     if !wanted(sql) {
         return Cow::Borrowed(sql);
     }
-    let grouped = match Parser::parse_sql(&GenericDialect {}, sql) {
+    // (the statement's own parse, kept in its context: the front and the engine take it, or the regrouped text's, again)
+    let grouped = match crate::parsed::generic(sql) {
         Ok(stmts) => regrouped(stmts),
         // (the generic dialect reads `?` as a placeholder, so text with one is read as Postgres's dialect reads it)
         Err(_) if sql.contains('?') => questions(sql),
@@ -53,8 +54,9 @@ pub(crate) fn wanted(sql: &str) -> bool {
 }
 
 /// The statements with each JSON operator and each `IS [NOT] DISTINCT FROM` regrouped where Postgres groups it
-/// differently. None when none was.
-fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> { regroup(&mut stmts).then(|| written(&stmts)) }
+/// differently, as text kept as its parse (`text::text_kept`), so the front reads the regrouped tree without a parse of
+/// its own. None when none was.
+fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> { regroup(&mut stmts).then(|| crate::text::text_kept(stmts)) }
 
 /// `regrouped` in place, on a tree whichever dialect read (the front's: generic's, or the fallback's for FROM first), or on a
 /// client's frame as it is inlined (`expander.rs`).
