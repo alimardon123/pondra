@@ -396,7 +396,9 @@ pub async fn files_once(lake: &Lake, ctx: &SessionContext, files: &[&DataFile], 
     }
     if !footed.is_empty() {
         crate::metrics::add(&lake.node.metrics.footers_planned, footed.len() as u64);
-        parts.push(crate::file_formats::read(ctx, crate::file_formats::default(), footed.iter().map(|f| lake.full(&f.path)).collect(), Some(schema.clone())).await?);
+        for (format, footed) in crate::file_formats::by_format(footed)? {
+            parts.push(crate::file_formats::read(ctx, format, footed.iter().map(|f| lake.full(&f.path)).collect(), Some(schema.clone())).await?);
+        }
     }
     if !deleted.is_empty() {
         parts.push(crate::lake_scan::with_deletes(lake, ctx, &deleted, schema).await?);

@@ -185,9 +185,39 @@ pub fn named(name: &str) -> Option<&'static dyn TableFileFormat> {
     crate::registry::get().find::<FileFormats>()?.0.iter().copied().find(|f| f.name() == name)
 }
 
-/// The format a table's new files are written in: Parquet, until a table's `file_format` names another (piece 15c).
-pub fn default() -> &'static dyn TableFileFormat {
-    named(parquet::PARQUET.name()).unwrap_or(&parquet::PARQUET) // (a registry without the engine's entries: Parquet is built in here)
+/// The format a table's new files are written in: Parquet, until a table's `file_format` names another (piece 15c-2).
+pub fn default() -> &'static dyn TableFileFormat { parquet() }
+
+/// Parquet's entry: the registry's, or the one built in here (a registry without the engine's entries).
+pub fn parquet() -> &'static dyn TableFileFormat { named(parquet::PARQUET.name()).unwrap_or(&parquet::PARQUET) }
+
+/// The format file `f` is in, as its entry says (none: Parquet). One this build doesn't have is refused, naming it.
+pub fn of(f: &crate::data_file::DataFile) -> Result<&'static dyn TableFileFormat> {
+    match f.format.as_str() {
+        "" => Ok(parquet()),
+        name => named(name).ok_or_else(|| anyhow::anyhow!("{}: a file in the {name} format, which this build doesn't have", f.path)),
+    }
+}
+
+/// What a file's entry says of its format (`DataFile::format`): nothing for Parquet.
+pub fn recorded(format: &dyn TableFileFormat) -> String {
+    match format.name() == parquet::PARQUET.name() {
+        true => String::new(),
+        false => format.name().to_string(),
+    }
+}
+
+/// `files` by their formats, in the order each format is first met (one group for a table whose files share one).
+pub fn by_format<'a>(files: impl IntoIterator<Item = &'a crate::data_file::DataFile>) -> Result<Vec<(&'static dyn TableFileFormat, Vec<&'a crate::data_file::DataFile>)>> {
+    let mut out: Vec<(&'static dyn TableFileFormat, Vec<&crate::data_file::DataFile>)> = vec![];
+    for f in files {
+        let format = of(f)?;
+        match out.iter_mut().find(|(g, _)| g.name() == format.name()) {
+            Some((_, group)) => group.push(f),
+            None => out.push((format, vec![f])),
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -215,6 +245,22 @@ mod tests {
         assert!(done.stats.sizes().contains_key("s") && !done.stats.sizes().contains_key("i"));
         let read = datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(done.bytes)).unwrap().build().unwrap();
         assert_eq!(read.map(|b| b.unwrap().num_rows()).sum::<usize>(), 3);
+    }
+
+    /// A file's entry names its format only when it isn't Parquet; one this build lacks is refused, naming it; files are
+    /// grouped by their formats in the order each is first met.
+    #[test]
+    fn a_files_format_is_its_entrys() {
+        let file = |path: &str, format: &str| crate::data_file::DataFile { path: path.into(), format: format.into(), ..Default::default() };
+        let (a, b, c) = (file("a", ""), file("b", "vortex"), file("c", ""));
+        assert_eq!(of(&a).unwrap().name(), "parquet");
+        assert_eq!(recorded(of(&a).unwrap()), "", "Parquet goes unsaid");
+        let err = of(&b).err().expect("no vortex here").to_string();
+        assert!(err.contains("b: a file in the vortex format"), "{err}");
+        let groups = by_format([&a, &c]).unwrap();
+        assert_eq!(groups.iter().map(|(f, g)| (f.name(), g.iter().map(|f| f.path.as_str()).collect::<Vec<_>>())).collect::<Vec<_>>(), [("parquet", vec!["a", "c"])]);
+        assert!(by_format([&a, &b]).is_err());
+        assert!(!serde_json::to_string(&a).unwrap().contains("format"), "an entry written as before");
     }
 
     /// Files are read through the entry as `read_parquet` read them: their schema given, or taken from the first.

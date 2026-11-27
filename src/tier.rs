@@ -455,12 +455,17 @@ async fn dead(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Result<V
 
 async fn dead_rows(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Result<datafusion::prelude::DataFrame> {
     use datafusion::prelude::{col, lit};
-    let paths: Vec<String> = gone.iter().map(|f| lake.full(&f.path)).collect();
     let ctx = lake.session();
     let within = col(crate::text::VERSION).between(lit(after as i64 + 1), lit(upto as i64));
-    Ok(match paths.is_empty() {
-        true => ctx.read_empty()?.select(vec![lit(0i64).alias("__id"), lit(0i64).alias("__v")])?.limit(0, Some(0))?,
-        false => crate::file_formats::read(&ctx, crate::file_formats::default(), paths, None).await?.filter(within)?.select(vec![col(crate::text::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
+    let mut parts = vec![]; // (one read of each format's files)
+    for (format, gone) in crate::file_formats::by_format(gone)? {
+        let paths: Vec<String> = gone.iter().map(|f| lake.full(&f.path)).collect();
+        parts.push(crate::file_formats::read(&ctx, format, paths, None).await?.filter(within.clone())?.select(vec![col(crate::text::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?);
+    }
+    let mut parts = parts.into_iter();
+    Ok(match parts.next() {
+        None => ctx.read_empty()?.select(vec![lit(0i64).alias("__id"), lit(0i64).alias("__v")])?.limit(0, Some(0))?,
+        Some(first) => parts.try_fold(first, |all, next| all.union(next))?,
     })
 }
 
@@ -1193,7 +1198,7 @@ const HOT_KEEP: usize = 64 << 20;
 /// (each one's arrays so far), which `put` hands to `hot::Hot::put`.
 struct Encoding {
     w: Box<dyn crate::file_formats::TableWriter>,
-    ending: &'static str, // (its format's: a file's name ends in it)
+    format: &'static dyn crate::file_formats::TableFileFormat, // what it is written in (a file's name ends in its ending)
     ids: datafusion::arrow::datatypes::SchemaRef,
     rows: usize,
     sys: bool,
@@ -1216,7 +1221,7 @@ impl Encoding {
         let hot: Vec<(usize, FieldRef)> = hot.into_iter().map(at).collect::<Option<_>>().unwrap_or_default();
         let kept = vec![vec![]; hot.len()];
         let format = crate::file_formats::default();
-        Ok(Encoding { w: format.writer(ids.clone(), keys)?, ending: format.ending(), ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, sketches, hot, kept, kept_bytes: 0 })
+        Ok(Encoding { w: format.writer(ids.clone(), keys)?, format, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, sketches, hot, kept, kept_bytes: 0 })
     }
 
     fn write(&mut self, b: &RecordBatch) -> Result<()> {
@@ -1252,12 +1257,12 @@ impl Encoding {
 
     /// The file's bytes, finished, and its entry but for where it goes: its ranges typed in a lake of format 8 (`typed`).
     fn finish(self, typed: bool) -> Result<(Vec<u8>, DataFile)> {
-        let Encoding { w, rows, sys, mut seen, sketches, .. } = self;
+        let Encoding { w, rows, sys, mut seen, sketches, format, .. } = self;
         let done = w.finish()?; // (its statistics: the file's min and max, as its format kept them, without a second pass)
         let ((stats, bounds), nulls, sketch) = (crate::bounds::kept(&seen.ranges(done.stats.as_ref()), typed), Some(seen.nulls()), sketches.map(|s| s.done()).unwrap_or_default());
         let (bytes, sizes) = (done.bytes.len() as u64, done.stats.sizes());
         let buf = done.bytes;
-        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, sizes, nulls, sketch, sys, ..Default::default() }))
+        Ok((buf, DataFile { rows: rows as u64, bytes, stats, bounds, sizes, nulls, sketch, sys, format: crate::file_formats::recorded(format), ..Default::default() }))
     }
 
     /// The file finished and put in the table's folder, and its hot columns held there (a table whose
@@ -1265,7 +1270,7 @@ impl Encoding {
     async fn put(mut self, lake: &Lake, table: &str, meta: Option<&TableMeta>) -> Result<DataFile> {
         let hot: Vec<FieldRef> = self.hot.iter().map(|(_, f)| f.clone()).collect();
         let kept = std::mem::take(&mut self.kept);
-        let (typed, ending) = (crate::format::typed(lake).await?, self.ending);
+        let (typed, ending) = (crate::format::typed(lake).await?, self.format.ending());
         let (buf, file) = blocking(move || self.finish(typed)).await?;
         let path = format!("data/{}/{}.{ending}", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
         lake.put(&path, buf).await?;
