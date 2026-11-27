@@ -2051,6 +2051,9 @@ impl Backend {
                 }
             }
         }
+        if n > 0 {
+            cast_types(sql, &mut types); // ($1::vector, CAST($2 AS date): the cast's type, over the plan's, which reads the cast's input untyped)
+        }
         types
     }
 
@@ -2237,6 +2240,56 @@ fn number_type(n: &str) -> Type {
     }
 }
 
+/// Where a parameter is cast (`$1::vector`, `CAST($2 AS date)`), the cast's type, as Postgres describes such a parameter:
+/// a client then sends its value as that type (asyncpg sends a registered `vector`, pgvector's codec, or a `date` as one).
+/// Written into `types` over what the plan gave, which reads a cast's input as untyped. A type `named_type` doesn't name
+/// is left as found. A parse and a walk, only for a statement that says `::` or CAST.
+fn cast_types(sql: &str, types: &mut [Type]) {
+    if !sql.contains("::") && !crate::text::contains_ci(sql, "cast") {
+        return;
+    }
+    let Some(statement) = crate::pg_types::one(sql) else { return };
+    let _ = crate::walk::visit_expressions(&statement, |e| {
+        if let Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, expr, data_type, .. } = e {
+            if let (Some(t), Some(slot)) = (named_type(data_type), crate::pg_trace::param(expr).and_then(|i| types.get_mut(i))) {
+                *slot = t;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// The Postgres type a cast names, of those a parameter is read as (`bind`, `pg_values`): a number's (`cast_type`), text,
+/// varchar, bool, date, time, timestamp with or without its zone, interval, uuid, json, jsonb, bytea, inet, and pgvector's
+/// `vector`. None for any other type.
+fn named_type(t: &ast::DataType) -> Option<Type> {
+    use ast::{DataType as D, TimezoneInfo as Z};
+    if let Some(t) = cast_type(t) {
+        return Some(t);
+    }
+    Some(match t {
+        D::Text | D::String(_) => Type::TEXT,
+        D::Varchar(_) | D::CharacterVarying(_) => Type::VARCHAR,
+        D::Bool | D::Boolean => Type::BOOL,
+        D::Date => Type::DATE,
+        D::Time(_, Z::None | Z::WithoutTimeZone) => Type::TIME,
+        D::Timestamp(_, Z::WithTimeZone | Z::Tz) => Type::TIMESTAMPTZ,
+        D::Timestamp(..) | D::TimestampNtz(_) => Type::TIMESTAMP,
+        D::Interval { .. } => Type::INTERVAL,
+        D::Uuid => Type::UUID,
+        D::JSON => Type::JSON,
+        D::JSONB => Type::JSONB,
+        D::Bytea => Type::BYTEA,
+        D::Custom(name, _) => match name.to_string().to_lowercase().as_str() {
+            "vector" => crate::pg_values::vector_type(),
+            "inet" => Type::INET,
+            "timestamptz" => Type::TIMESTAMPTZ,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 /// The numeric type a CAST names, as Postgres's casts give it: BIGINT is int8, DOUBLE PRECISION float8, and FLOAT(p) is
 /// real up to 24 digits of precision. None for any other type.
 fn cast_type(t: &ast::DataType) -> Option<Type> {
@@ -2349,6 +2402,23 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    /// A parameter cast to a type is described as that type, as Postgres describes it: pgvector's `vector`, a date, a bool, a
+    /// zone's timestamp… A type a parameter isn't read as here, and a parameter not cast, are left as found.
+    #[test]
+    fn a_cast_parameter_is_its_casts_type() {
+        let cast = |sql: &str, n: usize| {
+            let mut types = vec![Type::TEXT; n];
+            cast_types(sql, &mut types);
+            types.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(cast("INSERT INTO items (id, embedding) VALUES ($1, $2::vector)", 2), ["text", "vector"]);
+        assert_eq!(cast("SELECT cosine_distance(v, $1::vector(3)), $2::inet FROM t", 2), ["vector", "inet"]);
+        assert_eq!(cast("SELECT * FROM t WHERE d > CAST($1 AS date) AND n = $2::int AND ok = $3::boolean AND id = ($4)::bigint", 4), ["date", "int4", "bool", "int8"]);
+        assert_eq!(cast("SELECT $1::timestamptz, $2::timestamp with time zone, $3::timestamp, $4::jsonb, $5::uuid, $6::interval", 6),
+            ["timestamptz", "timestamptz", "timestamp", "jsonb", "uuid", "interval"]);
+        assert_eq!(cast("SELECT $1::text[], $2 || 'x', $3::varchar", 3), ["text", "text", "varchar"], "an array's cast and no cast: as found");
     }
 
     /// The types of `n` parameters of `sql`, as `arithmetic_types` leaves them (TEXT where nothing says).

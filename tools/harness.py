@@ -20318,6 +20318,8 @@ def vectors():
                 conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")
                 try:
                     await register_vector_asyncpg(conn)  # (set_type_codec: refused unless vector's typtype is a "char")
+                    # ($2::vector is described as vector, so asyncpg sends the array by pgvector's codec; $1 as the int its column is)
+                    await conn.execute("INSERT INTO ev VALUES ($1, $2::vector)", 7, np.array([1.5, 2.5, 3.5], dtype=np.float32))
                     await conn.execute("CREATE TYPE mood AS ENUM ('ok', 'sad')")
                     await conn.set_type_codec("mood", schema="public", encoder=str, decoder=str.upper, format="text")  # (any type's codec, likewise)
                     return await conn.fetchval("SELECT typtype FROM pg_type WHERE typname = 'vector'")
@@ -20327,6 +20329,11 @@ def vectors():
             # doesn't answer, as it did before vector; the Postgres lane's)
             check("asyncpg's register_vector, and set_type_codec for any type: pg_type's typtype is a \"char\", b'b'",
                   lambda: asyncio.run(apg()) == b"b")
+            def seventh():
+                with psycopg.connect(url) as c:
+                    return c.execute("SELECT v FROM ev WHERE id = 7").fetchone()[0]
+            check("asyncpg sends $2::vector by pgvector's codec, as the parameter is described as vector: the row holds [1.5, 2.5, 3.5]",
+                  lambda: seventh() == [1.5, 2.5, 3.5])
     finally:
         if node is not None:
             node.kill()
