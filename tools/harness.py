@@ -2624,6 +2624,20 @@ def clients():
         rows = await conn.fetch("SELECT id FROM users WHERE score > $1 ORDER BY id", 4.0); await conn.close()
         return [r["id"] for r in rows]
     checks["asyncpg"] = asyncio.run(apg()) == [1, 4]
+    async def apg_writes():
+        # a write's $1, $2… are its columns' types (an int is sent as one, not as text), and set_config is SET, as asyncpg
+        # sends it around its catalog reads: jit off while it reads, and back after
+        conn = await asyncpg.connect(host="127.0.0.1", port=A.port + 10, user="writer", password="w-tok", database="pondra")
+        jit = await conn.fetchrow("SELECT current_setting('jit') AS cur, set_config('jit', 'off', false) AS new")
+        back = await conn.fetchval("SELECT set_config('jit', $1, false)", "on")
+        await conn.execute("INSERT INTO users VALUES ($1, $2, $3)", 6, "fay", 6.0)
+        await conn.execute("UPDATE users SET score = $1 WHERE id = $2", 6.5, 6)
+        got = await conn.fetchrow("SELECT name, score FROM users WHERE id = $1", 6)
+        await conn.execute("DELETE FROM users WHERE id = $1", 6)
+        gone = await conn.fetchval("SELECT count(*) FROM users WHERE id = $1", 6)
+        await conn.close()
+        return (jit["cur"], jit["new"], back, tuple(got), gone)
+    checks["asyncpg writes with typed parameters, and set_config"] = asyncio.run(apg_writes()) == ("off", "off", "on", ("fay", 6.5), 0)
     checks["wrong password refused"] = _raises(lambda: psycopg.connect(dsn.replace("w-tok", "nope")))
     # attached lake: write into it through its own leader, join across the two
     admin.sql("CREATE TABLE sales.orders (id BIGINT PRIMARY KEY, user VARCHAR, amount BIGINT, _deleted BOOLEAN)")

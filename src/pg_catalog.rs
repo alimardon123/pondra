@@ -86,7 +86,7 @@ pub async fn over_http(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
 /// Does this query read Postgres's catalog, or say something only Postgres says?
 pub fn wanted(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_role", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
+    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_role", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "set_config", "has_table_privilege", "has_schema_privilege"]
         .iter().any(|w| s.contains(w))
 }
 
@@ -889,7 +889,13 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
 pub const SETTINGS: &[(&str, &str)] = &[("server_version", "16.0"), ("server_version_num", "160000"), ("server_encoding", "UTF8"), ("client_encoding", "UTF8"),
     ("standard_conforming_strings", "on"), ("integer_datetimes", "on"), ("TimeZone", "UTC"), ("DateStyle", "ISO, MDY"), ("IntervalStyle", "postgres"),
     ("max_identifier_length", "63"), ("default_transaction_isolation", "read committed"), ("transaction_isolation", "read committed"), ("search_path", "\"$user\", public"),
-    ("is_superuser", "off"), ("application_name", ""), ("default_transaction_read_only", "off"), ("lc_collate", "C.UTF-8"), ("lc_ctype", "C.UTF-8")];
+    ("is_superuser", "off"), ("application_name", ""), ("default_transaction_read_only", "off"), ("lc_collate", "C.UTF-8"), ("lc_ctype", "C.UTF-8"),
+    ("jit", "off")]; // (no JIT here: asyncpg reads it, and turns it off while it reads the catalog)
+
+/// A setting's value in the current session: the session's own (`SET`, `set_config`), else Postgres's as served here.
+fn setting(n: &str) -> Option<String> {
+    crate::set::shown(n).or_else(|| SETTINGS.iter().find(|(k, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.to_string()))
+}
 
 /// The SQL standard's `information_schema`, Postgres's way: its types by Postgres's names.
 fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
@@ -1213,9 +1219,22 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     }));
     ctx.register_udf(udf("pg_encoding_to_char", to_text, |_, n| Ok(texts_out((0..n).map(|_| Some("UTF8".to_string()))))));
     ctx.register_udf(udf("pg_backend_pid", |_| DataType::Int32, |_, n| Ok(Arc::new(datafusion::arrow::array::Int32Array::from(vec![std::process::id() as i32; n.max(1)])))));
-    ctx.register_udf(udf("current_setting", to_text, |a, n| {
+    // (a function runs wherever the query's stream is polled: each keeps the session the query was planned in)
+    let here = crate::temp::here();
+    let session = here.clone();
+    ctx.register_udf(udf("current_setting", to_text, move |a, n| {
         let names = text_arg(&a[0])?;
-        Ok(texts_out((0..n).map(|i| SETTINGS.iter().find(|(k, _)| names[i].as_deref().is_some_and(|x| x.eq_ignore_ascii_case(k))).map(|(_, v)| v.to_string()))))
+        Ok(crate::temp::SESSION.sync_scope(session.clone(), || texts_out((0..n).map(|i| setting(names[i].as_deref()?)))))
+    }));
+    ctx.register_udf(crate::pg_functions::function("set_config", Signature::any(3, Volatility::Volatile), to_text, move |a, n| {
+        let (names, values) = (text_arg(&a[0])?, text_arg(&a[1])?);
+        let set = |i: usize| -> anyhow::Result<Option<String>> {
+            let name = names[i].as_deref().ok_or_else(|| crate::codes::coded("22004", "SET requires parameter name"))?;
+            crate::set::config(name, values[i].clone())?;
+            Ok(setting(name))
+        };
+        let out = crate::temp::SESSION.sync_scope(here.clone(), || (0..n).map(set).collect::<anyhow::Result<Vec<_>>>());
+        Ok(texts_out(out.map_err(crate::codes::for_datafusion)?))
     }));
     let on_path: Vec<ScalarValue> = std::iter::once(s("pg_catalog")).chain(l.visible.iter().map(|v| s(v.as_str()))).collect();
     ctx.register_udf(udf("current_schemas", |_| list(DataType::Utf8), move |_, n| {
@@ -2228,6 +2247,26 @@ mod tests {
         assert_eq!(column(&ctx, "SELECT pg_database_size('lake')").await, vec![bytes.to_string()]);
         assert_eq!(column(&ctx, "SELECT pg_database_size('other')").await, vec!["NULL"]);
         assert_eq!(column(&ctx, "SELECT reset_val FROM pg_settings WHERE name = 'search_path'").await, vec!["\"$user\", public"]);
+    }
+
+    /// `set_config` is `SET` (or `RESET`, for a NULL value) in the session its query was planned in, and answers with the value
+    /// the setting then has, as `current_setting` reads it: asyncpg turns `jit` off so while it reads the catalog.
+    #[tokio::test]
+    async fn set_config_sets_the_sessions_setting() {
+        let (s, at) = (crate::temp::of_script(""), Arc::new(crate::temp::Sessions::default()));
+        let here = Some(crate::temp::Named { name: s.clone(), at: at.clone() });
+        let ctx = crate::temp::SESSION.scope(here.clone(), catalog()).await;
+        assert_eq!(column(&ctx, "SELECT current_setting('jit'), set_config('jit', 'off', false)").await, vec!["off"]);
+        assert_eq!(column(&ctx, "SELECT set_config('jit', 'on', false)").await, vec!["on"]);
+        assert_eq!(column(&ctx, "SELECT current_setting('jit')").await, vec!["on"]);
+        assert_eq!(column(&ctx, "SELECT set_config('jit', NULL, false)").await, vec!["off"], "NULL resets it");
+        assert_eq!(column(&ctx, "SELECT set_config('application_name', 'app', true)").await, vec!["app"], "is_local is SET LOCAL's: SET's here");
+        assert_eq!(crate::temp::SESSION.sync_scope(here, || crate::set::shown("application_name")), Some("app".into()));
+        let refused = |ctx: SessionContext, sql: &'static str| async move { async { ctx.sql(sql).await?.collect().await }.await.unwrap_err().to_string() };
+        assert!(refused(ctx.clone(), "SELECT set_config('datafusion.runtime.memory_limit', '1G', false)").await.contains("is the node's"), "refused as SET refuses it");
+        assert!(refused(ctx, "SELECT set_config(NULL, 'x', false)").await.contains("SET requires parameter name"));
+        at.end(&s);
+        assert!(refused(catalog().await, "SELECT set_config('jit', 'off', false)").await.contains("a session's"), "no session: none to set");
     }
 
     #[tokio::test]
