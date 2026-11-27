@@ -272,7 +272,8 @@ whose grants don't cover the whole table's rows gets `403`.
 `/live` answers a query now, and again each time a commit changes a table it reads, as lines of
 `{"at": COMMIT, "rows": […]}`. `GET /live?sql=…` takes the query in the URL, and `POST /live`
 takes a body as `POST /sql` does, with `$name` parameters. `every_ms` sets the shortest time between
-queries on a busy table (default 100). An answer that comes out the same isn't sent again. A line
+queries on a busy table (default 100). An answer that comes out the same isn't sent again. A user held to
+`MAX_ROWS n` gets at most n rows a line, as at every door, and a line cut so says `"cut": n`. A line
 `{"error": …}` ends the stream. The query runs while the connection is open, and stops when it
 closes.
 
