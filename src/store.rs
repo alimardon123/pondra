@@ -877,6 +877,16 @@ pub struct TableMeta {
     pub sketch: BTreeMap<String, String>, // append tables: each key-like column's distinct values, sketched (`sketch.rs`)
     #[serde(default)]
     pub ids: bool, // every row has its system columns (`sys.rs`): tables made from round 19 on
+    /// Its struct columns' fields have their field ids in every one of its files (`column::field_id`): a table made from
+    /// 5-TY-c3e on, or one whose files `tier::maintain` checked and rewrote before it first published as Iceberg
+    /// (`tier::unchecked`). Pondra wrote none before, and Iceberg's readers, which find a struct's fields by id, read
+    /// NULLs from a file without them. A node from before that rewrites the entry drops it, and the check runs once more,
+    /// which only reads footers: no format raise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub struct_ids: bool,
+    /// How far that check of a big table has got, over rounds: the last file it read, by path (`tier::without_struct_ids`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub struct_ids_after: Option<String>,
     #[serde(default)]
     pub changed: bool, // append tables: UPDATE, DELETE or MERGE has replaced rows (`{t}$deleted` holds the old ones)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

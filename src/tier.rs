@@ -163,9 +163,16 @@ const MERGE_BYTES: u64 = 256 << 20; // input a merge job takes at most
 /// other engines see its rows as they are now.
 pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_anyway: bool) -> Result<bool> {
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok(false) };
+    // (a table about to publish as Iceberg with a struct column: its files without the struct's field ids are rewritten
+    // first, an append table's each alone, a keyed table's compacted whole: `unchecked`)
+    let checking = unchecked(&meta);
+    let (older, through) = match checking {
+        true => without_struct_ids(lake, table, &mut meta, STRUCT_CHECKS).await?,
+        false => Default::default(),
+    };
     let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
     let generations = meta.files.iter().map(|f| f.ord).collect::<std::collections::BTreeSet<_>>().len();
-    let stale = now_anyway && !meta.publish.is_empty() && (generations > 1 || meta.files.iter().any(|f| !f.whole));
+    let stale = now_anyway && !meta.publish.is_empty() && (generations > 1 || meta.files.iter().any(|f| !f.whole)) || !meta.key.is_empty() && !older.is_empty();
     let changed = if !meta.key.is_empty() && (generations >= 8 || stale) {
         // Tables other engines read compact fully (they see keyed tables as of their last full
         // compaction); the rest merge size-tiered runs.
@@ -179,7 +186,7 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
         replace(&mut meta, &run, merged);
         shadow(lake, table, &mut meta, &new, false).await?; // (its delete markers, kept to shadow what's older)
         true
-    } else if meta.key.is_empty() && (small.len() >= 2 || meta.files.iter().any(mostly_deleted)) {
+    } else if meta.key.is_empty() && (small.len() >= 2 || meta.files.iter().any(mostly_deleted) || !older.is_empty()) {
         // Small files of one partition merge together (so each file keeps one): 8 of about one
         // size at a time (`class`), and all of them before they're sealed (manifests never change,
         // so they'd stay small).
@@ -211,7 +218,7 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
         // them (a merge reads it so), alone if no merge took it: the purge that used to rewrite
         // every changed file every round, now for the files it pays for (ADR-029 §4).
         let merged: std::collections::HashSet<String> = groups.iter().flatten().map(|f| f.path.clone()).collect();
-        groups.extend(meta.files.iter().filter(|f| mostly_deleted(f) && !merged.contains(&f.path)).map(|f| vec![f.clone()]));
+        groups.extend(meta.files.iter().filter(|f| (mostly_deleted(f) || older.contains(&f.path)) && !merged.contains(&f.path)).map(|f| vec![f.clone()]));
         if !groups.is_empty() {
             let jobs = groups.iter().map(|g| Job::new(table, &meta, Kind::Merge { files: g.clone() })).collect();
             let merged = deal(lake, jobs, nodes, me).await?;
@@ -221,12 +228,75 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
     } else {
         false
     };
+    if checking {
+        // (done once the last file is read, or once a keyed table's compaction wrote every file again)
+        let done = through.is_none() || !meta.key.is_empty() && !older.is_empty();
+        (meta.struct_ids, meta.struct_ids_after) = (done, through.filter(|_| !done));
+    }
     // The oldest inline files go into manifests once there are too many.
-    if !crate::manifest::seal(lake, table, &mut meta).await? && !changed {
+    if !crate::manifest::seal(lake, table, &mut meta).await? && !changed && !checking {
         return Ok(false);
     }
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
     Ok(true)
+}
+
+/// Is `m` to publish as Iceberg with a struct column, its files not yet checked for the struct's field ids
+/// (`TableMeta::struct_ids`)? Then `maintain` takes it in the next round (`Brief::untidy`) and rewrites those without
+/// them, and it publishes as Iceberg after that, not before (`delta::publish_named`). A table with no files has none to
+/// check: it publishes at once, empty (ADR-028).
+pub fn unchecked(m: &TableMeta) -> bool {
+    !m.struct_ids && (!m.files.is_empty() || m.sealed.is_some()) && m.publish.iter().any(|f| f == "iceberg") && m.live().any(|(_, _, t)| crate::column::struct_fields_of(t).is_some())
+}
+
+/// The footers a round reads at most in `maintain`'s check of a table's files for struct field ids, as its other work is
+/// bounded: a big table's check goes on over rounds (`TableMeta::struct_ids_after`), Iceberg held until it is done.
+const STRUCT_CHECKS: usize = 256;
+
+/// Of the next `at_most` files of `meta` by path, past where its check had got (`TableMeta::struct_ids_after`), those
+/// whose struct columns' fields have no field ids, by their footers (`struct_ids`), sealed ones brought back inline to be
+/// rewritten (`manifest::unseal`); and the last path read, or None once none is left. A file written meanwhile has them.
+async fn without_struct_ids(lake: &Lake, table: &str, meta: &mut TableMeta, at_most: usize) -> Result<(std::collections::HashSet<String>, Option<String>)> {
+    use futures::TryStreamExt;
+    let list = crate::manifest::list(lake, meta).await?;
+    // (each file with the manifest it is sealed in, if it is)
+    let mut all: Vec<(DataFile, Option<usize>)> = meta.files.iter().map(|f| (f.clone(), None)).collect();
+    for (i, m) in list.iter().enumerate() {
+        all.extend(crate::manifest::files(lake, m).await?.into_iter().map(|f| (f, Some(i))));
+    }
+    all.retain(|(f, _)| meta.struct_ids_after.as_ref().is_none_or(|after| f.path > *after));
+    all.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    let through = (all.len() > at_most).then(|| all[at_most - 1].0.path.clone());
+    all.truncate(at_most);
+    let ctx = lake.session();
+    let files: Vec<DataFile> = all.iter().map(|(f, _)| f.clone()).collect();
+    let given: Vec<bool> = futures::stream::iter(files).map(|f| struct_ids(lake, &ctx, f)).buffered(16).try_collect().await?;
+    let (lacking, mut which): (std::collections::HashSet<String>, Vec<usize>) = (
+        all.iter().zip(&given).filter(|(_, given)| !**given).map(|((f, _), _)| f.path.clone()).collect(),
+        all.iter().zip(&given).filter(|(_, given)| !**given).filter_map(|((_, i), _)| *i).collect(),
+    );
+    which.sort_unstable();
+    which.dedup();
+    crate::manifest::unseal(lake, table, meta, list, &which).await?;
+    Ok((lacking, through))
+}
+
+/// Do a file's struct columns' fields have their field ids (`field_ids`)? Its Parquet footer says. A file whose size
+/// its record doesn't keep is taken as having none (rewriting it costs a write, nothing else).
+async fn struct_ids(lake: &Lake, ctx: &datafusion::prelude::SessionContext, f: DataFile) -> Result<bool> {
+    use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY as ID;
+    if f.bytes == 0 {
+        return Ok(false);
+    }
+    let url = datafusion::datasource::listing::ListingTableUrl::parse(lake.full(&f.path))?;
+    let store = ctx.runtime_env().object_store(&url)?;
+    let object = object_store_df::ObjectMeta { location: url.prefix().clone(), last_modified: Default::default(), size: f.bytes, e_tag: None, version: None };
+    let md = datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata::new(store.as_ref(), &object).fetch_metadata().await.with_context(|| format!("{}: its Parquet footer", f.path))?;
+    let schema = datafusion::parquet::arrow::parquet_to_arrow_schema(md.file_metadata().schema_descr(), None)?;
+    Ok(schema.fields().iter().all(|c| match c.data_type() {
+        datafusion::arrow::datatypes::DataType::Struct(fs) => fs.iter().all(|f| f.metadata().contains_key(ID)),
+        _ => true,
+    }))
 }
 
 /// A file a tenth or more of whose rows were deleted by position: `maintain` rewrites it.
@@ -796,7 +866,7 @@ impl Brief {
         let (sealed, rows, bytes) = m.sealed.as_ref().map_or((0, 0, 0), |s| (s.files, s.rows, s.bytes));
         Brief {
             tiered: m.tiered,
-            untidy: m.files.len() >= 8 || heavy,
+            untidy: m.files.len() >= 8 || heavy || unchecked(m),
             changed: m.changed && m.key.is_empty(),
             purged: m.purged(),
             settles: m.purges.get(1).map(|p| p.1),
@@ -1298,20 +1368,29 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
     // A list's elements have an id too, `column::ELEMENTS` past the column's (`iceberg.rs`: `element-id`): a reader that
     // matches a file's fields by id alone (DuckDB's `iceberg_scan`) reads a list whose elements have none as NULLs.
     let columns = list.as_ref().map_or(made.len(), |l| l.all().len());
-    let element = |t: &DataType, id: usize| {
-        let with = |f: &FieldRef| std::sync::Arc::new(f.as_ref().clone().with_metadata([(ID.to_string(), id.to_string())].into()));
+    // A struct's fields (a FILE's) have theirs, by their places: `column::field_id`.
+    let element = |t: &DataType, column: usize| {
+        let id = crate::column::ELEMENTS as usize + column;
+        let with = |f: &FieldRef, id: usize| {
+            let mut m = f.metadata().clone();
+            m.insert(ID.to_string(), id.to_string());
+            std::sync::Arc::new(f.as_ref().clone().with_metadata(m))
+        };
         match t {
-            DataType::List(f) => DataType::List(with(f)),
-            DataType::LargeList(f) => DataType::LargeList(with(f)),
-            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(with(f), *n),
-            t => t.clone(),
+            DataType::List(f) => DataType::List(with(f, id)),
+            DataType::LargeList(f) => DataType::LargeList(with(f, id)),
+            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(with(f, id), *n),
+            t => match crate::column::struct_fields(t) {
+                Some(fs) => DataType::Struct(fs.iter().enumerate().map(|(k, f)| with(f, crate::column::field_id(column as u32, k) as usize)).collect()),
+                None => t.clone(),
+            },
         }
     };
     let fields: Vec<_> = schema.fields().iter().map(|f| match id(f.name()) {
         Some(i) => {
             let mut m = f.metadata().clone();
             m.insert(ID.to_string(), i.to_string());
-            let t = if i <= columns { element(f.data_type(), crate::column::ELEMENTS as usize + i) } else { f.data_type().clone() };
+            let t = if i <= columns { element(f.data_type(), i) } else { f.data_type().clone() };
             std::sync::Arc::new(f.as_ref().clone().with_metadata(m).with_data_type(t))
         }
         None => f.clone(),
@@ -1703,6 +1782,63 @@ mod tests {
         let Err(err) = write_stream(&lake, "u", stream(true), 2500, &[], None).await else { panic!("the stream's error") };
         assert!(format!("{err:#}").contains("the query stopped"), "{err:#}");
         assert_eq!(parquet(&dir), before + 3, "the files filled before the error are put; the one under way is not");
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A table about to publish as Iceberg with a struct column (5-TY-c3e): a file whose struct's fields have no field ids,
+    /// as Pondra wrote them before, is rewritten with them first (DuckDB's `iceberg_scan` read its fields as NULLs), its
+    /// rows as they were; a file with them stays. Until that is done the table is `unchecked`, which Iceberg's publishing
+    /// waits for (`delta::publish_named`).
+    #[tokio::test]
+    async fn a_structs_older_file_is_rewritten_with_its_fields_ids_before_it_publishes_as_iceberg() -> Result<()> {
+        use datafusion::arrow::array::StructArray;
+        use datafusion::arrow::datatypes::Fields;
+        use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY as ID;
+        let dir = std::env::temp_dir().join(format!("pondra-struct-ids-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        crate::write::create_table(&lake, "t", r#"{"columns": [["id", "Int64"], ["s", "Struct(\"a\": Int64, \"b\": Utf8)"]]}"#).await?;
+        let pair = Fields::from(vec![Field::new("a", DataType::Int64, true), Field::new("b", DataType::Utf8, true)]);
+        let rows = |ids: bool| {
+            let id = |f: Field, i: &str| if ids { f.with_metadata([(ID.to_string(), i.to_string())].into()) } else { f };
+            let schema = Arc::new(Schema::new(vec![id(Field::new("id", DataType::Int64, true), "1"), id(Field::new("s", DataType::Struct(pair.clone()), true), "2")]));
+            let s = StructArray::try_new(pair.clone(), vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef, Arc::new(StringArray::from(vec![Some("x"), None]))], None).unwrap();
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(s)]).unwrap()
+        };
+        // (the older file: its columns' ids, none for the struct's fields)
+        let mut w = ArrowWriter::try_new(Vec::new(), rows(true).schema(), None)?;
+        w.write(&rows(true))?;
+        let bytes = w.into_inner()?;
+        let mut meta = lake.cat.get::<TableMeta>(&table_key("t")).await?.unwrap();
+        let older = format!("data/{}/older.parquet", meta.folder("t"));
+        lake.put(&older, bytes.clone()).await?;
+        let stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(rows(false).schema(), futures::stream::iter([Ok::<_, datafusion::error::DataFusionError>(rows(false))])));
+        let newer = write_stream(&lake, "t", stream, 1000, &[], None).await?;
+        meta.files = newer.clone();
+        meta.files.push(DataFile { path: older.clone(), rows: 2, bytes: bytes.len() as u64, ..Default::default() });
+        meta.publish = vec!["iceberg".into()];
+        assert!(meta.struct_ids, "a table made now is checked already");
+        meta.struct_ids = false; // (as a table made before 5-TY-c3e)
+        lake.cat.commit(vec![(table_key("t"), json(&meta))], &[]).await?;
+        assert!(unchecked(&meta) && Brief::of(&meta).untidy, "it waits for maintain");
+        // (a round reads so many footers at most, and the next goes on from where it got to)
+        let mut part = meta.clone();
+        let (first, through) = without_struct_ids(&lake, "t", &mut part, 1).await?;
+        part.struct_ids_after = through.clone();
+        let (second, last) = without_struct_ids(&lake, "t", &mut part, 1).await?;
+        assert!(through.is_some() && last.is_none());
+        assert_eq!(first.into_iter().chain(second).collect::<Vec<_>>(), [older.clone()], "two rounds of one footer find the older file");
+        let ctx = lake.session();
+        assert!(!struct_ids(&lake, &ctx, meta.files[1].clone()).await? && struct_ids(&lake, &ctx, meta.files[0].clone()).await?);
+        assert!(maintain(&lake, "t", &["me".to_string()], "me", false).await?);
+        let after = lake.cat.get::<TableMeta>(&table_key("t")).await?.unwrap();
+        assert!(after.struct_ids && after.struct_ids_after.is_none() && !unchecked(&after));
+        assert!(after.files.iter().any(|f| f.path == newer[0].path) && !after.files.iter().any(|f| f.path == older), "the newer file stays, the older one is rewritten");
+        assert_eq!(after.files.iter().map(|f| f.rows).sum::<u64>(), 4);
+        for f in &after.files {
+            assert!(struct_ids(&lake, &ctx, f.clone()).await?, "{}", f.path);
+        }
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())

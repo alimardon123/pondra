@@ -241,7 +241,8 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::app::App>
 }
 
 /// A staged create's table as the catalog answers it before it is made (`create`): the request's schema with the field ids
-/// Pondra's table will give it (its columns 1…n in order, a list's elements `column::ELEMENTS` past their column's: `iceberg::fields`), its partition
+/// Pondra's table will give it (its columns 1…n in order, a list's elements `column::ELEMENTS` past their column's, a struct's fields
+/// `column::field_id`: `iceberg::fields`), its partition
 /// spec and write order on those ids, no snapshot. The engine writes its files with these ids, so they read as the table's.
 fn staged(location: &str, asked: &Value) -> Value {
     let fields = asked["schema"]["fields"].as_array().cloned().unwrap_or_default();
@@ -253,9 +254,13 @@ fn staged(location: &str, asked: &Value) -> Value {
         if f["type"]["type"] == "list" {
             f["type"]["element-id"] = (crate::column::ELEMENTS as i64 + own).into();
         }
+        for (k, field) in f.get_mut("type").and_then(|t| t.get_mut("fields")).and_then(Value::as_array_mut).into_iter().flatten().enumerate() {
+            field["id"] = crate::column::field_id(own as u32, k).into(); // (a struct's fields, by their places)
+        }
         f
     }).collect();
-    let last = fields.iter().map(|f| f["type"]["element-id"].as_i64().unwrap_or(0).max(f["id"].as_i64().unwrap_or(0))).max().unwrap_or(0);
+    let deepest = |f: &Value| f["type"]["fields"].as_array().into_iter().flatten().filter_map(|f| f["id"].as_i64()).max().unwrap_or(0);
+    let last = fields.iter().map(|f| f["type"]["element-id"].as_i64().unwrap_or(0).max(f["id"].as_i64().unwrap_or(0)).max(deepest(f))).max().unwrap_or(0);
     let keys: Vec<Value> = asked["schema"]["identifier-field-ids"].as_array().into_iter().flatten().map(id).collect();
     let spec: Vec<Value> = asked["partition-spec"]["fields"].as_array().into_iter().flatten().enumerate()
         .map(|(i, f)| json!({"source-id": id(&f["source-id"]), "field-id": 1000 + i as i64, "name": f["name"], "transform": f["transform"]})).collect();
@@ -371,12 +376,15 @@ fn replacement(table: &str, asked: &Value, meta: &Value, publish: &str) -> Value
     })
 }
 
-/// Are a schema's field ids those Pondra gives a new table's columns (1…n in order, a list's elements `column::ELEMENTS` past their column's)? Then the
+/// Are a schema's field ids those Pondra gives a new table's columns (1…n in order, a list's elements `column::ELEMENTS` past their column's, a
+/// struct's fields `column::field_id`)? Then the
 /// engine's files can be the table's as written; otherwise they're copied by name (`prepare_as`), since a file's columns are
 /// matched by field id first.
 fn aligned(schema: &Value) -> bool {
     let fields = schema["fields"].as_array().cloned().unwrap_or_default();
-    fields.iter().enumerate().all(|(i, f)| f["id"] == i as i64 + 1 && (f["type"]["type"] != "list" || f["type"]["element-id"] == crate::column::ELEMENTS as i64 + i as i64 + 1))
+    let own = |f: &Value, k: usize, i: usize| f["id"] == crate::column::field_id(i as u32 + 1, k) as i64;
+    fields.iter().enumerate().all(|(i, f)| f["id"] == i as i64 + 1 && (f["type"]["type"] != "list" || f["type"]["element-id"] == crate::column::ELEMENTS as i64 + i as i64 + 1)
+        && f["type"]["fields"].as_array().into_iter().flatten().enumerate().all(|(k, f)| own(f, k, i)))
 }
 
 /// A replace through the catalog, as Pondra's CREATE OR REPLACE TABLE of what it makes current: the new table filled with the

@@ -20040,8 +20040,9 @@ def filecols():
     results, so psycopg and asyncpg hand over its object; pg_attribute and information_schema say jsonb; a parameter's
     path or object goes into the column, and COPY … TO STDOUT writes its text. POST /append takes its object, and COPY …
     FROM STDIN (CSV) its path, refusing what is neither with 22P02 and writing nothing. A view and a materialized view's
-    table keep the type (a filter by path), and so does a branch. Delta and Iceberg have no type for it yet: a table of
-    one is refused publishing, naming the column and FILE."""
+    table keep the type (a filter by path), and so does a branch. A table of one publishes as Delta and Iceberg (5-TY-c3e:
+    a struct, each field with an id by its place, `column::field_id`), which DuckDB reads as its struct, through a column
+    added after and one renamed (Delta's column mapping then names the struct's fields too); its type can't be changed."""
     import asyncio
     import psycopg
     try:
@@ -20159,9 +20160,42 @@ def filecols():
         check("a branch (CREATE DATABASE … CLONE) keeps the type: filtered by path", branched)
 
         def published():
-            info["published"] = http_err("/sql", b"CREATE TABLE pub (id INT, photo FILE) WITH (publish = 'iceberg')")
-            return info["published"][:2] == (501, "0A000") and "iceberg has no type for photo (FILE)" in info["published"][2]
-        check("a table of one isn't published: Iceberg has no type for it yet, said by name", published)
+            import open_check
+            q("CREATE TABLE pub (id INT, photo FILE) WITH (publish = 'delta,iceberg')")
+            q("INSERT INTO pub VALUES (1, 'cams/a.jpg'), (2, NULL)")
+            call(port, "POST", "/tier", timeout=300)
+            q("ALTER TABLE pub ADD COLUMN n INT")  # (a column added after: the struct's field ids stay, older files read on)
+            q("""INSERT INTO pub VALUES (3, '{"path": "cams/b.png", "version": "5"}', 7)""")
+            call(port, "POST", "/tier", timeout=300)
+            d = open_check.duck(lake)
+            got = lambda scan: [tuple(r) for r in d.execute(f"SELECT id, photo, n FROM {scan} ORDER BY id").fetchall()]
+            want = [(1, obj("cams/a.jpg", "image/jpeg"), None), (2, None, None), (3, obj("cams/b.png", "image/png", "5"), 7)]
+            info["duckdb delta"], info["duckdb iceberg"] = got(f"delta_scan('{lake}/data/pub')"), got(f"iceberg_scan('{open_check.iceberg_metadata(lake, 'pub')}')")
+            # (renamed: Delta's column mapping then names each field, the struct's too; Iceberg's ids are unchanged)
+            q("ALTER TABLE pub RENAME COLUMN photo TO picture")
+            call(port, "POST", "/tier", timeout=300)
+            d = open_check.duck(lake)
+            renamed = lambda scan: [tuple(r) for r in d.execute(f"SELECT id, picture FROM {scan} ORDER BY id").fetchall()]
+            info["renamed delta"], info["renamed iceberg"] = renamed(f"delta_scan('{lake}/data/pub')"), renamed(f"iceberg_scan('{open_check.iceberg_metadata(lake, 'pub')}')")
+            info["retyped"] = http_err("/sql", b"ALTER TABLE pub ALTER COLUMN picture TYPE TEXT")
+            return info["duckdb delta"] == want and info["duckdb iceberg"] == want and info["renamed delta"] == [w[:2] for w in want] == info["renamed iceberg"] \
+                and info["retyped"][1] == "42804" and "picture is FILE:" in info["retyped"][2]
+        check("published as Delta and Iceberg, DuckDB reads each FILE as its struct, through a column added and one renamed; its type doesn't change", published)
+
+        def structs():
+            import open_check
+            q("CREATE TABLE pairs AS SELECT * FROM (VALUES (1, named_struct('a', 1, 'b', 'x')), (2, named_struct('a', 2, 'b', NULL))) AS v(id, s)")
+            call(port, "POST", "/tier", timeout=300)
+            q("ALTER TABLE pairs SET (publish = 'delta,iceberg')")
+            call(port, "POST", "/tier", timeout=300)
+            d = open_check.duck(lake)
+            got = lambda scan: [tuple(r) for r in d.execute(f"SELECT id, s FROM {scan} ORDER BY id").fetchall()]
+            info["pairs delta"], info["pairs iceberg"] = got(f"delta_scan('{lake}/data/pairs')"), got(f"iceberg_scan('{open_check.iceberg_metadata(lake, 'pairs')}')")
+            q("CREATE TABLE deep AS SELECT named_struct('a', named_struct('b', 1)) AS s")
+            info["deep"] = http_err("/sql", b"ALTER TABLE deep SET (publish = 'iceberg')")
+            want = [(1, {"a": 1, "b": "x"}), (2, {"a": 2, "b": None})]
+            return info["pairs delta"] == want == info["pairs iceberg"] and info["deep"][:2] == (501, "0A000") and "no type for s" in info["deep"][2]
+        check("any struct column publishes as well, once published later; one with a struct in it is refused by name (0A000)", structs)
         if asyncpg is not None:
             async def apg():
                 conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")
@@ -23771,7 +23805,7 @@ def registry():
     checks["CREATE OR ALTER TABLE: made, then nothing to do, a column added, options taken away, a type widened; what would lose rows refused"] = \
         first.get("created") is True and same.get("unchanged") is True and "+ note" in grown.get("altered", []) \
         and any(a.startswith("CLUSTER BY") for a in grown.get("altered", [])) and any(a.startswith("retention") for a in grown.get("altered", [])) \
-        and "n BIGINT" in widened2.get("altered", []) and [r[0] for r in refused] == [500] * 5 \
+        and "n BIGINT" in widened2.get("altered", []) and [r[0] for r in refused] == [500, 500, 500, 400, 500] and "can only widen" in refused[3][1] \
         and q("SELECT id, kind, note, n FROM events") == [{"id": 1, "kind": "a"}] \
         and q("SELECT * FROM recent") == [{"id": 1, "kind": "a"}] and "CLUSTER BY" not in show("table", "events")
     q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR)")
