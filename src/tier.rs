@@ -1290,7 +1290,7 @@ impl Encoding {
         let at = |f: FieldRef| Some((schema.index_of(f.name()).ok()?, f));
         let hot: Vec<(usize, FieldRef)> = hot.into_iter().map(at).collect::<Option<_>>().unwrap_or_default();
         let kept = vec![vec![]; hot.len()];
-        let format = crate::file_formats::default();
+        let format = meta.map_or(Ok(crate::file_formats::default()), |m| crate::file_formats::table(&m.file_format))?;
         Ok(Encoding { w: format.writer(ids.clone(), keys)?, format, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, sketches, hot, kept, kept_bytes: 0 })
     }
 

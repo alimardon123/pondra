@@ -926,6 +926,10 @@ pub struct TableMeta {
     /// set): read `AT (…)` (`past.rs`), and undropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_secs: Option<u64>,
+    /// `file_format = 'vortex'`: what its new files are written in (`file_formats::table`); none: Parquet. Its files
+    /// written before keep theirs (`DataFile::format`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_format: String,
     /// From which commit (and time, ms) on the table can be read as it was: a purge let the old
     /// versions of earlier changes go (`tier::purge`). (0, 0): all of it; None: changed before
     /// this was kept, and whole only from its oldest purge kept (`past::kept_since`).
