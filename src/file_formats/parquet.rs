@@ -56,6 +56,7 @@ impl TableFileFormat for Parquet {
     }
     fn blocks(&self) -> Option<&dyn Blocks> { Some(self) }
     fn columns(&self) -> Option<&dyn Columns> { Some(self) }
+    fn numbers(&self) -> bool { true }
 }
 
 /// A file's blocks are its row groups, its index its footer: a row group's min and max say whether it may hold a key.

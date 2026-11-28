@@ -66,6 +66,9 @@ async fn attempt(source: &impl Source, target: &Lake, table: &str, sql: &str, jo
     if !plain || meta.rules()?.ruled() {
         return Ok(Err("the table isn't this statement's, or has a partition, a key, a rule or identity".into()));
     }
+    if crate::file_formats::table(&meta.file_format)?.name() != crate::file_formats::parquet().name() {
+        return Ok(Err(format!("the table's files are written in {} (file_format)", meta.file_format)));
+    }
     if recorded(target, job).await? {
         return Ok(Err("the job is recorded: written as today answers it".into()));
     }
