@@ -141,14 +141,7 @@ pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
                 Reset::ALL => None,
                 Reset::ConfigurationParameter(n) => Some(name(&n.to_string())),
             };
-            if let Some(n) = name.as_deref().filter(|n| n.starts_with("datafusion.") && !n.starts_with("datafusion.runtime.")) {
-                datafusion::config::ConfigField::reset(&mut datafusion::config::ConfigOptions::new(), n)?; // (a name DataFusion has)
-            }
-            crate::temp::with(&session()?, false, |s| Ok(match name.as_deref() {
-                Some(DIALECT) => drop([DIALECT, "language"].map(|n| s.settings.remove(n))), // (the dialect's setting names the language too)
-                Some(n) => drop(s.settings.remove(n)),
-                None => s.settings.clear(),
-            }))?;
+            reset(&session()?, name.as_deref())?;
             Done::Said(Kind::new("RESET"))
         }
         Statement::Prepare { name, statement, .. } => {
@@ -188,6 +181,29 @@ pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
         }
         _ => bail!("not a setting or a prepared statement (SET name = value or SHOW name for a setting, PREPARE name AS … for a statement)"),
     })
+}
+
+/// `RESET name` in `session`, or `RESET ALL` for None. `name` as kept (`name`).
+fn reset(session: &str, name: Option<&str>) -> Result<()> {
+    if let Some(n) = name.filter(|n| n.starts_with("datafusion.") && !n.starts_with("datafusion.runtime.")) {
+        datafusion::config::ConfigField::reset(&mut datafusion::config::ConfigOptions::new(), n)?; // (a name DataFusion has)
+    }
+    crate::temp::with(session, false, |s| Ok(match name {
+        Some(DIALECT) => drop([DIALECT, "language"].map(|n| s.settings.remove(n))), // (the dialect's setting names the language too)
+        Some(n) => drop(s.settings.remove(n)),
+        None => s.settings.clear(),
+    }))
+}
+
+/// Postgres's `set_config(name, value, is_local)` in the current session: `SET name = value`, or `RESET name` for a NULL
+/// value (asyncpg turns `jit` off so while it reads the catalog, and back after). Its `is_local` is SET LOCAL's, which
+/// is SET's here. The caller answers with the value the setting then has (`current_setting`'s).
+pub fn config(n: &str, value: Option<String>) -> Result<()> {
+    let session = crate::temp::current().context(NO_SESSION)?;
+    match value {
+        Some(v) => set(&session, n, v),
+        None => reset(&session, Some(&name(n))),
+    }
 }
 
 /// `DISCARD`, as Postgres's. `ALL` is what a pooler sends before it hands a connection to another client (PgBouncer's

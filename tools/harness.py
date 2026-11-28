@@ -2624,6 +2624,20 @@ def clients():
         rows = await conn.fetch("SELECT id FROM users WHERE score > $1 ORDER BY id", 4.0); await conn.close()
         return [r["id"] for r in rows]
     checks["asyncpg"] = asyncio.run(apg()) == [1, 4]
+    async def apg_writes():
+        # a write's $1, $2… are its columns' types (an int is sent as one, not as text), and set_config is SET, as asyncpg
+        # sends it around its catalog reads: jit off while it reads, and back after
+        conn = await asyncpg.connect(host="127.0.0.1", port=A.port + 10, user="writer", password="w-tok", database="pondra")
+        jit = await conn.fetchrow("SELECT current_setting('jit') AS cur, set_config('jit', 'off', false) AS new")
+        back = await conn.fetchval("SELECT set_config('jit', $1, false)", "on")
+        await conn.execute("INSERT INTO users VALUES ($1, $2, $3)", 6, "fay", 6.0)
+        await conn.execute("UPDATE users SET score = $1 WHERE id = $2", 6.5, 6)
+        got = await conn.fetchrow("SELECT name, score FROM users WHERE id = $1", 6)
+        await conn.execute("DELETE FROM users WHERE id = $1", 6)
+        gone = await conn.fetchval("SELECT count(*) FROM users WHERE id = $1", 6)
+        await conn.close()
+        return (jit["cur"], jit["new"], back, tuple(got), gone)
+    checks["asyncpg writes with typed parameters, and set_config"] = asyncio.run(apg_writes()) == ("off", "off", "on", ("fay", 6.5), 0)
     checks["wrong password refused"] = _raises(lambda: psycopg.connect(dsn.replace("w-tok", "nope")))
     # attached lake: write into it through its own leader, join across the two
     admin.sql("CREATE TABLE sales.orders (id BIGINT PRIMARY KEY, user VARCHAR, amount BIGINT, _deleted BOOLEAN)")
@@ -20304,6 +20318,8 @@ def vectors():
                 conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")
                 try:
                     await register_vector_asyncpg(conn)  # (set_type_codec: refused unless vector's typtype is a "char")
+                    # ($2::vector is described as vector, so asyncpg sends the array by pgvector's codec; $1 as the int its column is)
+                    await conn.execute("INSERT INTO ev VALUES ($1, $2::vector)", 7, np.array([1.5, 2.5, 3.5], dtype=np.float32))
                     await conn.execute("CREATE TYPE mood AS ENUM ('ok', 'sad')")
                     await conn.set_type_codec("mood", schema="public", encoder=str, decoder=str.upper, format="text")  # (any type's codec, likewise)
                     return await conn.fetchval("SELECT typtype FROM pg_type WHERE typname = 'vector'")
@@ -20313,6 +20329,11 @@ def vectors():
             # doesn't answer, as it did before vector; the Postgres lane's)
             check("asyncpg's register_vector, and set_type_codec for any type: pg_type's typtype is a \"char\", b'b'",
                   lambda: asyncio.run(apg()) == b"b")
+            def seventh():
+                with psycopg.connect(url) as c:
+                    return c.execute("SELECT v FROM ev WHERE id = 7").fetchone()[0]
+            check("asyncpg sends $2::vector by pgvector's codec, as the parameter is described as vector: the row holds [1.5, 2.5, 3.5]",
+                  lambda: seventh() == [1.5, 2.5, 3.5])
     finally:
         if node is not None:
             node.kill()

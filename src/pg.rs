@@ -1935,7 +1935,7 @@ impl ExtendedQueryHandler for Backend {
         }
         let who = self.signed().await?; // (a key lookup's and a plan's types, of what it may read: as whoever signed in)
         let run = async {
-            let inferred = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, self.types(statement))).await;
+            let inferred = crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, self.types(statement, false))).await;
             self.told(client, &user, &bind(portal, inferred)?, &portal.result_column_format).await
         };
         let out = crate::context::carried(statement.found.context.clone(), run).await?;
@@ -1958,7 +1958,7 @@ impl ExtendedQueryHandler for Backend {
             Ok(who) => who,
             Err(e) => return self.noted(&stmt.statement.sql, Err(e)).await,
         };
-        let described = async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) };
+        let described = async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement, true).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) };
         let out = crate::context::carried(stmt.statement.found.context.clone(), crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(who, described))).await; // (its temporary tables too)
         self.noted(&stmt.statement.sql, out).await
     }
@@ -1977,7 +1977,7 @@ impl ExtendedQueryHandler for Backend {
             Err(e) => return self.noted(&sent, Err(e)).await,
         };
         let described = async {
-            let inferred = self.types(statement).await;
+            let inferred = self.types(statement, false).await;
             sent = bind(portal, inferred)?;
             let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &sent, ""), &sent, &portal.result_column_format).await?;
             statement.keep(columns);
@@ -1999,15 +1999,18 @@ impl Backend {
         crate::temp::SESSION.scope(self.named(), crate::auth::WHO.scope(self.who(), failed)).await
     }
 
-    /// A statement's `param_types`, worked out once (`Prepared`).
-    async fn types<'a>(&self, statement: &'a Prepared) -> &'a [Type] {
-        statement.found.types.get_or_init(|| async { self.param_types(&pg_dialect(&self.app.lake, &statement.sql, "")).await }).await
+    /// A statement's `param_types`, worked out once (`Prepared`). `described`: for a Describe of the statement, whose answer
+    /// the client sends its values by (asyncpg's every statement), and the Binds after it read them so.
+    async fn types<'a>(&self, statement: &'a Prepared, described: bool) -> &'a [Type] {
+        statement.found.types.get_or_init(|| async { self.param_types(&pg_dialect(&self.app.lake, &statement.sql, ""), described).await }).await
     }
 
     /// The types of `$1`, `$2`… as the query implies them (`WHERE id = $1`: id's type); text when
-    /// it doesn't say.
-    async fn param_types(&self, sql: &str) -> Vec<Type> {
-        let mut types = self.inferred(sql).await;
+    /// it doesn't say. A row write's are planned only for a Describe (`described`): a Bind with no Describe before it
+    /// (node-postgres, pgbench's -M extended: a Parse for each run) takes its values as text, which the write casts to its
+    /// columns, and pays for no plan.
+    async fn param_types(&self, sql: &str, described: bool) -> Vec<Type> {
+        let mut types = self.inferred(sql, described).await;
         for i in crate::pg_types::params(&self.app.lake, sql, &self.who().scope).await {
             if let Some(t) = types.get_mut(i).filter(|t| **t == Type::TEXT) {
                 *t = Type::UUID; // (a uuid's: asyncpg sends it as one, and `pg_values` takes it as Postgres's text or binary)
@@ -2017,7 +2020,7 @@ impl Backend {
     }
 
     /// `param_types`, but for uuids (`pg_types`), which are text to the planner.
-    async fn inferred(&self, sql: &str) -> Vec<Type> {
+    async fn inferred(&self, sql: &str, described: bool) -> Vec<Type> {
         if let Ok(Some(p)) = crate::serve::point(&self.app.lake, sql, &self.who().scope).await {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
@@ -2026,13 +2029,18 @@ impl Backend {
         if n > 0 {
             arithmetic_types(sql, &mut types); // (an operand of + - * / %: the other operand's type, as Postgres gives it; the plan below still wins)
         }
-        if n > 0 && session_command(sql).is_none() && !crate::set::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
-            let plan = async {
+        // (a row write is planned and never run: DataFusion gives INSERT's VALUES and UPDATE's SET their columns' types,
+        // and a WHERE's what it compares with, so asyncpg sends an int as one. Any other write stays text)
+        use crate::write::Stmt;
+        let write = crate::write::parse(sql);
+        let rows = write.as_ref().is_none_or(|w| described && matches!(w, Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Delete(..)));
+        if n > 0 && rows && session_command(sql).is_none() && !crate::set::is(sql) && Copy::of(sql).is_none() && !crate::script::is(sql) {
+            let fields = async {
                 let sql = crate::routines::expand(&self.app.lake, sql, &self.who().scope).await.ok()?;
-                crate::engine::sql(&self.session(&sql, "").await.ok()?, &crate::sys::planned(&sql).ok()?).await.ok()
+                planned_parameters(&self.session(&sql, "").await.ok()?, &sql, write.is_some()).await
             }.await;
             // (by its field, so one compared with an INET is an inet, which asyncpg then sends as one)
-            for (name, f) in plan.and_then(|df| df.logical_plan().get_parameter_fields().ok()).unwrap_or_default() {
+            for (name, f) in fields.unwrap_or_default() {
                 if let (Some(i @ 1..), Some(f)) = (name.trim_start_matches('$').parse::<usize>().ok(), f) {
                     if i <= n {
                         types[i - 1] = match field_type(&f, FieldFormat::Text).0 {
@@ -2042,6 +2050,9 @@ impl Backend {
                     }
                 }
             }
+        }
+        if n > 0 {
+            cast_types(sql, &mut types); // ($1::vector, CAST($2 AS date): the cast's type, over the plan's, which reads the cast's input untyped)
         }
         types
     }
@@ -2121,6 +2132,17 @@ impl Backend {
         };
         Ok((described(&schema, format), Columns::Kept { schema, given: false }))
     }
+}
+
+/// The fields DataFusion gives `$1`, `$2`… of `sql` in `ctx`: a query's from its plan, and a row write's from its plan, made
+/// and never run (INSERT's VALUES and UPDATE's SET give their columns', a WHERE what it compares with). None where it doesn't plan.
+async fn planned_parameters(ctx: &datafusion::prelude::SessionContext, sql: &str, write: bool) -> Option<std::collections::HashMap<String, Option<datafusion::arrow::datatypes::FieldRef>>> {
+    let sql = crate::sys::planned(sql).ok()?;
+    let plan = match write {
+        true => crate::engine::planned(ctx, &sql).await.ok()?,
+        false => crate::engine::sql(ctx, &sql).await.ok()?.logical_plan().clone(),
+    };
+    plan.get_parameter_fields().ok()
 }
 
 /// Where an unknown parameter is an operand of `+ - * / %` (`$1 * 1000000000000000 + $2`), its type as Postgres gives it: the
@@ -2218,6 +2240,56 @@ fn number_type(n: &str) -> Type {
     }
 }
 
+/// Where a parameter is cast (`$1::vector`, `CAST($2 AS date)`), the cast's type, as Postgres describes such a parameter:
+/// a client then sends its value as that type (asyncpg sends a registered `vector`, pgvector's codec, or a `date` as one).
+/// Written into `types` over what the plan gave, which reads a cast's input as untyped. A type `named_type` doesn't name
+/// is left as found. A parse and a walk, only for a statement that says `::` or CAST.
+fn cast_types(sql: &str, types: &mut [Type]) {
+    if !sql.contains("::") && !crate::text::contains_ci(sql, "cast") {
+        return;
+    }
+    let Some(statement) = crate::pg_types::one(sql) else { return };
+    let _ = crate::walk::visit_expressions(&statement, |e| {
+        if let Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, expr, data_type, .. } = e {
+            if let (Some(t), Some(slot)) = (named_type(data_type), crate::pg_trace::param(expr).and_then(|i| types.get_mut(i))) {
+                *slot = t;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// The Postgres type a cast names, of those a parameter is read as (`bind`, `pg_values`): a number's (`cast_type`), text,
+/// varchar, bool, date, time, timestamp with or without its zone, interval, uuid, json, jsonb, bytea, inet, and pgvector's
+/// `vector`. None for any other type.
+fn named_type(t: &ast::DataType) -> Option<Type> {
+    use ast::{DataType as D, TimezoneInfo as Z};
+    if let Some(t) = cast_type(t) {
+        return Some(t);
+    }
+    Some(match t {
+        D::Text | D::String(_) => Type::TEXT,
+        D::Varchar(_) | D::CharacterVarying(_) => Type::VARCHAR,
+        D::Bool | D::Boolean => Type::BOOL,
+        D::Date => Type::DATE,
+        D::Time(_, Z::None | Z::WithoutTimeZone) => Type::TIME,
+        D::Timestamp(_, Z::WithTimeZone | Z::Tz) => Type::TIMESTAMPTZ,
+        D::Timestamp(..) | D::TimestampNtz(_) => Type::TIMESTAMP,
+        D::Interval { .. } => Type::INTERVAL,
+        D::Uuid => Type::UUID,
+        D::JSON => Type::JSON,
+        D::JSONB => Type::JSONB,
+        D::Bytea => Type::BYTEA,
+        D::Custom(name, _) => match name.to_string().to_lowercase().as_str() {
+            "vector" => crate::pg_values::vector_type(),
+            "inet" => Type::INET,
+            "timestamptz" => Type::TIMESTAMPTZ,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 /// The numeric type a CAST names, as Postgres's casts give it: BIGINT is int8, DOUBLE PRECISION float8, and FLOAT(p) is
 /// real up to 24 digits of precision. None for any other type.
 fn cast_type(t: &ast::DataType) -> Option<Type> {
@@ -2300,6 +2372,53 @@ mod tests {
         for (sql, drops) in cases {
             assert_eq!(said(sql), drops, "{sql}");
         }
+    }
+
+    /// A row write's parameters have its columns' types (INSERT's VALUES, UPDATE's SET) or what a WHERE compares them with, from
+    /// its plan, made and never run: asyncpg sends each value by the type it is told.
+    #[tokio::test]
+    async fn a_writes_parameters_are_its_columns_types() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-params-{}", uuid::Uuid::new_v4()));
+        let lake = crate::store::Lake::open(dir.to_str().unwrap(), true, false, crate::node_state::NodeState::unhosted()).await?;
+        crate::write::create_table(&lake, "users", r#"{"columns": [["id", "Int64"], ["name", "Utf8"], ["score", "Float64"]]}"#).await?;
+        let types = async |sql: &str| -> anyhow::Result<Vec<String>> {
+            let ctx = crate::query::session_for(&lake, sql, "", None, &crate::rights::Scope::everything()).await?;
+            let mut fields: Vec<_> = planned_parameters(&ctx, sql, crate::write::parse(sql).is_some()).await.unwrap_or_default().into_iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(fields.into_iter().map(|(n, f)| format!("{n}:{}", f.map_or("?".into(), |f| f.data_type().to_string()))).collect())
+        };
+        assert_eq!(types("INSERT INTO users VALUES ($1, $2, $3)").await?, ["$1:Int64", "$2:Utf8View", "$3:Float64"]);
+        assert_eq!(types("INSERT INTO users (score, id) VALUES ($1, $2), ($3, $4)").await?, ["$1:Float64", "$2:Int64", "$3:Float64", "$4:Int64"]);
+        assert_eq!(types("UPDATE users SET score = $1 WHERE id = $2").await?, ["$1:Float64", "$2:Int64"]);
+        assert_eq!(types("DELETE FROM users WHERE name = $1").await?, ["$1:Utf8View"]);
+        assert_eq!(types("SELECT name FROM users WHERE id = $1").await?, ["$1:Int64"], "a query's, as before");
+        // (what it costs a statement no client gave types for: node-postgres's every query, pgbench's -M extended)
+        for sql in ["UPDATE users SET score = score + $1 WHERE id = $2", "SELECT score FROM users WHERE id = $1"] {
+            let started = std::time::Instant::now();
+            for _ in 0..200 {
+                types(sql).await?;
+            }
+            eprintln!("typing {sql}: {:?} each", started.elapsed() / 200);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A parameter cast to a type is described as that type, as Postgres describes it: pgvector's `vector`, a date, a bool, a
+    /// zone's timestamp… A type a parameter isn't read as here, and a parameter not cast, are left as found.
+    #[test]
+    fn a_cast_parameter_is_its_casts_type() {
+        let cast = |sql: &str, n: usize| {
+            let mut types = vec![Type::TEXT; n];
+            cast_types(sql, &mut types);
+            types.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(cast("INSERT INTO items (id, embedding) VALUES ($1, $2::vector)", 2), ["text", "vector"]);
+        assert_eq!(cast("SELECT cosine_distance(v, $1::vector(3)), $2::inet FROM t", 2), ["vector", "inet"]);
+        assert_eq!(cast("SELECT * FROM t WHERE d > CAST($1 AS date) AND n = $2::int AND ok = $3::boolean AND id = ($4)::bigint", 4), ["date", "int4", "bool", "int8"]);
+        assert_eq!(cast("SELECT $1::timestamptz, $2::timestamp with time zone, $3::timestamp, $4::jsonb, $5::uuid, $6::interval", 6),
+            ["timestamptz", "timestamptz", "timestamp", "jsonb", "uuid", "interval"]);
+        assert_eq!(cast("SELECT $1::text[], $2 || 'x', $3::varchar", 3), ["text", "text", "varchar"], "an array's cast and no cast: as found");
     }
 
     /// The types of `n` parameters of `sql`, as `arithmetic_types` leaves them (TEXT where nothing says).
