@@ -19,15 +19,23 @@
 //! rows as they are (projections, exchanges, filters), and runs just before DataFusion's `FilterPushdown(Post)`.
 //! `KeysUnused`, just after it, takes away each `KeysExec` that no filter came down to, so other plans are as before.
 //! Neither runs on a spread query's slices (as `EarlyProbes`): `KeysExec` is no operator their analysis knows.
+//!
+//! DataFusion's filter keeps a probe row whose key is NULL, under NULL-equals-NULL (INTERSECT, EXCEPT, IS NOT DISTINCT
+//! FROM), only when its build side's keys hold a NULL, and it asks each key array's `null_count`, which is 0 for an
+//! array of type Null: its nulls aren't stored. So a key that was a bare NULL on both sides dropped every probe row
+//! once the build was in, and `SELECT NULL AS e, k … INTERSECT SELECT NULL AS e, k …` gave its rows or none, by which
+//! side ended first (found by `tools/random_sql.py`). `TypedNulls`, before the joins' sides are picked, gives such a
+//! key a type, BOOLEAN, on both sides: its nulls are then stored, and the join matches as it did.
 
 use datafusion::arrow::array::AsArray;
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DataFusionError, Result, ScalarValue, Statistics};
+use datafusion::arrow::datatypes::{DataType, Schema};
+use datafusion::common::{DataFusionError, NullEquality, Result, ScalarValue, Statistics};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::expressions::Literal;
+use datafusion::physical_expr::expressions::{cast, Literal};
 use datafusion::physical_expr::DynamicFilterTracking;
 use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -302,6 +310,36 @@ impl PhysicalOptimizerRule for KeysUnused {
     }
 }
 
+/// Gives a hash join's bare-NULL keys a type where NULL matches NULL (the module's doc).
+#[derive(Debug)]
+pub struct TypedNulls;
+
+impl PhysicalOptimizerRule for TypedNulls {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|p| {
+            let Some(j) = p.downcast_ref::<HashJoinExec>().filter(|j| j.null_equality() == NullEquality::NullEqualsNull) else { return Ok(Transformed::no(p)) };
+            let (l, r) = (j.left().schema(), j.right().schema());
+            let null = |e: &Arc<dyn PhysicalExpr>, s: &Schema| e.data_type(s).is_ok_and(|t| t == DataType::Null);
+            let bare = |(a, b): &(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)| null(a, &l) && null(b, &r);
+            if !j.on().iter().any(bare) {
+                return Ok(Transformed::no(p));
+            }
+            let typed = |e: &Arc<dyn PhysicalExpr>, s: &Schema| cast(e.clone(), s, DataType::Boolean);
+            let on = j.on().iter().map(|k| if bare(k) { Ok((typed(&k.0, &l)?, typed(&k.1, &r)?)) } else { Ok(k.clone()) }).collect::<Result<_>>()?;
+            Ok(Transformed::yes(j.builder().with_on(on).build_exec()?))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "typed_nulls"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +398,22 @@ mod tests {
         let ((text, rows), (_, plain_rows)) = (plan_and_rows(&ctx, on_value).await, plan_and_rows(&plain, on_value).await);
         assert!(!text.contains("KeysExec"), "no filter comes down through an aggregated value: {text}");
         assert_eq!(rows, plain_rows);
+    }
+
+    /// A key that is a bare NULL on both sides of a join where NULL matches NULL (INTERSECT, EXCEPT) is given a type
+    /// (`TypedNulls`), so the join's dynamic filter keeps the probe rows it matches. It dropped them all once the build
+    /// was in, so an INTERSECT gave its rows or none by which side ended first; with `EarlyProbes` left out the probe
+    /// waits for the build, and the filter is always in.
+    #[tokio::test]
+    async fn a_bare_null_key_keeps_the_rows_it_matches() {
+        let sql = "SELECT count(*) AS n FROM (SELECT NULL AS e, k FROM many WHERE v < 100000 INTERSECT SELECT NULL AS e, k FROM few)";
+        for without in [&[][..], &["EarlyProbes"]] {
+            let ctx = session(without);
+            tables(&ctx);
+            let (text, rows) = plan_and_rows(&ctx, sql).await;
+            assert!(rows.contains("| 3 |"), "the three keys of `few`, without {without:?}: {rows}\n{text}");
+            assert!(text.contains("(CAST(e@0 AS Boolean), CAST(e@0 AS Boolean))"), "{text}");
+        }
     }
 
     /// Rows pass as they are while a filter isn't built (`true`), and a filter whose checks keep most rows stops, while
