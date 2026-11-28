@@ -1169,6 +1169,59 @@ mod tests {
         .await
     }
 
+    /// A MERGE's clauses in one join (`change::one_pass`, zip1128/M1), into a keyed and an append table: each row takes the
+    /// first clause of its kind whose condition holds, a value is worked out only for the rows its clause takes (the
+    /// UPDATE's `t.v / s.x` never sees the DELETE's x = 0), a clause's columns left out take their default, and a target
+    /// row two source rows match is refused (21000; an UPDATE … FROM's words), with nothing written. An upsert of several
+    /// rows takes it too.
+    #[tokio::test]
+    async fn a_merge_answers_as_its_clauses_do_in_one_join() {
+        use datafusion::arrow::array::{Array, AsArray};
+        crate::auth::as_node(async {
+            let (app, marks) = lake_app().await;
+            let node = crate::auth::Principal::node();
+            let run = |sql: String| {
+                let (app, node) = (app.clone(), node.clone());
+                async move {
+                    let stmt = crate::write::parse(&sql).unwrap_or_else(|| panic!("{sql}: not a statement"));
+                    crate::write::on_node(&app, stmt, None, &node).await.map(|_| ()).map_err(|e| (crate::codes::of(&e).to_string(), format!("{e:#}")))
+                }
+            };
+            let rows = |t: &str| {
+                let (app, node, sql) = (app.clone(), node.clone(), format!("SELECT CAST(id AS TEXT) || ':' || coalesce(CAST(v AS TEXT), '-') || ':' || coalesce(s, '-') AS r FROM {t} ORDER BY id"));
+                async move {
+                    let b = app.query(&sql, Some("0"), &node.scope).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+                    b.iter().flat_map(|b| { let c = datafusion::arrow::compute::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8).unwrap(); (0..c.len()).map(move |i| c.as_string::<i32>().value(i).to_string()).collect::<Vec<_>>() }).collect::<Vec<_>>()
+                }
+            };
+            for (t, key) in [("k", " PRIMARY KEY"), ("a", "")] {
+                run(format!("CREATE TABLE {t} (id BIGINT{key}, v BIGINT, s TEXT DEFAULT 'none')")).await.unwrap();
+                run(format!("INSERT INTO {t} VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')")).await.unwrap();
+                let merge = format!("MERGE INTO {t} USING (VALUES (1, 0), (2, 5), (3, 7), (5, 0), (6, 9)) AS s(id, x) ON {t}.id = s.id \
+                    WHEN MATCHED AND s.x = 0 THEN DELETE WHEN MATCHED THEN UPDATE SET v = {t}.v / s.x \
+                    WHEN NOT MATCHED AND s.x > 0 THEN INSERT VALUES (s.id, s.x, 'new') WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)");
+                run(merge).await.unwrap_or_else(|e| panic!("{t}: {e:?}"));
+                assert_eq!(rows(t).await, ["2:4:b", "3:4:c", "4:40:d", "5:-:none", "6:9:new"], "{t}");
+                for (twice, code, words) in [
+                    (format!("MERGE INTO {t} USING (VALUES (2), (2)) AS s(id) ON {t}.id = s.id WHEN MATCHED THEN UPDATE SET v = 0 WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"), "21000", "MERGE command cannot affect row a second time"),
+                    (format!("MERGE INTO {t} USING (VALUES (3, 1), (3, 2)) AS s(id, x) ON {t}.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.x, 'z')"), "21000", "MERGE command cannot affect row a second time"),
+                    (format!("UPDATE {t} SET v = 0 FROM (VALUES (4), (4)) AS s(id) WHERE {t}.id = s.id"), "", "matches more than one source row"),
+                    // (a NOT MATCHED clause sees the source alone: the target's columns aren't NULL there, they aren't in scope)
+                    (format!("MERGE INTO {t} USING (VALUES (8, 1)) AS s(id, x) ON {t}.id = s.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (s.id, {t}.v, 'z')"), "", "No field named"),
+                ] {
+                    let (got, why) = run(twice.clone()).await.expect_err(&twice);
+                    assert!(why.contains(words) && (code.is_empty() || got == code), "{twice}: {got} {why}");
+                }
+                assert_eq!(rows(t).await, ["2:4:b", "3:4:c", "4:40:d", "5:-:none", "6:9:new"], "{t}: nothing written");
+            }
+            run("INSERT INTO k VALUES (2, 1, 'u'), (4, 2, 'u'), (7, 7, 'n') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, s = EXCLUDED.s WHERE k.v > 10".into()).await.unwrap();
+            assert_eq!(rows("k").await, ["2:4:b", "3:4:c", "4:2:u", "5:-:none", "6:9:new", "7:7:n"]);
+            marks.abort();
+            crate::memory_lake::forget_memory(&app.lake.url);
+        })
+        .await
+    }
+
     /// A table's JSON column is marked as one where queries plan over it (`TableMeta::read_schema`, step 5 piece 14c,
     /// E1): from its rows in memory and from its files, and through a view. Every write that
     /// reads the table back (an UPDATE, a DELETE, an INSERT … SELECT from itself, a CREATE TABLE AS, a tiering round, a
