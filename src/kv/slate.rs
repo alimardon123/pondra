@@ -239,9 +239,12 @@ async fn collect(mut it: slatedb::DbIterator) -> Result<BTreeMap<String, Bytes>,
 }
 
 /// The catalog's own object cache: on the SSD tier beside the lake's objects when there is one (`cache_dir`), and none
-/// without it (SlateDB caches nothing with no root folder).
+/// without it (SlateDB caches nothing with no root folder). Its folder is scanned once, when the catalog opens, not every
+/// hour too: SlateDB's hourly scan outlives the database it was opened with, and holds the cache's open files (up to a
+/// thousand) with it, so a process that opened lakes again and again ran out of files (the nightly sim, from 11-23).
+/// What this process writes to the cache it counts as it writes; the scan only finds what another process left there.
 fn object_cache(cache_dir: Option<PathBuf>) -> ObjectStoreCacheOptions {
-    ObjectStoreCacheOptions { root_folder: cache_dir, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() }
+    ObjectStoreCacheOptions { root_folder: cache_dir, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, scan_interval: None, ..Default::default() }
 }
 
 /// The catalog's blocks kept in memory: 32 MB of data and 32 MB of indexes and filters. SlateDB's
@@ -377,5 +380,46 @@ async fn unpin(store: Store) {
                 let _ = admin.delete_checkpoint(c.id).await;
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// The files of the catalog's object cache that this process holds open (`/proc/self/fd`).
+    fn open_under(dir: &std::path::Path) -> usize {
+        let fds = std::fs::read_dir("/proc/self/fd").into_iter().flatten().flatten();
+        fds.filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to.starts_with(dir))).count()
+    }
+
+    /// A catalog closed lets go of its object cache's files. SlateDB's rescan of the cache folder (every hour) outlived
+    /// the database it was opened with and held its open files with it, so a process that opened lakes again and again
+    /// (the library form, the sim's guests) kept a few more files each time, until it could open none (the nightly sim).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_catalog_keeps_none_of_its_cache_files_open() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-cache-files-{}", uuid::Uuid::new_v4()));
+        let (bucket, cache) = (dir.join("bucket"), dir.join("cache"));
+        std::fs::create_dir_all(&bucket)?;
+        let store: Store = Arc::new(crate::store::Local(object_store::local::LocalFileSystem::new_with_prefix(&bucket)?));
+        let mut held = vec![];
+        for round in 0..3 {
+            let w = Writer::open(store.clone(), Some(cache.clone()), false, crate::node_state::NodeState::unhosted()).await?;
+            w.write(&[(format!("k/{round}"), Bytes::from_static(b"v"))], &[]).await?.durable().await?;
+            w.checkpoint().await?; // (into a file of the catalog's, which the cache keeps)
+            w.close().await?;
+            let r = Reader::open(store.clone(), false, Some(cache.clone()), Duration::from_secs(1)).await?;
+            assert_eq!(r.scan(b"k/".to_vec()..b"k0".to_vec(), false).await?.len(), round + 1, "round {round}: what was written is read");
+            held.push(open_under(&cache)); // (the reader's files, before it closes)
+            r.close().await?;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while open_under(&cache) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(held.iter().any(|&n| n > 0), "the readers read through the cache, holding {held:?} of its files");
+        assert_eq!(open_under(&cache), 0, "closed, the catalogs hold none of the cache's files (open while reading: {held:?})");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }
