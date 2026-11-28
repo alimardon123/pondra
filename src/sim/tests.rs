@@ -2,7 +2,7 @@
 //! (`PONDRA_SIM_SEED` runs one alone). The harness's own copies (tools/harness.py) stay for what the sim can't be: real
 //! processes, sockets and buckets.
 use super::cluster::Cluster;
-use super::faults::Odds;
+use super::faults::{Faults, Odds};
 use crate::terms::LEASE;
 use std::time::Duration;
 
@@ -685,7 +685,8 @@ async fn row_locks_through_a_follower_wait_time_out_and_go_with_a_killed_followe
         assert!(waited < Duration::from_secs(90), "seed {seed}: the waiter got the row {waited:?} after the kill, a lease being 60 s\n{}", c.met());
         let inside = in_session(&c, 2, "waiter-03", "SELECT v FROM held WHERE id = 1").await;
         assert_eq!(rows(&inside), vec![serde_json::json!({"v": 11})], "seed {seed}: v as the waiter's transaction sees it: {inside}\n{}", c.met());
-        assert_eq!(c.code_in(2, "waiter-03", "COMMIT").await, "ok", "seed {seed}\n{}", c.met());
+        let done = in_session(&c, 2, "waiter-03", "COMMIT").await;
+        assert_eq!(done["transaction"], "commit", "seed {seed}: the waiter's COMMIT answered {done}\n{}", c.met());
         let v = c.sql(0, "SELECT v FROM held WHERE id = 1").await.unwrap();
         assert_eq!(rows(&v), vec![serde_json::json!({"v": 11})], "seed {seed}: v on member 1 after the waiter's COMMIT (10, and the waiter's 1; the killed holder's never lands)\n{}", c.met());
         println!(
@@ -736,5 +737,53 @@ async fn a_task_graph_through_a_leader_stop_writes_each_row_once() {
         let statuses = serde_json::Value::Array(rows(&runs).iter().map(|r| r["status"].clone()).collect());
         assert_eq!(statuses, serde_json::json!(["ok", "ok", "ok"]), "seed {seed}: the runs of the graph on member {}\n{}", lead + 1, c.met());
         println!("seed {seed}: member 1 {} stopped; member {} led at the end; flog {flog}; runs {statuses}", if c.up(0) { "was not" } else { "was" }, lead + 1);
+    }
+}
+
+/// A round trip to a far bucket (`Faults::far`): 50 ms, as `tools/faulty_s3.py`'s `slow_ms` sets it to measure one.
+const TRIP: Duration = Duration::from_millis(50);
+
+/// How many bucket calls one after another `f` waited on: its time on the sim's clock in round trips of `TRIP`, rounded
+/// up. Calls made side by side count once.
+/// The calls themselves, each with when it went, are what `faults` (the far one's) shows from then on (`Faults::trips`).
+async fn chain<T>(faults: &Faults, f: impl std::future::Future<Output = T>) -> (u128, Vec<String>, T) {
+    let began = crate::clock::now();
+    let out = f.await;
+    (began.elapsed().as_millis().div_ceil(TRIP.as_millis()), faults.trips(began), out)
+}
+
+/// Review pick O1 (11-27, with `li1030/A4`): with the bucket 50 ms away, a cold `pondra sql` SELECT, a node's start on a
+/// lake that's there, and the node's first and second SELECT each wait on only so many bucket calls one after another.
+/// A change that makes one of these chains longer fails here: each call more is 30 to 100 ms more on R2.
+#[tokio::test(start_paused = true)]
+async fn a_cold_open_waits_on_few_bucket_calls_one_after_another() {
+    // (the most each may wait on: the chains measured on 11-28; a change that shortens one lowers its cap here)
+    // (`PONDRA_SIM_TRIPS=1` shows each chain's calls, each with when it went)
+    const CAPS: [(&str, u128); 4] = [("a cold pondra sql SELECT", 30), ("a node's start", 19), ("its first SELECT", 0), ("its second SELECT", 0)];
+    for seed in seeds() {
+        let c = Cluster::new(seed, 1);
+        c.guest(0, "CREATE TABLE t (id BIGINT)", "made").await.unwrap();
+        c.guest(0, "INSERT INTO t VALUES (1), (2), (3)", "rows").await.unwrap();
+        c.guest_faults(1).far(TRIP);
+        c.faults(0).far(TRIP);
+        let select = "SELECT count(*) AS n FROM t";
+        let three = |a: &serde_json::Value| rows(a).first().and_then(|r| r["n"].as_i64()) == Some(3);
+        let (guest, guest_calls, answer) = chain(&c.guest_faults(1), c.guest(1, select, "read")).await;
+        let answer = answer.unwrap();
+        assert!(three(&answer), "seed {seed}: the cold pondra sql SELECT answered {answer}\n{}", c.met());
+        let (start, start_calls, started) = chain(c.faults(0), c.start(0)).await;
+        started.unwrap();
+        let (first, first_calls, a) = chain(c.faults(0), c.sql(0, select)).await;
+        let (second, second_calls, b) = chain(c.faults(0), c.sql(0, select)).await;
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(three(&a) && three(&b), "seed {seed}: the node's SELECTs answered {a} and {b}\n{}", c.met());
+        let chains = [(guest, guest_calls), (start, start_calls), (first, first_calls), (second, second_calls)];
+        for ((what, cap), (n, calls)) in CAPS.iter().zip(&chains) {
+            if crate::env::flag("PONDRA_SIM_TRIPS") {
+                println!("seed {seed}: {what}: {n} bucket calls one after another, of these:\n{}", calls.join("\n"));
+            }
+            assert!(n <= cap, "seed {seed}: {what} waited on {n} bucket calls one after another, more than its {cap}; the calls, each with when it went:\n{}\n{}", calls.join("\n"), c.met());
+        }
+        println!("seed {seed}: bucket calls one after another, 50 ms each: a cold pondra sql SELECT {guest}, a node's start {start}, its first SELECT {first}, its second {second}");
     }
 }
