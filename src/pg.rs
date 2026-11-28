@@ -425,7 +425,7 @@ impl StartupHandler for Startup {
             PgWireFrontendMessage::PasswordMessageFamily(m) if *self.plain.lock().await => {
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
                 let password = m.into_password()?.password;
-                let token = crate::users::is_token(&user, &password) || app.auth.token_role(&password) > crate::auth::Role::None;
+                let token = crate::users::is_token(&app.auth, &user, &password); // (a session's `ps_` too: 11-22 audit H1)
                 // (a user's password crosses only TLS from another machine; a token may, as `tls.rs` says)
                 if !token && !crate::tls::may_send_password(secure, at) {
                     return Err(fatal(crate::tls::PASSWORD_PLAIN.into()));
@@ -436,6 +436,8 @@ impl StartupHandler for Startup {
                     Ok(who) => who,
                     Err(r) => return Err(said_no(&user, r)),
                 };
+                // (a token signs in its own principal whatever the name, and is signed in with again: never the name's own
+                // rights, which a passwordless user's empty verifier would match, 11-22 audit H1)
                 let again = match token {
                     true => Again::Token { user: user.clone(), token: password.clone() },
                     false => Again::User { verifier: crate::users::verifier(&app.lake, &user).await, user: user.clone() },
@@ -794,6 +796,11 @@ impl Backend {
         let Some(again) = self.again.lock().unwrap().clone() else { return Ok(who) };
         match Box::pin(who.again(&self.app, || self.sign_in_again(again))).await { // (boxed: a statement's future doesn't carry a sign-in's)
             None => Ok(who),
+            // (signed in again, it is whom it was: a connection never takes another principal's rights, 11-22 audit H1)
+            Some(Ok(p)) if p.name != who.name => {
+                *self.who.lock().unwrap() = None;
+                Err(fatal(who.signed_out(&format!("it now signs in {} where it signed in {}", p.name, who.name))))
+            }
             Some(Ok(p)) => {
                 *self.who.lock().unwrap() = Some(p.clone());
                 Ok(p)
@@ -817,8 +824,9 @@ impl Backend {
                 Some(p) => Ok(p),
                 None => Err(crate::sso::why(lake, token).await.unwrap_or_else(|| "its token was revoked or has expired".into())),
             },
+            // (a password signed it in, so it had a verifier: none now, or none then, signs no one in)
             Again::User { user, verifier } => match crate::users::verifier(lake, user).await {
-                v if v == *verifier => crate::users::principal(lake, user).await.map_err(|e| format!("{e:#}")),
+                Some(v) if Some(&v) == verifier.as_ref() => crate::users::principal(lake, user).await.map_err(|e| format!("{e:#}")),
                 None => Err("it can't sign in any more (dropped, or NOLOGIN)".into()),
                 Some(_) => Err("its password was changed".into()),
             },

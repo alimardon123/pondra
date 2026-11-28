@@ -120,7 +120,8 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     // publish (a DDL or a writer's commit) still sees them.
     let done = futures::future::join_all(changed.iter().map(|(key, meta)| async move {
         let table = &key[2..];
-        let formats = futures::future::join_all(meta.publish.iter().filter(|f| refused(meta, f).is_none()).map(|format| async move {
+        // (not as Iceberg while its struct columns' files wait to be checked for their fields' ids: `tier::unchecked`)
+        let formats = futures::future::join_all(meta.publish.iter().filter(|f| refused(meta, f).is_none() && !(*f == "iceberg" && crate::tier::unchecked(meta))).map(|format| async move {
             match format.as_str() {
                 "delta" => publish(lake, table, meta).await,
                 _ => crate::iceberg::publish(lake, table, meta, named.iter().find(|n| n.table == table)).await,
@@ -470,7 +471,9 @@ pub fn protocol(schema: &str, vectors: bool) -> Value {
 
 pub fn metadata(id: &str, table: &str, schema: &str, now: u64, vectors: bool) -> Value {
     // (column mapping by name: the files' columns are the fields' physical names)
-    let ids = serde_json::from_str::<Value>(schema).ok().and_then(|s| s["fields"].as_array().map(|f| f.iter().filter_map(|f| f["metadata"][MAPPING_ID].as_u64()).max()));
+    // (a struct's fields' ids too: `maxColumnId` is past every field's)
+    let deepest = |f: &Value| f["metadata"][MAPPING_ID].as_u64().into_iter().chain(f["type"]["fields"].as_array().into_iter().flatten().filter_map(|f| f["metadata"][MAPPING_ID].as_u64())).max();
+    let ids = serde_json::from_str::<Value>(schema).ok().and_then(|s| s["fields"].as_array().map(|f| f.iter().filter_map(deepest).max()));
     let mut configuration = match ids.flatten() {
         Some(max) => json!({"delta.columnMapping.mode": "name", "delta.columnMapping.maxColumnId": max.to_string()}),
         None => json!({}),
@@ -497,6 +500,10 @@ fn table_schema(meta: &TableMeta, mapped: bool) -> Option<String> {
     let mut schema: Value = serde_json::from_str(&schema_string(&live.iter().map(|c| (c.name.clone(), c.dtype.clone())).collect::<Vec<_>>())?).ok()?;
     for (f, c) in schema["fields"].as_array_mut()?.iter_mut().zip(&live) {
         f["metadata"] = json!({(MAPPING_ID): c.id, "delta.columnMapping.physicalName": c.stored});
+        // (a struct's fields too, as column mapping asks of every field: their ids `column::field_id`, the files' names theirs)
+        for (k, field) in f.get_mut("type").and_then(|t| t.get_mut("fields")).and_then(Value::as_array_mut).into_iter().flatten().enumerate() {
+            field["metadata"] = json!({(MAPPING_ID): crate::column::field_id(c.id, k), "delta.columnMapping.physicalName": field["name"].clone()});
+        }
     }
     Some(schema.to_string())
 }
@@ -589,6 +596,11 @@ pub fn schema_string(columns: &[(String, String)]) -> Option<String> {
             // A list column (an embedding, say): Delta's array type.
             let element = element(&item)?;
             return Some(json!({"name": name, "type": {"type": "array", "elementType": element, "containsNull": true}, "nullable": true, "metadata": {}}));
+        }
+        if let Some(fs) = crate::column::struct_fields_of(t) {
+            // A struct column (a FILE): Delta's struct type, one level (`column::struct_fields`).
+            let each = fs.iter().map(|(n, t, nullable)| Some(json!({"name": n, "type": element(t)?, "nullable": nullable, "metadata": {}})));
+            return Some(json!({"name": name, "type": {"type": "struct", "fields": each.collect::<Option<Vec<_>>>()?}, "nullable": true, "metadata": {}}));
         }
         let t = match t.as_str() {
             "Int64" => "long",

@@ -158,7 +158,11 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
                 _ => w.who.clone(),
             };
             let scope = who.scope.clone();
-            let rows = crate::temp::SESSION.scope(crate::temp::named(&w.app.lake, w.session.clone()), crate::auth::WHO.scope(who, crate::context::carried(w.context.clone(), w.app.query(&w.sql, None, &scope)))).await.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
+            // (its rows are the answer this door sends, which MAX_ROWS cuts as every door's: 11-22 audit M1; the line says where)
+            let answer = crate::app::answering(w.app.query(&w.sql, None, &scope));
+            let batches = crate::temp::SESSION.scope(crate::temp::named(&w.app.lake, w.session.clone()), crate::auth::WHO.scope(who, crate::context::carried(w.context.clone(), answer))).await;
+            let cut = batches.as_ref().ok().and_then(|b| b.first()).and_then(|b| crate::answer::cut_at(b.schema_ref())).map_or(String::new(), |n| format!(",\"cut\":{n}"));
+            let rows = batches.and_then(|b| crate::answer::render(&b, None, &|rows| crate::pages::keep(&w.app.lake, rows)));
             let rows = match rows {
                 Ok(r) => r,
                 Err(e) => return Some((Ok(error(e, &w.tag, scope.shows_code())), None)),
@@ -168,7 +172,7 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
                 continue; // (the same answer: nothing to send)
             }
             w.answer = Some(hash);
-            let line = [format!("{{{}\"at\":{},\"rows\":", w.tag, w.seen).as_bytes(), &rows, b"}\n"].concat();
+            let line = [format!("{{{}\"at\":{}{cut},\"rows\":", w.tag, w.seen).as_bytes(), &rows, b"}\n"].concat();
             return Some((Ok(line.into()), Some(w)));
         }
     })

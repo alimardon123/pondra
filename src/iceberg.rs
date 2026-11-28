@@ -575,9 +575,11 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
     // (a renamed column by both names: Pondra's files keep the stored one, other writers write SQL's)
     let known = |c: &crate::column::Column| if c.name == c.stored { json!([c.stored]) } else { json!([c.name, c.stored]) };
-    let mut names: Vec<Value> = list.all().iter().map(|c| match crate::answer::list_item(&c.dtype).is_some() {
-        true => json!({"field-id": c.id, "names": known(c), "fields": [{"field-id": crate::column::ELEMENTS + c.id, "names": ["item", "element"]}]}),
-        false => json!({"field-id": c.id, "names": known(c)}),
+    // (a struct's fields by their names, each with its id: `column::field_id`)
+    let mut names: Vec<Value> = list.all().iter().map(|c| match (crate::answer::list_item(&c.dtype).is_some(), crate::column::struct_fields_of(&c.dtype)) {
+        (true, _) => json!({"field-id": c.id, "names": known(c), "fields": [{"field-id": crate::column::ELEMENTS + c.id, "names": ["item", "element"]}]}),
+        (false, Some(fs)) => json!({"field-id": c.id, "names": known(c), "fields": fs.iter().enumerate().map(|(k, (n, _, _))| json!({"field-id": crate::column::field_id(c.id, k), "names": [n]})).collect::<Vec<_>>()}),
+        (false, None) => json!({"field-id": c.id, "names": known(c)}),
     }).collect();
     // The files also hold the rows' system columns (`sys.rs`), which the schema leaves out: named
     // too (ids of their own, never the schema's), so a reader that maps a file's every column by
@@ -587,7 +589,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
     let current = &snapshots[snapshots.len() - 1].0["snapshot-id"];
     json!({
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{folder}")),
-        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": crate::column::last_id(list.all().iter().map(|c| (c.id, crate::answer::list_item(&c.dtype).is_some()))),
+        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": crate::column::last_id(list.all().iter().map(|c| (c.id, c.dtype.as_str()))),
         "current-schema-id": 0, "schemas": [schema],
         "default-spec-id": layout.id_of(layout.spec), "last-partition-id": layout.last_field(),
         "partition-specs": std::iter::once(json!({"spec-id": 0, "fields": []})).chain(layout.published().map(|(id, parts)| json!({"spec-id": id, "fields": spec_of(parts)}))).collect::<Vec<_>>(),
@@ -606,7 +608,7 @@ pub fn empty(location: &str, columns: &[(String, String)], now: u64) -> Option<V
     let fields = fields(&TableMeta::with_columns(columns.to_vec()))?;
     Some(json!({
         "format-version": 2, "table-uuid": uuid::Uuid::new_v4().to_string(), "location": location,
-        "last-sequence-number": 0, "last-updated-ms": now, "last-column-id": crate::column::last_id(columns.iter().enumerate().map(|(i, (_, t))| (i as u32 + 1, crate::answer::list_item(t).is_some()))),
+        "last-sequence-number": 0, "last-updated-ms": now, "last-column-id": crate::column::last_id(columns.iter().enumerate().map(|(i, (_, t))| (i as u32 + 1, t.as_str()))),
         "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
         "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "last-partition-id": 999,
         "default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
@@ -641,10 +643,15 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
             },
         })
     };
-    // A list column (an embedding, say) needs an id for its elements too: `column::ELEMENTS` past the column's.
-    let kind = |id: u32, t: &str| match crate::answer::list_item(t) {
-        Some(item) => Some(json!({"type": "list", "element-id": crate::column::ELEMENTS + id, "element": iceberg(&item)?, "element-required": false})),
-        None => Some(Value::String(iceberg(t)?)),
+    // A list column (an embedding, say) needs an id for its elements too: `column::ELEMENTS` past the column's. A struct (a
+    // FILE) one for each of its fields, by its place: `column::field_id`.
+    let kind = |id: u32, t: &str| match (crate::answer::list_item(t), crate::column::struct_fields_of(t)) {
+        (Some(item), _) => Some(json!({"type": "list", "element-id": crate::column::ELEMENTS + id, "element": iceberg(&item)?, "element-required": false})),
+        (None, Some(fs)) => {
+            let each = fs.iter().enumerate().map(|(k, (n, t, nullable))| Some(json!({"id": crate::column::field_id(id, k), "name": n, "required": !nullable, "type": iceberg(t)?})));
+            Some(json!({"type": "struct", "fields": each.collect::<Option<Vec<_>>>()?}))
+        }
+        (None, None) => Some(Value::String(iceberg(t)?)),
     };
     // (listed in SQL's order: a field is known by its id, wherever it is listed; a key's are required, as identifier fields)
     list.sql().filter(|c| !meta.marker(&c.stored)).map(|c| Some(json!({"id": c.id, "name": c.name, "required": meta.key.contains(&c.stored), "type": kind(c.id, &c.dtype)?}))).collect()
@@ -1399,7 +1406,23 @@ mod tests {
         let f = fields(&meta).unwrap();
         assert_eq!((element(&meta), f[2]["id"].as_u64()), (Some(500_001), Some(3)));
         let list = meta.column_list();
-        assert_eq!(crate::column::last_id(list.all().iter().map(|c| (c.id, crate::answer::list_item(&c.dtype).is_some()))), 500_001);
+        assert_eq!(crate::column::last_id(list.all().iter().map(|c| (c.id, c.dtype.as_str()))), 500_001);
+    }
+
+    /// A struct's fields (a FILE's path, version and content type) have ids of their own, by their places, which stay when a
+    /// column is added and meet no other id; one with a struct or list in it isn't carried yet.
+    #[test]
+    fn a_structs_field_ids_stay_when_a_column_is_added() {
+        let file = crate::answer::type_name(&crate::column_types::stored("file").unwrap());
+        let mut meta = TableMeta::made(crate::store::Made { columns: vec![("id".into(), "Int32".into()), ("photo".into(), file)], ..Default::default() });
+        let ids = |meta: &TableMeta| fields(meta).unwrap()[1]["type"]["fields"].as_array().unwrap().iter().map(|f| (f["id"].as_u64().unwrap(), f["name"].as_str().unwrap().to_string(), f["required"].as_bool().unwrap())).collect::<Vec<_>>();
+        let want = vec![(2_002_000, "path".to_string(), true), (2_002_001, "version".to_string(), false), (2_002_002, "content_type".to_string(), false)];
+        assert_eq!(ids(&meta), want);
+        meta.add_column("w", "Int32", None, None);
+        assert_eq!((ids(&meta), fields(&meta).unwrap()[2]["id"].as_u64()), (want, Some(3)));
+        let list = meta.column_list();
+        assert_eq!(crate::column::last_id(list.all().iter().map(|c| (c.id, c.dtype.as_str()))), 2_002_002);
+        assert!(!carries("Struct(\"a\": Struct(\"b\": Int32))") && !carries("Struct(\"a\": Int32)[]") && carries("Struct(\"a\": Int32)"));
     }
 
     /// A version lets go of a file only when none of its own is that file: a file moved between our manifests and the

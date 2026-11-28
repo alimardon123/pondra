@@ -209,7 +209,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, owner, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), crate::rules::create::identity_default(&i.sequence));
             }
-            { let mut entry = TableMeta::made(crate::store::Made { columns, not_null, defaults, identity, enums, sql_types, ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = publish.unwrap_or_else(default_publish); entry.cluster = cluster.unwrap_or_default(); entry.ttl = ttl; entry.partition = partition.filter(|p| !p.is_empty()); entry.order = order; entry.checks = checks; entry.constraints = constraints; entry.folder = folder; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.made_by = made_by; entry.ids = true; entry.properties = properties.unwrap_or_default(); entry.retention_secs = retention; entry.file_format = file_format.unwrap_or_default(); entry }
+            { let mut entry = TableMeta::made(crate::store::Made { columns, not_null, defaults, identity, enums, sql_types, ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = publish.unwrap_or_else(default_publish); entry.cluster = cluster.unwrap_or_default(); entry.ttl = ttl; entry.partition = partition.filter(|p| !p.is_empty()); entry.order = order; entry.checks = checks; entry.constraints = constraints; entry.folder = folder; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.made_by = made_by; entry.ids = true; entry.struct_ids = true; entry.properties = properties.unwrap_or_default(); entry.retention_secs = retention; entry.file_format = file_format.unwrap_or_default(); entry }
         }
         Some(mut m) => {
             // (a CREATE TABLE … AS SELECT's definition is sent again only under the job that made the table: the same
@@ -1513,7 +1513,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     if lake.cat.get::<u64>(&producer_key(&format!("job:{}", f.job))).await?.is_some() {
         return Ok(j!({"duplicate": true})); // the same job finished concurrently
     }
-    let new = { let mut entry = TableMeta::with_columns(f.columns.clone()); entry.publish = default_publish(); entry.ids = true; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
+    let new = { let mut entry = TableMeta::with_columns(f.columns.clone()); entry.publish = default_publish(); entry.ids = true; entry.struct_ids = true; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
     let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::answer::dtype(t).map(|t| crate::answer::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();

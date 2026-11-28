@@ -152,12 +152,15 @@ impl Attempt<'_> {
         }
     }
 
-    /// A credential that signed nobody in, refused: counted against its name from this address when it is a password (a
-    /// token in its place is never checked as one, so it guesses at none), audited, and said: `why` when a token said it
-    /// (`Tried::Nobody`).
+    /// A credential that signed nobody in, refused: counted against its name from this address when it was checked as the
+    /// name's password: any password, and a token's form too for a user who has one (`users::sign_in` tries it as theirs,
+    /// 11-22 audit L1). A token in a token-only user's place guesses at nothing, so it isn't counted (invariant 381). Then
+    /// audited, and said: `why` when a token said it (`Tried::Nobody`).
     pub async fn refuse(&self, credential: &Credential, why: Option<String>) -> Refusal {
         if let Credential::Password { user, password } = credential {
-            if !crate::users::token_form(&self.app.auth, password) {
+            let checked = !crate::users::token_form(&self.app.auth, password)
+                || (!crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&self.app.lake, user).await.is_some());
+            if checked {
                 crate::auth::guessed(&self.app.lake, self.client, user);
             }
         }
