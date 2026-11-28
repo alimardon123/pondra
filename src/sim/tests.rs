@@ -759,7 +759,7 @@ async fn chain<T>(faults: &Faults, f: impl std::future::Future<Output = T>) -> (
 async fn a_cold_open_waits_on_few_bucket_calls_one_after_another() {
     // (the most each may wait on: the chains measured on 11-28; a change that shortens one lowers its cap here)
     // (`PONDRA_SIM_TRIPS=1` shows each chain's calls, each with when it went)
-    const CAPS: [(&str, u128); 4] = [("a cold pondra sql SELECT", 8), ("a node's start", 19), ("its first SELECT", 0), ("its second SELECT", 0)];
+    const CAPS: [(&str, u128); 4] = [("a cold pondra sql SELECT", 8), ("a node's start", 18), ("its first SELECT", 0), ("its second SELECT", 0)];
     for seed in seeds() {
         let c = Cluster::new(seed, 1);
         c.guest(0, "CREATE TABLE t (id BIGINT)", "made").await.unwrap();
