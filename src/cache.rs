@@ -164,6 +164,7 @@ pub struct CachedStore {
     lakes: std::sync::RwLock<Vec<String>>, // the prefix of each lake read through it (`a/b/`, or `` at the bucket's root)
     id: String, // (this store, in the keys of `OUTSIDE`)
     blocks: Arc<tokio::sync::Semaphore>, // the blocks (and pieces) in flight from it at once (`side_by_side`)
+    flights: Mutex<std::collections::HashMap<String, Arc<tokio::sync::OnceCell<Entry>>>>, // a lake file's ranges being fetched, by key (`in_flight`)
 }
 
 /// A file outside the lakes is read in blocks of this size (`in_blocks`), and a longer range of a lake's file not on this
@@ -193,14 +194,14 @@ impl Charged for CachedStore {
 impl CachedStore {
     pub fn new(inner: Arc<dyn object_store::ObjectStore>, max_bytes: usize, disk: Option<(Arc<Disk>, String)>, prefix: &str) -> Self {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let this = Self { inner, cache: Mutex::new(ByteLru::new(max_bytes)), disk, lakes: Default::default(), id, blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) };
+        let this = Self { inner, cache: Mutex::new(ByteLru::new(max_bytes)), disk, lakes: Default::default(), id, blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)), flights: Default::default() };
         this.add_lake(prefix);
         this
     }
 
     /// A store of files outside any lake (a bucket `CREATE SECRET` covers, a web server).
     pub fn files(inner: Arc<dyn object_store::ObjectStore>) -> Self {
-        Self { inner, cache: Mutex::new(ByteLru::new(0)), disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string(), blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) }
+        Self { inner, cache: Mutex::new(ByteLru::new(0)), disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string(), blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)), flights: Default::default() }
     }
 
     /// The bytes of objects' ranges held in memory now (at most `max_bytes`).
@@ -361,6 +362,27 @@ impl CachedStore {
         drop(left); // (let go of outside the lock)
     }
 
+    /// A miss of `key`, fetched once however many miss it at once: the first one fetches and keeps it in memory, and the
+    /// others wait for it and take its bytes. (li1030/A1: with 4 TPC-H clients started cold on a bucket paced like R2, a
+    /// quarter of the bytes fetched were a range already on its way; one client alone, 5%.) A fetch that fails is
+    /// tried again by the next one waiting, as each tried its own before.
+    async fn in_flight<F: std::future::Future<Output = Result<Entry>>>(&self, key: String, fetch: impl FnOnce() -> F) -> Result<Entry> {
+        let flight = self.flights.lock().unwrap().entry(key.clone()).or_default().clone();
+        let got = flight
+            .get_or_try_init(|| async {
+                let entry = fetch().await?;
+                self.keep(key.clone(), entry.clone()); // (before the flight ends: a miss after it finds the bytes kept)
+                Ok::<_, Error>(entry)
+            })
+            .await
+            .cloned();
+        let mut flights = self.flights.lock().unwrap();
+        if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
+            flights.remove(&key);
+        }
+        got
+    }
+
     async fn fetch(&self, location: &Path, range: Option<GetRange>, head: bool) -> Result<Entry> {
         if let (Some(GetRange::Bounded(r)), false) = (&range, head) {
             if r.end - r.start > BLOCK {
@@ -430,11 +452,7 @@ impl ObjectStore for CachedStore {
         };
         let entry = match hit {
             Some(entry) => entry,
-            None => {
-                let entry = self.fetch(location, options.range, options.head).await?;
-                self.keep(key, entry.clone());
-                entry
-            }
+            None => self.in_flight(key, || self.fetch(location, options.range, options.head)).await?,
         };
         Ok(result(entry))
     }
@@ -486,6 +504,40 @@ mod tests {
         let path = Path::from("lk/data/t/a.parquet");
         for r in [5..size - 3, BLOCK - 1..2 * BLOCK + 2, 0..BLOCK + 1, 0..size, 10..20] {
             assert_eq!(store.get_range(&path, r.clone()).await?, Bytes::copy_from_slice(&data[r.start as usize..r.end as usize]), "{r:?}");
+        }
+        Ok(())
+    }
+
+    /// Misses of one range at once fetch it once, a short range and one fetched in pieces alike: eight reads at once of a
+    /// range make the bucket calls one read makes, and each gets the range's bytes. A read after them is a hit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn misses_of_one_range_at_once_fetch_it_once() -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use object_store_df::ObjectStoreExt as _;
+        let size = 3 * BLOCK + 777;
+        let data: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+        let path = Path::from("lk/data/t/a.parquet");
+        // (a bucket 50 ms away, its calls counted)
+        let far = || async {
+            let inner = Arc::new(object_store::memory::InMemory::new());
+            inner.put(&object_store::path::Path::from("lk/data/t/a.parquet"), data.clone().into()).await.unwrap();
+            let slow = object_store::throttle::ThrottleConfig { wait_get_per_call: std::time::Duration::from_millis(50), ..Default::default() };
+            let metrics: Arc<crate::metrics::Metrics> = Default::default();
+            let counted = crate::store::counted(Arc::new(object_store::throttle::ThrottledStore::new(inner, slow)), &metrics);
+            (CachedStore::new(counted, 64 << 20, None, "lk"), metrics)
+        };
+        let reads = |m: &crate::metrics::Metrics| m.object_reads.load(std::sync::atomic::Ordering::Relaxed);
+        for r in [10..20, 5..size - 3] {
+            let (alone, one) = far().await;
+            alone.get_range(&path, r.clone()).await?;
+            let (store, eight) = far().await;
+            let got = futures::future::join_all((0..8).map(|_| store.get_range(&path, r.clone()))).await;
+            assert_eq!(reads(&eight), reads(&one), "{r:?}: eight misses at once made {} calls, one alone {}", reads(&eight), reads(&one));
+            for g in got {
+                assert_eq!(g?, Bytes::copy_from_slice(&data[r.start as usize..r.end as usize]), "{r:?}");
+            }
+            store.get_range(&path, r.clone()).await?;
+            assert_eq!(reads(&eight), reads(&one), "{r:?}: a read after them is a hit");
         }
         Ok(())
     }
