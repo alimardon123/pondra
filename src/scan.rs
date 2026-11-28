@@ -438,7 +438,7 @@ pub struct Files {
     pub partition: Vec<FieldRef>, // columns a file's place gives (Delta's partition values), after them
     pub files: Vec<File>,
     pub adapter: Option<Arc<dyn datafusion::physical_expr_adapter::PhysicalExprAdapterFactory>>, // (columns matched by field id)
-    pub row: Option<FieldRef>, // Parquet's row number, last, under this name (`adopted`)
+    pub row: Option<FieldRef>, // each row's place in its file, last (`file_formats::place`; a format that `numbers` its rows)
 }
 
 #[derive(Debug, Clone)]
@@ -501,6 +501,11 @@ impl TableProvider for Files {
 impl Files {
     /// A scan of `files`, all of them in `entry`'s format.
     async fn plan(&self, state: &dyn Session, entry: &'static dyn crate::file_formats::TableFileFormat, mut files: Vec<File>, schema: &SchemaRef, projection: Option<&Vec<usize>>, limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let placed = self.file_schema.fields().len() + self.partition.len(); // (the place column's index: last)
+        if self.row.is_some() && !entry.numbers() && projection.is_none_or(|p| p.contains(&placed)) {
+            let file = files.first().map_or("a file", |f| f.key.as_str());
+            return Err(datafusion::common::DataFusionError::NotImplemented(format!("{file}: each row's place in its file is read (a row id), which this build's {} can't give", entry.name())));
+        }
         let format = entry.reader(state);
         let table = datafusion::datasource::table_schema::TableSchema::builder(self.file_schema.clone()).with_table_partition_cols(self.partition.clone()).with_virtual_columns(self.row.clone().into_iter().collect::<Vec<_>>()).build();
         let source = format.file_source(table);

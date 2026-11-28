@@ -1,7 +1,7 @@
 //! A lake's own files read with their lineage and deletes (`scan.rs` is the reader under them).
 use crate::scan::{field, gone, key_of, statistics, url_of, ById, Delete, File, Files};
 use anyhow::{Context, Result};
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::common::ScalarValue;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use std::sync::Arc;
@@ -64,7 +64,7 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
         out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: values, deleted, range, only, stats, modified: None, format: crate::file_formats::of(f)? });
     }
     let adapter = Some(Arc::new(ById { ids, mapping }) as _);
-    let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber));
+    let row = crate::file_formats::place("__row");
     let df = ctx.read_table(Arc::new(Files { store, file_schema, partition, files: out, adapter, row: Some(row) }))?;
     Ok(df.select(schema.fields().iter().map(|f| match f.name().as_str() {
         crate::text::ROW_ID => (col("__first") + col("__row")).alias(f.name()),
@@ -77,13 +77,12 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
 /// One of a lake's own files as `schema` (stored names), each row with its place in the file
 /// (`__row`), the rows deleted by position skipped unread.
 pub async fn placed(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, f: &crate::store::DataFile, schema: &SchemaRef) -> Result<datafusion::prelude::DataFrame> {
-    use datafusion::arrow::datatypes::DataType;
     let url = url_of(&lake.full(&f.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let deleted = lake_gone(lake, ctx, &[f]).await?.pop().flatten();
     let stats = Arc::new(statistics(f, f.rows, true, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
     let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats, modified: None, format: crate::file_formats::of(f)? };
-    let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber)); // (its places: Parquet's row number, so its format is Parquet's until the entry numbers rows, 15b-2)
+    let row = crate::file_formats::place("__row"); // (its places: a format that doesn't number its rows is refused, naming it)
     Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: Some(row) }))?)
 }
 

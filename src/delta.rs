@@ -327,6 +327,7 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
     let was = |p: &String| state.inline.contains_key(p) || lost.contains_key(p);
     let changed = |p: &String| was(p) && state.dvs.get(p) != dvs.get(p);
     let adds: Vec<(String, &DataFile)> = want.iter().filter(|(p, _)| !was(p) || changed(p)).map(|(p, f)| (p.clone(), *f)).collect();
+    adds.iter().try_for_each(|(_, f)| crate::file_formats::published(f))?; // (other engines read Parquet: a file kept from another format holds the commit back)
     let removes: Vec<String> = gone.keys().filter(|p| !want.contains_key(*p)).chain(want.keys().filter(|p| changed(p))).cloned().collect();
     if state.version.is_some() && adds.is_empty() && removes.is_empty() && state.schema == schema {
         return Ok(None);
