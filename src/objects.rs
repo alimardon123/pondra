@@ -682,6 +682,9 @@ pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
     if let Some(r) = m.retention_secs {
         with.push(format!("retention = '{}'", span(r)));
     }
+    if !m.file_format.is_empty() {
+        with.push(format!("file_format = '{}'", m.file_format));
+    }
     if !with.is_empty() {
         s += &format!("\nWITH ({})", with.join(", "));
     }
@@ -1043,6 +1046,9 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str, scope: &Scope, alter: &Alt
     // (another PARTITION BY, or none, splits the files written from now on: the ones before keep their spec, `create_table`)
     if s["partition_by"].is_null() && old.partition.is_some() {
         s["partition_by"] = j!("");
+    }
+    if s["file_format"].is_null() && !old.file_format.is_empty() {
+        s["file_format"] = j!("parquet"); // (and the files written from now on are Parquet: the ones before keep theirs)
     }
     ensure!(old.order.is_none() || s["order_by"].as_str().is_some(), "{table}'s SEQUENCE BY can't be taken away: CREATE OR REPLACE TABLE makes it anew");
     let not_null: Vec<String> = strings(&s["not_null"]).into_iter().chain(key.iter().cloned()).collect();

@@ -74,6 +74,8 @@ enum TableSpec {
         made_by: Option<String>, // the job of the CREATE TABLE that sends it (`made_by_job`); none: sent again freely
         #[serde(default)]
         shown: Option<Vec<String>>, // an existing table's columns in SQL's order, SQL's names (`ADD COLUMN … AFTER b`): `TableMeta::set_order`
+        #[serde(default)]
+        file_format: Option<String>, // what its new files are written in: 'parquet', the default, or another format this build has
     },
 }
 
@@ -119,13 +121,18 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     let owner = crate::sys::staged_for(name.as_str()).unwrap_or(name.as_str()); // (a staged table takes its folder and sequences' names from the table it replaces)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
     let mut kept: (Vec<(String, Vec<u8>)>, Vec<String>) = Default::default(); // (what reads it by position, kept reading it as it did: `shown_as_stored`)
-    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new(), None, None),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown),
+    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown, file_format) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new(), None, None, None),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown, file_format } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown, file_format),
     };
     // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
-    let (retention, columns, ttl) = async {
+    let (retention, columns, ttl, file_format) = async {
         let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
+        // (what its new files are written in: a keyed table's are read by key, block by block, which its format must do)
+        let file_format = file_format.as_deref().map(crate::file_formats::chosen).transpose()?;
+        if let Some(f) = file_format.filter(|f| !key.is_empty() && f.blocks().is_none()) {
+            bail!("file_format: a keyed table's files are read by key, a block at a time, which the {} format's can't be", f.name());
+        }
         // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`), and a fixed-size
         // list keeps its size only where the lake does (format 8: `answer::fixed_name`).
         let fixed = crate::format::fixed(lake).await?;
@@ -168,13 +175,17 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         }
         crate::rules::create::identity_types(&columns, &identity)?;
         crate::defaults::definition(&columns, &defaults, &checks).await?; // (a DEFAULT, a CHECK: as a temporary table's are)
-        Ok((retention, columns, ttl))
+        Ok((retention, columns, ttl, file_format))
     }
     .await
     .map_err(definition)?;
     // (a key's columns are NOT NULL too: a row with no key has nothing to be found by)
     let not_null: Vec<String> = columns.iter().map(|(c, _)| c).filter(|c| crate::rules::create::required(c.as_str(), &not_null, &key, &identity)).cloned().collect();
     let mut defaulted = publish.is_none(); // (a new table published as the node's --publish says)
+    let file_format = file_format.map(crate::file_formats::recorded); // (its entry's: none for Parquet)
+    if file_format.as_ref().is_some_and(|f| !f.is_empty()) {
+        crate::format::require(lake, crate::format::FORMATS, "a table's files in another format than Parquet").await?;
+    }
     let mut meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
         // (A new table reads the log from now on: a table of this name dropped earlier left rows
         // in segments that aren't expired yet.)
@@ -198,7 +209,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, owner, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), crate::rules::create::identity_default(&i.sequence));
             }
-            { let mut entry = TableMeta::made(crate::store::Made { columns, not_null, defaults, identity, enums, sql_types, ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = publish.unwrap_or_else(default_publish); entry.cluster = cluster.unwrap_or_default(); entry.ttl = ttl; entry.partition = partition.filter(|p| !p.is_empty()); entry.order = order; entry.checks = checks; entry.constraints = constraints; entry.folder = folder; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.made_by = made_by; entry.ids = true; entry.properties = properties.unwrap_or_default(); entry.retention_secs = retention; entry }
+            { let mut entry = TableMeta::made(crate::store::Made { columns, not_null, defaults, identity, enums, sql_types, ..Default::default() }); entry.key = key; entry.merge = merge; entry.publish = publish.unwrap_or_else(default_publish); entry.cluster = cluster.unwrap_or_default(); entry.ttl = ttl; entry.partition = partition.filter(|p| !p.is_empty()); entry.order = order; entry.checks = checks; entry.constraints = constraints; entry.folder = folder; entry.tiered = lake.visible(); entry.made = Some((lake.visible(), crate::log::now_ms())); entry.made_by = made_by; entry.ids = true; entry.properties = properties.unwrap_or_default(); entry.retention_secs = retention; entry.file_format = file_format.unwrap_or_default(); entry }
         }
         Some(mut m) => {
             // (a CREATE TABLE … AS SELECT's definition is sent again only under the job that made the table: the same
@@ -232,7 +243,8 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let (recluster, rettl, reorder) = (cluster.as_ref().is_some_and(|c| *c != l.cluster), ttl.is_some() && ttl != l.ttl, order.is_some() && order != l.order);
             let reprop = properties.as_ref().is_some_and(|p| *p != m.properties);
             let reretain = retention.is_some() && retention != m.retention_secs;
-            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop && !reretain && !respec && shown.is_none() {
+            let reformat = file_format.as_ref().is_some_and(|f| *f != m.file_format); // (files from now on: the ones before keep theirs)
+            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop && !reretain && !respec && !reformat && shown.is_none() {
                 return Ok(j!({"table": name, "publish": m.publish}));
             }
             if new > old {
@@ -275,6 +287,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             m.order = order.or(m.order);
             m.properties = properties.unwrap_or(m.properties);
             m.retention_secs = retention.or(m.retention_secs);
+            m.file_format = file_format.unwrap_or(m.file_format);
             if reretain {
                 crate::rejects::retain(lake, retention).await?; // (its dropped rows are held as long: `pondra.rejects`)
             }
@@ -919,7 +932,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool, scope: 
     if d.keyed() && !columns.iter().any(|(c, _)| c == "_deleted") {
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
-    let spec = j!({"columns": columns, "key": d.key, "merge": d.merge, "publish": d.list("publish"), "cluster_by": d.list("cluster_by"), "ttl": d.options.get("ttl"), "partition_by": d.options.get("partition_by"), "order_by": d.options.get("order_by"), "not_null": d.not_null, "defaults": d.defaults, "checks": d.checks, "retention": d.options.get("retention"), "identity": d.identity, "constraints": d.constraints, "enums": enums, "sql_types": sql_types});
+    let spec = j!({"columns": columns, "key": d.key, "merge": d.merge, "publish": d.list("publish"), "cluster_by": d.list("cluster_by"), "ttl": d.options.get("ttl"), "partition_by": d.options.get("partition_by"), "order_by": d.options.get("order_by"), "not_null": d.not_null, "defaults": d.defaults, "checks": d.checks, "retention": d.options.get("retention"), "file_format": d.options.get("file_format"), "identity": d.identity, "constraints": d.constraints, "enums": enums, "sql_types": sql_types});
     Ok(spec.to_string())
 }
 
@@ -987,7 +1000,7 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
     let table = table.to_string();
     let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
-    let mut spec = j!({"columns": m.to_columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": crate::objects::not_null_columns(&m), "defaults": crate::objects::column_defaults(&m), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
+    let mut spec = j!({"columns": m.to_columns(), "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": crate::objects::not_null_columns(&m), "defaults": crate::objects::column_defaults(&m), "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds")), "file_format": (!m.file_format.is_empty()).then_some(&m.file_format)});
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists, place) => {
             if m.columns().any(|(c, _)| c == column) {
@@ -1035,13 +1048,13 @@ async fn alter_spec(lake: &Lake, table: &str, stmt: &Stmt) -> Result<Option<Stri
             for (k, v) in options {
                 match k.as_str() {
                     "publish" | "cluster_by" => spec[k] = j!(list(v)),
-                    "ttl" | "order_by" | "retention" => spec[k.as_str()] = j!(v),
+                    "ttl" | "order_by" | "retention" | "file_format" => spec[k.as_str()] = j!(v),
                     "partition_by" => spec[k.as_str()] = j!(v), // ('' for none: `create_table`)
                     // Other engines' own (`write.delete.mode`, `write.merge.mode`…): kept and published
                     // for them (Iceberg's table properties); '' takes one out.
                     p if p.contains('.') && v.is_empty() => drop(spec["properties"].as_object_mut().map(|o| o.remove(p))),
                     p if p.contains('.') => spec["properties"][p] = j!(v),
-                    other => bail!("{other}: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')"),
+                    other => bail!("{other}: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by, retention and file_format, and other engines' properties (write.delete.mode = 'merge-on-read')"),
                 }
             }
         }
@@ -1796,13 +1809,18 @@ impl Drop for Undo {
     }
 }
 
-async fn on_node_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
-    let stmt = crate::protect::door(&app.lake, stmt, &by.name).await?; // (a project's objects in a protected database: an apply's only)
-    if let Some(out) = crate::temp::statement(app, &stmt, files, by).await? {
-        return Ok(out); // (the session's own tables and views: on this node, in memory; a temporary table has no identity column)
-    }
-    let (stmt, placed) = in_sql_order(&app.lake, stmt, &by.scope).await?; // (an INSERT without a column list, into a table that moved a column)
-    crate::log::placed_as(placed, listed_in_order(app, stmt, job, files, by)).await
+// (its future made on the heap, here, and not in `on_node_as`'s: a statement's is some 270 KB, and a CREATE TABLE … AS runs
+// one inside another, on a test thread's 2 MB stack)
+#[inline(never)]
+fn on_node_listed<'a>(app: &'a crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &'a crate::auth::Principal) -> futures::future::BoxFuture<'a, Result<Value>> {
+    Box::pin(async move {
+        let stmt = crate::protect::door(&app.lake, stmt, &by.name).await?; // (a project's objects in a protected database: an apply's only)
+        if let Some(out) = crate::temp::statement(app, &stmt, files, by).await? {
+            return Ok(out); // (the session's own tables and views: on this node, in memory; a temporary table has no identity column)
+        }
+        let (stmt, placed) = in_sql_order(&app.lake, stmt, &by.scope).await?; // (an INSERT without a column list, into a table that moved a column)
+        crate::log::placed_as(placed, listed_in_order(app, stmt, job, files, by)).await
+    })
 }
 
 async fn listed_in_order(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool, by: &crate::auth::Principal) -> Result<Value> {
@@ -2932,6 +2950,18 @@ mod section {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `file_format` names what a table's new files are written in, in any case: Parquet goes unsaid in its entry, and a
+    /// format this build doesn't have is refused, naming the ones it has.
+    #[tokio::test]
+    async fn a_tables_file_format_is_one_this_build_has() {
+        let lake = Lake::open(&format!("memory://file-format-{}", uuid::Uuid::new_v4().simple()), true, false, crate::node_state::NodeState::unhosted()).await.unwrap();
+        create_table(&lake, "t", r#"{"columns": [["a", "Int64"]], "file_format": "PARQUET"}"#).await.unwrap();
+        assert_eq!(lake.cat.get::<TableMeta>(&table_key("t")).await.unwrap().expect("made").file_format, "", "Parquet goes unsaid");
+        let refused = format!("{:#}", create_table(&lake, "u", r#"{"columns": [["a", "Int64"]], "file_format": "vortex"}"#).await.err().expect("refused"));
+        assert!(refused.contains("this build has no vortex format (it has parquet)"), "{refused}");
+        assert!(lake.cat.get::<TableMeta>(&table_key("u")).await.unwrap().is_none(), "nothing made");
+    }
 
     /// Rows whose columns aren't the table's: 40001 where the table can have moved under them, and XX000, never run again,
     /// where their node names a type the leader doesn't read (11-08 audit L14).

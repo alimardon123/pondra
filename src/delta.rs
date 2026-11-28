@@ -188,6 +188,9 @@ pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Parts>>
 /// `--publish` leaves such a table out with a notice. A table refused is never published
 /// (`publish_named`): another engine would read rows that aren't the table's.
 pub fn refused(meta: &TableMeta, format: &str) -> Option<String> {
+    if !meta.file_format.is_empty() {
+        return Some(format!("its files are written in {} (file_format), and other engines read a published table's as Parquet", meta.file_format));
+    }
     if meta.finish.is_some() {
         return Some("its files hold partial rows, finished as they are read (an average, a variance, a HAVING)".into());
     }
