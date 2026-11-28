@@ -147,6 +147,9 @@ impl Point {
 /// tiering round left a kept `Point` with the table's old columns and files. A node whose catalog has no version (a
 /// follower between seeds) works it out each time.
 pub async fn point(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> Result<Option<Arc<Point>>> {
+    if crate::file_formats::default().name() != "parquet" {
+        return Ok(None); // (the Vortex spike: a lookup reads Parquet's row groups, so another format's tables are planned as SQL)
+    }
     Ok(worked_out(lake, sql).await?.filter(|p| scope.reads(&p.table, p.names.iter().chain(&p.meta.key).map(String::as_str))))
 }
 
