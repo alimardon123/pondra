@@ -328,8 +328,13 @@ pub fn end(at: &crate::temp::Sessions, session: &str) {
 /// The book's transaction of session `s`, removed (`commit`).
 fn take(at: &crate::temp::Sessions, s: &str) -> Option<Txn> { at.book.lock().unwrap().txns.remove(s) }
 
-/// A statement failed in this session's transaction: it is failed now (25P02 for the ones that follow).
+/// A statement failed in this session's transaction: it is failed now (25P02 for the ones that follow). A statement whose
+/// lock wait gave way to a newer one of its transaction (`locks::GAVE_WAY`: its client sent it again) fails nothing: it
+/// changed nothing yet, and the newer one does its work.
 pub fn failed(message: &str) {
+    if message.contains(crate::locks::GAVE_WAY) {
+        return;
+    }
     with_txn(|t| {
         t.failed.get_or_insert_with(|| message.to_string());
     });
@@ -2208,6 +2213,27 @@ mod tests {
         b.book.lock().unwrap().txns.insert("ann~t".into(), txn());
         end(&a, "ann~t");
         assert!(!held(&a, "ann~t") && held(&b, "ann~t"), "ended at a, b's stays");
+    }
+
+    /// A statement whose lock wait gave way to a newer one of its transaction (its client sent it again) leaves the
+    /// transaction open, whichever door words its error; any other failure fails it.
+    #[test]
+    fn a_wait_that_gave_way_fails_no_transaction() {
+        let at = std::sync::Arc::new(crate::temp::Sessions::default());
+        let txn = Txn {
+            id: "t".into(), job: None, lake: std::sync::Weak::new(), level: Level::Committed, read_only: false, snapshot: 0, ran: false, leader: None,
+            protocol: false, locked: false, state: State::Open, tables: BTreeMap::new(), by_key: BTreeMap::new(), reads: BTreeMap::new(),
+            marks: vec![], failed: None, used: Instant::now(), busy: 0, next: -1,
+        };
+        at.book.lock().unwrap().txns.insert("ann~t".into(), txn);
+        let here = Some(crate::temp::Named { name: "ann~t".into(), at: at.clone() });
+        let gave_way = format!("canceling statement: lock on held: {}", crate::locks::GAVE_WAY);
+        for said in [gave_way.clone(), format!("User provided error: ErrorInfo: ERROR, 57014, {gave_way}")] {
+            crate::temp::SESSION.sync_scope(here.clone(), || failed(&said));
+            assert!(at_in(&at, "ann~t", |t| t.failed.is_none()).expect("open"), "as HTTP or Postgres words it: {said}");
+        }
+        crate::temp::SESSION.sync_scope(here, || failed("canceling statement due to lock timeout"));
+        assert!(at_in(&at, "ann~t", |t| t.failed.is_some()).expect("open"), "a lock timeout fails it");
     }
 
     #[test]

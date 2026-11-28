@@ -630,3 +630,111 @@ async fn copy_into_from_two_members_and_through_a_kill_loads_each_file_once() {
         );
     }
 }
+
+/// What member `m` answers `sql` with in session `session`: its JSON, or its status, SQLSTATE and words.
+async fn in_session(c: &Cluster, m: usize, session: &str, sql: &str) -> serde_json::Value {
+    match c.ask_with(m, "POST", "/sql", &[("x-pondra-session".to_string(), session.to_string())], sql.as_bytes().to_vec()).await {
+        Ok((200..=299, _, body)) => serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        Ok((status, code, body)) => serde_json::json!({"status": status, "code": code, "body": String::from_utf8_lossy(&body)}),
+        Err(e) => serde_json::json!({"no answer": e.to_string()}),
+    }
+}
+
+/// The harness's `waits` through a follower, on paused time: a row lock held from m2 makes a waiter on m3 time out
+/// (55P03, then 25P02 until it ends), keeps through the holder's idle minutes (its follower renews it), and goes to a
+/// waiter within a lease once the holder's follower is killed.
+#[tokio::test(start_paused = true)]
+async fn row_locks_through_a_follower_wait_time_out_and_go_with_a_killed_follower() {
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        c.start(0).await.unwrap();
+        c.sql(0, "CREATE TABLE held (id BIGINT, v BIGINT)").await.unwrap();
+        c.sql(0, "INSERT INTO held VALUES (1, 10)").await.unwrap();
+        c.start(1).await.unwrap();
+        c.start(2).await.unwrap();
+        c.until("every member knows the three", Duration::from_secs(30), || async { c.known(1).await == 3 && c.known(2).await == 3 }).await.unwrap();
+        let upd = "UPDATE held SET v = v + 1 WHERE id = 1";
+        for (m, session, sql, want) in [
+            (1, "holder-01", "BEGIN", "ok"),
+            (1, "holder-01", upd, "ok"),
+            (2, "waiter-01", "SET lock_timeout = '200ms'", "ok"),
+            (2, "waiter-01", "BEGIN", "ok"),
+            (2, "waiter-01", upd, "55P03"),
+            (2, "waiter-01", "SELECT 1", "25P02"),
+            (2, "waiter-01", "ROLLBACK", "ok"),
+        ] {
+            let got = c.code_in(m, session, sql).await;
+            assert_eq!(got, want, "seed {seed}: session {session} on member {} ran {sql:?}\n{}", m + 1, c.met());
+        }
+        tokio::time::sleep(Duration::from_secs(180)).await; // (the holder idles: its follower renews its lock)
+        assert_eq!(c.code_in(0, "waiter-02", "SET lock_timeout = '1s'").await, "ok", "seed {seed}\n{}", c.met());
+        assert_eq!(c.code_in(0, "waiter-02", "BEGIN").await, "ok", "seed {seed}\n{}", c.met());
+        let idle = c.code_in(0, "waiter-02", upd).await;
+        assert_eq!(idle, "55P03", "seed {seed}: the idle holder keeps its row, asked on member 1\n{}", c.met());
+        assert_eq!(c.code_in(0, "waiter-02", "ROLLBACK").await, "ok", "seed {seed}\n{}", c.met());
+        c.kill(1);
+        let killed = crate::clock::now();
+        // (the lock goes once its lease, 60 s, passes with no word from the holder's member; the test's ask waits 30 s at
+        // most, as the harness's call does, so the waiter asks 40 s after the kill, and waits the rest)
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert_eq!(c.code_in(2, "waiter-03", "SET lock_timeout = '120s'").await, "ok", "seed {seed}\n{}", c.met());
+        assert_eq!(c.code_in(2, "waiter-03", "BEGIN").await, "ok", "seed {seed}\n{}", c.met());
+        let got = c.code_in(2, "waiter-03", upd).await;
+        let waited = killed.elapsed();
+        assert_eq!(got, "ok", "seed {seed}: the waiter's UPDATE after the kill\n{}", c.met());
+        assert!(waited < Duration::from_secs(90), "seed {seed}: the waiter got the row {waited:?} after the kill, a lease being 60 s\n{}", c.met());
+        let inside = in_session(&c, 2, "waiter-03", "SELECT v FROM held WHERE id = 1").await;
+        assert_eq!(rows(&inside), vec![serde_json::json!({"v": 11})], "seed {seed}: v as the waiter's transaction sees it: {inside}\n{}", c.met());
+        assert_eq!(c.code_in(2, "waiter-03", "COMMIT").await, "ok", "seed {seed}\n{}", c.met());
+        let v = c.sql(0, "SELECT v FROM held WHERE id = 1").await.unwrap();
+        assert_eq!(rows(&v), vec![serde_json::json!({"v": 11})], "seed {seed}: v on member 1 after the waiter's COMMIT (10, and the waiter's 1; the killed holder's never lands)\n{}", c.met());
+        println!(
+            "seed {seed}: 55P03 and 25P02 through member 3, 55P03 through member 1 with the holder idle 180 s; the waiter got the row {:.1} s after the kill; v 11",
+            waited.as_secs_f64()
+        );
+    }
+}
+
+/// The harness's `tasks` through a leader stop, on paused time, three members: a graph started from a follower runs to
+/// its end although the member that leads may be stopped at a commit of its run, and the leader that is left has each
+/// write once, and each run ok.
+#[tokio::test(start_paused = true)]
+async fn a_task_graph_through_a_leader_stop_writes_each_row_once() {
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        c.start(0).await.unwrap();
+        c.start(1).await.unwrap();
+        c.start(2).await.unwrap();
+        c.until("every member knows the three", Duration::from_secs(30), || async { c.known(1).await == 3 && c.known(2).await == 3 }).await.unwrap();
+        c.sql(0, "CREATE TABLE flog (task VARCHAR, v BIGINT)").await.unwrap();
+        c.sql(0, "CREATE TASK froot SCHEDULE '1 hour' AS SELECT 1").await.unwrap();
+        c.sql(0, "CREATE TASK fload AFTER froot AS BEGIN INSERT INTO flog VALUES ('fload', 1); RETURN 7; END").await.unwrap();
+        c.sql(0, "CREATE TASK freport AFTER fload AS INSERT INTO flog VALUES ('freport', pondra.result('fload'))").await.unwrap();
+        let started = c.sql(1, "EXECUTE TASK froot").await;
+        assert!(started.is_ok(), "seed {seed}: EXECUTE TASK froot on member 2 was refused: {started:?}\n{}", c.met());
+        c.faults(0).stop_at("after_commit", 0.5); // (each commit member 1 makes while the graph runs may stop it there)
+        let found = std::cell::Cell::new(None);
+        c.until("a member that is up leads and has freport ok", Duration::from_secs(120), || async {
+            for m in 0..3 {
+                if !c.up(m) || c.role(m).await.as_deref() != Some("leader") {
+                    continue;
+                }
+                let answer = c.sql(m, "SELECT status FROM pondra.runs WHERE routine = 'freport'").await.unwrap_or(serde_json::Value::Null);
+                if rows(&answer).first().is_some_and(|r| r["status"] == "ok") {
+                    found.set(Some(m));
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        let lead = found.get().unwrap_or_else(|| panic!("seed {seed}: no leader found\n{}", c.met()));
+        let flog = c.sql(lead, "SELECT task, v FROM flog ORDER BY task").await.unwrap();
+        assert_eq!(flog, serde_json::json!([{"task": "fload", "v": 1}, {"task": "freport", "v": 7}]), "seed {seed}: flog on member {}\n{}", lead + 1, c.met());
+        let runs = c.sql(lead, "SELECT routine, status FROM pondra.runs WHERE routine IN ('froot', 'fload', 'freport') ORDER BY routine").await.unwrap();
+        let statuses = serde_json::Value::Array(rows(&runs).iter().map(|r| r["status"].clone()).collect());
+        assert_eq!(statuses, serde_json::json!(["ok", "ok", "ok"]), "seed {seed}: the runs of the graph on member {}\n{}", lead + 1, c.met());
+        println!("seed {seed}: member 1 {} stopped; member {} led at the end; flog {flog}; runs {statuses}", if c.up(0) { "was not" } else { "was" }, lead + 1);
+    }
+}
