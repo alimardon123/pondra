@@ -78,7 +78,7 @@ impl std::fmt::Display for Restarting {
 pub enum Guest {
     /// It only reads: it follows a leader that answers, or reads beside one that doesn't, or nobody's, and claims nothing.
     Reads,
-    /// It may record writes, so it leads a lake nobody leads (`Cluster::guest`).
+    /// It may record writes, so it leads a lake nobody leads (`Cluster::guest`, `sim::cluster::Cluster::guest`).
     Writes,
 }
 

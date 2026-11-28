@@ -10,6 +10,7 @@ use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutOptions, PutPayload, PutResult};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The members' buckets in this process, by name: what `sim://name/…` opens (`open`).
@@ -18,10 +19,25 @@ static BUCKETS: Mutex<Option<HashMap<String, Store>>> = Mutex::new(None);
 /// A sim cluster's one bucket: objects in memory, each stamped by the sim's clock.
 pub fn bucket() -> Arc<Bucket> { Arc::new(Bucket { objects: object_store::memory::InMemory::new(), stamps: Default::default() }) }
 
-/// `sim://name` opens `bucket` as `faults` meet its calls, from now on.
-pub fn give(name: &str, bucket: Arc<Bucket>, faults: Arc<Faults>) {
-    let store: Store = Arc::new(Faulty { bucket, faults });
+/// `sim://name` opens `bucket` as `faults` meet its calls, from now on, for the process that opens it next: its `Life`.
+pub fn give(name: &str, bucket: Arc<Bucket>, faults: Arc<Faults>) -> Arc<Life> {
+    let life = Arc::new(Life::default());
+    let store: Store = Arc::new(Faulty { bucket, faults, life: life.clone() });
     lock(&BUCKETS).get_or_insert_with(HashMap::new).insert(name.to_string(), store);
+    life
+}
+
+/// A member's or a guest's process, as its bucket sees it. Once it ends (killed, or its run over), every call made through
+/// what it opened fails at once, as a process that is gone makes none: the tasks a kill doesn't reach, its catalog's own
+/// (SlateDB's), would otherwise go on polling and flushing the bucket, and a write it hadn't put yet land after it died.
+#[derive(Debug, Default)]
+pub struct Life {
+    ended: AtomicBool,
+}
+
+impl Life {
+    /// The process is gone: no call it would make from now on is made.
+    pub fn end(&self) { self.ended.store(true, SeqCst); }
 }
 
 /// `sim://name` opens nothing from now on.
@@ -59,11 +75,12 @@ impl Bucket {
     }
 }
 
-/// One member's view of the bucket: each call meets the member's faults first.
+/// One member's view of the bucket: each call meets the member's faults first, while its process lives (`life`).
 #[derive(Debug)]
 struct Faulty {
     bucket: Arc<Bucket>,
     faults: Arc<Faults>,
+    life: Arc<Life>,
 }
 
 impl std::fmt::Display for Faulty {
@@ -75,9 +92,19 @@ fn failed(op: Op, at: &(dyn std::fmt::Display + Sync), verdict: Verdict) -> obje
     object_store::Error::Generic { store: "sim", source: format!("{op:?} {at}: {verdict:?} (the sim's faults)").into() }
 }
 
+/// What a call of a process that ended answers (`Life`): it isn't made. NotSupported, which SlateDB doesn't retry, so the
+/// dead process's tasks that are still running fail and end instead of calling again.
+fn gone(op: Op, at: &(dyn std::fmt::Display + Sync)) -> object_store::Error {
+    object_store::Error::NotSupported { source: format!("{op:?} {at}: its process is gone (the sim's kill)").into() }
+}
+
 impl Faulty {
-    /// Runs `call` as the member's faults say: not at all (it fails), or done and its answer lost, or as it comes.
+    /// Runs `call` as the member's faults say: not at all (it fails, or its process is gone), or done and its answer lost,
+    /// or as it comes.
     async fn run<T>(&self, op: Op, at: &(dyn std::fmt::Display + Sync), call: impl std::future::Future<Output = object_store::Result<T>>) -> object_store::Result<T> {
+        if self.life.ended.load(SeqCst) {
+            return Err(gone(op, at));
+        }
         match self.faults.meet(op, at).await {
             Verdict::Fail => Err(failed(op, at, Verdict::Fail)),
             Verdict::Lose => {
@@ -103,7 +130,7 @@ impl ObjectStore for Faulty {
 
     async fn put_multipart_opts(&self, at: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         let upload = self.run(Op::Put, at, self.bucket.objects.put_multipart_opts(at, opts)).await?;
-        Ok(Box::new(Parts { upload, at: at.clone(), bucket: self.bucket.clone(), faults: self.faults.clone() }))
+        Ok(Box::new(Parts { upload, at: at.clone(), bucket: self.bucket.clone(), faults: self.faults.clone(), life: self.life.clone() }))
     }
 
     async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
@@ -113,13 +140,13 @@ impl ObjectStore for Faulty {
     }
 
     fn delete_stream(&self, paths: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
-        let (bucket, faults) = (self.bucket.clone(), self.faults.clone());
+        let (bucket, faults, life) = (self.bucket.clone(), self.faults.clone(), self.life.clone());
         paths
             .then(move |p| {
-                let (bucket, faults) = (bucket.clone(), faults.clone());
+                let (bucket, faults, life) = (bucket.clone(), faults.clone(), life.clone());
                 async move {
                     let p = p?;
-                    let me = Faulty { bucket: bucket.clone(), faults };
+                    let me = Faulty { bucket: bucket.clone(), faults, life };
                     me.run(Op::Delete, &p, async {
                         bucket.objects.delete(&p).await?;
                         lock(&bucket.stamps).remove(&p);
@@ -158,8 +185,11 @@ impl ObjectStore for Faulty {
 impl Faulty {
     /// A listing: it meets the member's faults once, before its first page, and each object in it is stamped.
     fn listed(&self, prefix: Option<&Path>, listing: BoxStream<'static, object_store::Result<ObjectMeta>>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let (bucket, faults, shown) = (self.bucket.clone(), self.faults.clone(), prefix.map(Path::to_string).unwrap_or_default());
+        let (bucket, faults, shown, life) = (self.bucket.clone(), self.faults.clone(), prefix.map(Path::to_string).unwrap_or_default(), self.life.clone());
         futures::stream::once(async move {
+            if life.ended.load(SeqCst) {
+                return futures::stream::once(async move { Err(gone(Op::List, &shown)) }).boxed();
+            }
             match faults.meet(Op::List, &shown).await {
                 Verdict::Go => listing.map(move |m| m.map(|m| bucket.stamped(m))).boxed(),
                 v => futures::stream::once(async move { Err(failed(Op::List, &shown, v)) }).boxed(),
@@ -177,13 +207,17 @@ struct Parts {
     at: Path,
     bucket: Arc<Bucket>,
     faults: Arc<Faults>,
+    life: Arc<Life>,
 }
 
 #[async_trait::async_trait]
 impl object_store::MultipartUpload for Parts {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
-        let (part, faults, at) = (self.upload.put_part(data), self.faults.clone(), self.at.clone());
+        let (part, faults, at, life) = (self.upload.put_part(data), self.faults.clone(), self.at.clone(), self.life.clone());
         Box::pin(async move {
+            if life.ended.load(SeqCst) {
+                return Err(gone(Op::Put, &at));
+            }
             match faults.meet(Op::Put, &at).await {
                 Verdict::Go => part.await,
                 Verdict::Lose => {
@@ -196,8 +230,8 @@ impl object_store::MultipartUpload for Parts {
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let (faults, at, bucket) = (self.faults.clone(), self.at.clone(), self.bucket.clone());
-        let me = Faulty { bucket: bucket.clone(), faults };
+        let (faults, at, bucket, life) = (self.faults.clone(), self.at.clone(), self.bucket.clone(), self.life.clone());
+        let me = Faulty { bucket: bucket.clone(), faults, life };
         let upload = &mut self.upload;
         me.run(Op::Put, &at, async {
             let r = upload.complete().await?;

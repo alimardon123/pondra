@@ -27,12 +27,16 @@ struct Member {
     /// Its host's end: dropped as it is killed, so nothing is told to a supervisor that's gone.
     host: Mutex<Option<crate::node::Host>>,
     node: Mutex<Weak<crate::node_state::NodeState>>,
+    /// Its process, as the bucket sees it: each start a new one, ended by its kill (`store::Life`).
+    life: Mutex<Arc<super::store::Life>>,
 }
 
 impl Member {
     /// Killed: its supervisor and every task of its node end where they are, the calls it was answering get no answer,
-    /// and nothing reaches it, as when its process is killed. Its objects stay in the bucket.
+    /// and nothing reaches it, as when its process is killed. Nor does it reach the bucket again, though its catalog's own
+    /// tasks (SlateDB's) run on. Its objects stay in the bucket.
     fn kill(&self) {
+        lock(&self.life).end();
         if let Some(s) = lock(&self.supervisor).take() {
             s.abort();
         }
@@ -70,7 +74,7 @@ impl Cluster {
         let members = (1..=n)
             .map(|i| {
                 let faults = Faults::new(seed.wrapping_mul(1_000_003).wrapping_add(i as u64));
-                super::store::give(&format!("{name}-m{i}"), bucket.clone(), faults.clone());
+                let life = super::store::give(&format!("{name}-m{i}"), bucket.clone(), faults.clone());
                 Arc::new(Member {
                     name: format!("m{i}"),
                     faults,
@@ -80,6 +84,7 @@ impl Cluster {
                     supervisor: Default::default(),
                     host: Default::default(),
                     node: Default::default(),
+                    life: Mutex::new(life),
                 })
             })
             .collect();
@@ -97,6 +102,7 @@ impl Cluster {
         let member = self.members[m].clone();
         anyhow::ensure!(lock(&member.supervisor).is_none(), "{} is up already", member.name);
         let (host, told) = crate::node::Host::beside(); // (kept beside the others, reached through its router: no port of its own, restarted in place)
+        *lock(&member.life) = super::store::give(&format!("{}-{}", self.name, member.name), self.bucket.clone(), member.faults.clone()); // (a new process)
         let (kept, killed) = (Arc::downgrade(&member), Arc::downgrade(&member));
         let given = crate::node_state::Given {
             dial: Some(self.net.dial(&member.name)),
@@ -242,9 +248,9 @@ impl Cluster {
         lock(&self.guests).entry(g).or_insert_with(made).clone()
     }
 
-    /// `sql` run as `pondra sql` runs it, with job `job`, by guest `g`: a node with no address and no doors, which leads
-    /// the lake for the moment if nobody does, or goes through the leader, or its inbox; it answers, waits for what it
-    /// wrote to be durable, and ends. Fenced out by a newer writer, or stopped at a point (its process killed), it runs
+    /// `sql` run as `pondra sql` runs it, with job `job`, by guest `g`: a node with no address and no doors. A plain query
+    /// or an export only reads (`statement::reads_only`); anything else leads the lake for the moment if nobody does, or
+    /// goes through the leader, or its inbox. It answers, waits for what it wrote to be durable, and ends. Fenced out by a newer writer, or stopped at a point (its process killed), it runs
     /// again with the same job, as the command does, so whoever records the job records it once; it gives up after five.
     pub async fn guest(&self, g: usize, sql: &str, job: &str) -> Result<serde_json::Value> {
         let (name, faults) = (format!("g{g}"), self.guest_faults(g));
@@ -255,13 +261,15 @@ impl Cluster {
             // (its process: the task that runs it, and its node's tasks, all ended where they are when it stops at a point)
             let node: Arc<Mutex<Weak<crate::node_state::NodeState>>> = Default::default();
             let ran: Arc<Mutex<Option<tokio::task::AbortHandle>>> = Default::default();
-            let (kept, killed, run_by, stopper) = (node.clone(), node.clone(), ran.clone(), faults.clone());
+            let life = super::store::give(&format!("{}-{name}", self.name), self.bucket.clone(), faults.clone()); // (its process's: `store::Life`)
+            let (kept, killed, run_by, stopper, dies) = (node.clone(), node.clone(), ran.clone(), faults.clone(), life.clone());
             let given = crate::node_state::Given {
                 dial: Some(self.net.dial(&name)),
                 started: Some(Arc::new(move |n: &Arc<crate::node_state::NodeState>| *lock(&kept) = Arc::downgrade(n))),
                 stops: Some(Arc::new(move |point: &str| {
                     let stops = stopper.stops_at(point);
                     if stops {
+                        dies.end();
                         lock(&run_by).take().inspect(tokio::task::AbortHandle::abort);
                         lock(&killed).upgrade().inspect(|n| n.tasks.abort_all());
                     }
@@ -272,7 +280,8 @@ impl Cluster {
             // (its host's end is kept while it runs: a node whose host is gone stops the process on a failure, and a guest
             // stopped at a point fails its own work)
             let (host, _told) = crate::node::Host::beside();
-            let mut options = crate::node::Options::guest(&dir, vec![], crate::node::Guest::Writes);
+            let kind = if crate::statement::reads_only(sql) { crate::node::Guest::Reads } else { crate::node::Guest::Writes }; // (as `pondra sql` picks it)
+            let mut options = crate::node::Options::guest(&dir, vec![], kind);
             (options.given, options.host) = (given, Some(host));
             let (path, body) = (path.clone(), sql.as_bytes().to_vec());
             let run = crate::spawns::untracked(async move {
@@ -293,7 +302,9 @@ impl Cluster {
                 Ok(serde_json::from_str(&said).unwrap_or(serde_json::Value::Null))
             });
             *lock(&ran) = Some(run.abort_handle());
-            match run.await {
+            let ended = run.await;
+            life.end(); // (its process is over, whichever way it ended)
+            match ended {
                 Ok(Ok(answer)) => return Ok(answer),
                 Ok(Err(e)) if crate::write::fenced(&e) => last = e,
                 Ok(Err(e)) => return Err(e.context(format!("{name}: {sql}"))),
