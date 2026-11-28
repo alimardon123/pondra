@@ -119,7 +119,7 @@ pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
             Done::Said(Kind::new("SET"))
         }
         Statement::Set(Set::SetRole { role_name: None, .. }) => Done::Said(Kind::new("SET")), // (SET ROLE NONE: the sign-in's own rights, which a session always has)
-        Statement::Set(Set::SetRole { role_name: Some(role), .. }) => return Err(crate::codes::coded("0A000", format!("SET ROLE {role}: {ROLE_IS_SIGN_INS}"))),
+        Statement::Set(Set::SetRole { role_name: Some(role), .. }) => return Err(crate::codes::coded("0A000", format!("SET ROLE {role}: {}", ROLE_IS_SIGN_INS.replacen("the role", &role.to_string(), 1)))), // (the role named: "GRANT analyst TO …")
         Statement::Set(Set::SetSessionAuthorization(_)) => return Err(crate::codes::coded("0A000", format!("SET SESSION AUTHORIZATION: {AUTHORIZATION_IS_SIGN_INS}"))),
         Statement::Set(Set::SetNames { charset_name, .. }) => {
             set(&session()?, "client_encoding", charset_name.value)?; // (Postgres's SET NAMES is client_encoding)
