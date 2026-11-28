@@ -4166,6 +4166,15 @@ def schemas():
                                      "SELECT count(*) AS n FROM (SELECT k FROM dbo.small UNION ALL SELECT k FROM dbo.big)",
                                      f'SELECT count(*) AS n FROM "{me}".dbo.big b JOIN dbo.small s ON b.id = s.k + 1')]
     checks["queries over views spread, with the same answers"] = all(one == many and ran >= 1 for one, many, ran in over_view)
+    # INTERSECT ALL and EXCEPT ALL count each node's own copies (`CountsExec`): both sides shuffled by every column, or,
+    # where the rows hold the key the tables are cut by the ranges of, counted where they are
+    ran = lambda: (lambda m: (m["pondra_spread_queries_total"], m["pondra_shuffled_queries_total"]))(metrics_of(A.port))
+    counted = [(lambda before: (q(s, spread=0), q(s, spread=1), [a - b for a, b in zip(ran(), before)]))(ran()) for s in (
+        "SELECT count(*) AS n, sum(v) AS s FROM (SELECT v FROM dbo.big EXCEPT ALL SELECT v FROM dbo.small)",
+        "SELECT count(*) AS n, sum(k) AS s FROM (SELECT k FROM dbo.big EXCEPT ALL SELECT k FROM dbo.small)",
+        "SELECT count(*) AS n, sum(k) AS s FROM (SELECT k, v FROM dbo.big INTERSECT ALL SELECT k, v FROM dbo.t)")]
+    checks["INTERSECT ALL and EXCEPT ALL spread over the three nodes (shuffled off the key), with one node's answers"] = \
+        all(one == many and spread >= 1 for one, many, (spread, _) in counted) and counted[0][2][1] >= 1
     # materialized views in SQL
     q("CREATE MATERIALIZED VIEW dbo.per_k AS SELECT k, count(*) AS n, sum(v) AS s FROM dbo.t GROUP BY k", 1)
     q("CREATE TABLE clicks (w_ts TIMESTAMP, u VARCHAR)")

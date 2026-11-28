@@ -1086,6 +1086,10 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<S
         }),
         "HashJoinExec" | "CrossJoinExec" | "NestedLoopJoinExec" => join(&line, kids[0], kids[1], false).or_else(|| collected(p, &line, &kids, exchanges)),
         "AsOfJoinExec" => asof(p, &line, &kids, exchanges),
+        // (INTERSECT ALL and EXCEPT ALL by counting, `set_all.rs`: each node counts and takes only its own keys' copies, so
+        // both sides shuffled by every column; a whole side beside a split one would be counted on every node)
+        "CountsExec" if kids[..] == [Ranged, Ranged] && counts_meet(p) => Some(Ranged),
+        "CountsExec" => (kids[..] == [Keyed, Keyed]).then_some(Keyed),
         "SortMergeJoinExec" | "SortMergeJoin" => join(&line, kids[0], kids[1], true),
         // (every node's own rows of each input: a copy read whole on every node would repeat)
         "UnionExec" => (!kids.contains(&Whole)).then_some(Split),
@@ -1161,7 +1165,7 @@ fn ranged(p: &Arc<dyn ExecutionPlan>, i: usize) -> bool {
             (JoinSide::Right, _) => ranged(j.right(), c.index),
         });
     }
-    matches!(p.name(), "CoalesceBatchesExec" | "CooperativeExec" | "RepartitionExec" | "CoalescePartitionsExec" | "SortExec" | "LeanExec" | "HeldValuesExec" | "HeldValuesInExec" | "SortPreservingMergeExec") && ranged(p.children()[0], i)
+    matches!(p.name(), "CoalesceBatchesExec" | "CooperativeExec" | "RepartitionExec" | "CoalescePartitionsExec" | "SortExec" | "LeanExec" | "HeldValuesExec" | "HeldValuesInExec" | "SortPreservingMergeExec" | "CountsExec") && ranged(p.children()[0], i)
 }
 
 /// A join of two sides cut by the same ranges that runs where the rows are: a pair of its keys is
@@ -1170,6 +1174,14 @@ fn ranged(p: &Arc<dyn ExecutionPlan>, i: usize) -> bool {
 fn meets(p: &Arc<dyn ExecutionPlan>) -> bool {
     let Some(j) = p.downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>() else { return false };
     !j.null_aware && j.on().iter().any(|(l, r)| by_range(j.left(), std::slice::from_ref(l)) && by_range(j.right(), std::slice::from_ref(r)))
+}
+
+/// INTERSECT ALL's or EXCEPT ALL's count (`CountsExec`) of two sides cut by the same ranges: a pair of its keys is the key
+/// on both sides, so all of a row's copies, the left's and the right's, are on one node.
+fn counts_meet(p: &Arc<dyn ExecutionPlan>) -> bool {
+    let Some(c) = p.downcast_ref::<crate::set_all::CountsExec>() else { return false };
+    let (l, r) = c.keys();
+    l.iter().zip(r).any(|(l, r)| by_range(p.children()[0], std::slice::from_ref(l)) && by_range(p.children()[1], std::slice::from_ref(r)))
 }
 
 /// A hash repartition's expressions; an aggregation's groups.
@@ -1250,7 +1262,7 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
     }
     let what = match p.name() {
         "RepartitionExec" => p.output_partitioning().to_string(),
-        "AggregateExec" | "HashJoinExec" | "AsOfJoinExec" | "SortMergeJoinExec" | "SortExec" | "SortExec(TopK)" | "BoundedWindowAggExec" => displayable(p.as_ref()).one_line().to_string(),
+        "AggregateExec" | "HashJoinExec" | "AsOfJoinExec" | "CountsExec" | "SortMergeJoinExec" | "SortExec" | "SortExec(TopK)" | "BoundedWindowAggExec" => displayable(p.as_ref()).one_line().to_string(),
         name => name.to_string(),
     };
     // (an aggregate's partial state crosses the nodes in its own layout, which a release may change while its plan's line
