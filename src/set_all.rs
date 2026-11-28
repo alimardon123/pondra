@@ -206,9 +206,20 @@ pub struct CountsExec {
 
 impl CountsExec {
     fn new(left: Arc<dyn ExecutionPlan>, right: Arc<dyn ExecutionPlan>, keys: (Exprs, Exprs), except: bool, partitioned: bool) -> CountsExec {
-        let props = PlanProperties::new(left.equivalence_properties().clone(), left.output_partitioning().clone(), datafusion::physical_plan::execution_plan::EmissionType::Incremental, left.boundedness());
+        use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+        // (a count over an unbounded right side never ends, so nothing is let through)
+        let bounded = match right.boundedness() {
+            Boundedness::Bounded => left.boundedness(),
+            Boundedness::Unbounded { .. } => Boundedness::Unbounded { requires_infinite_memory: true },
+        };
+        let props = PlanProperties::new(left.equivalence_properties().clone(), left.output_partitioning().clone(), EmissionType::Incremental, bounded);
         CountsExec { left, right, keys: Arc::new(keys), except, partitioned, props: Arc::new(props) }
     }
+}
+
+impl CountsExec {
+    /// The keys a row is counted by: the left's and the right's, pair by pair.
+    pub(crate) fn keys(&self) -> (&[Arc<dyn PhysicalExpr>], &[Arc<dyn PhysicalExpr>]) { (&self.keys.0, &self.keys.1) }
 }
 
 impl DisplayAs for CountsExec {
