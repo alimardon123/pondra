@@ -265,7 +265,7 @@ fn said_no(user: &str, r: crate::signin::Refusal) -> PgWireError {
     match r.kind {
         crate::signin::Kind::Password => PgWireError::InvalidPassword(user.to_string()),
         crate::signin::Kind::Token => PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{user}\": {}", r.words)))),
-        crate::signin::Kind::Locked(_) | crate::signin::Kind::Malformed => fatal(r.words),
+        crate::signin::Kind::Locked(_) | crate::signin::Kind::Malformed | crate::signin::Kind::Plain => fatal(r.words),
     }
 }
 
@@ -796,11 +796,6 @@ impl Backend {
         let Some(again) = self.again.lock().unwrap().clone() else { return Ok(who) };
         match Box::pin(who.again(&self.app, || self.sign_in_again(again))).await { // (boxed: a statement's future doesn't carry a sign-in's)
             None => Ok(who),
-            // (signed in again, it is whom it was: a connection never takes another principal's rights, 11-22 audit H1)
-            Some(Ok(p)) if p.name != who.name => {
-                *self.who.lock().unwrap() = None;
-                Err(fatal(who.signed_out(&format!("it now signs in {} where it signed in {}", p.name, who.name))))
-            }
             Some(Ok(p)) => {
                 *self.who.lock().unwrap() = Some(p.clone());
                 Ok(p)

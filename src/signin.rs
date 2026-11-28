@@ -22,6 +22,9 @@ pub const PAUSE: std::time::Duration = std::time::Duration::from_millis(400);
 /// What a wrong name or password is told, at every door.
 pub const WRONG_PASSWORD: &str = "wrong user name or password";
 
+/// What a password refused where one may not cross is (`Attempt::plain`); each door tells it with its way out.
+pub const PLAIN: &str = "a password crosses only TLS from another machine";
+
 /// What a token that signs nobody in is told (an identity provider's says why instead: `sso::why`).
 pub const WRONG_TOKEN: &str = "wrong token";
 
@@ -33,6 +36,7 @@ pub struct Attempt<'a> {
     pub client: Option<std::net::IpAddr>,   // the one counted: behind a proxy, the client it names (`tls::Peer::client`)
     pub what: String,                       // (the audit's: "sign in", or HTTP's request)
     pub vouched: bool,                      // (from this machine, or with the nodes' authority's certificate: `users::nodes_key`)
+    pub plain: bool,                        // (a password may not cross its connection: `tls::may_send_password`. A token may)
 }
 
 /// Why a sign-in was refused, which each door says in its own codes.
@@ -46,6 +50,8 @@ pub enum Kind {
     Locked(u64),
     /// A credential that can't be read (`Credential::Malformed`).
     Malformed,
+    /// A user's own password where a password may not cross (`Attempt::plain`): a plain connection from another machine.
+    Plain,
 }
 
 /// A refused sign-in: its kind and what the client is told.
@@ -67,7 +73,7 @@ pub enum Tried {
 impl Attempt<'_> {
     /// An attempt counted by the connection's own address (the doors whose wire names no client behind a proxy).
     pub fn at<'a>(app: &'a App, door: &'static str, from: Option<std::net::SocketAddr>) -> Attempt<'a> {
-        Attempt { app, door, from, client: from.map(|a| a.ip()), what: "sign in".into(), vouched: false }
+        Attempt { app, door, from, client: from.map(|a| a.ip()), what: "sign in".into(), vouched: false, plain: false }
     }
 
     /// Whom `credential` signs in: refused at once when it can't be read, or when its name is locked out from this
@@ -81,8 +87,15 @@ impl Attempt<'_> {
                 return Tried::Refused(self.refused(Kind::Locked(wait), user, crate::auth::guessing_says(user, wait)).await);
             }
         }
-        match crate::users::who_or_why(&self.app.lake, &self.app.auth, credential, self.vouched).await {
-            Ok(p) => {
+        match crate::users::who_and_how(&self.app.lake, &self.app.auth, credential, self.vouched).await {
+            Ok((_, crate::users::By::Password)) if self.plain => {
+                // (a value in a token's form can be a password set before #864: what signed it in decides, not its form. Not
+                // a guess: no pause)
+                let user = credential.user().unwrap_or_default();
+                crate::audit::refused_by(self.app, user, self.door, self.from, self.client, &self.what, PLAIN).await;
+                Tried::Refused(Refusal { kind: Kind::Plain, words: PLAIN.into() }) // (each door says it its own way: `tls::PASSWORD_PLAIN`)
+            }
+            Ok((p, _)) => {
                 // (a token under another name signs in its own principal: the audit names both)
                 if let Some(given) = credential.user() {
                     crate::audit::signed_as(self.app, &p.name, given, self.door, self.from, self.client);

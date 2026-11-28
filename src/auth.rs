@@ -84,7 +84,7 @@ impl Principal {
             return None;
         }
         let epoch = app.lake.cat.rights_version(); // (before it is asked, as at sign-in)
-        Some(match sign_in().await {
+        Some(match sign_in().await.and_then(|p| self.still(p)) {
             Ok(p) => Ok(Principal { epoch: p.epoch.max(epoch), ..p.at(self.door, self.from) }),
             Err(why) => {
                 if !self.name.is_empty() {
@@ -93,6 +93,16 @@ impl Principal {
                 Err(why)
             }
         })
+    }
+
+    /// Signed in again, it is whom it was, at every door (`again`): a session never takes another principal's rights, as a
+    /// credential that now signs in someone else would give it (a new user of a first identity provider's name, `sso`;
+    /// 11-22 audit H1 at Postgres, 11-28 M2 at the rest).
+    fn still(&self, now: Principal) -> std::result::Result<Principal, String> {
+        match now.name == self.name {
+            true => Ok(now),
+            false => Err(format!("it now signs in {} where it signed in {}", now.name, self.name)),
+        }
     }
 
     /// `again`'s refusal, as every door words it (SQLSTATE 28000).
@@ -743,6 +753,16 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
     use crate::clock::Instant;
+
+    /// Signed in again, a session is whom it was at every door: a credential that now signs in another principal ends it.
+    #[test]
+    fn signed_in_again_it_is_whom_it_was() {
+        let ann = Principal { name: "ann".into(), ..Principal::of(Role::Read) };
+        let again = Principal { name: "ann".into(), ..Principal::of(Role::Write) };
+        assert_eq!(ann.still(again).map(|p| p.role), Ok(Role::Write), "its own rights, as they are now");
+        let bob = Principal { name: "bob".into(), ..Principal::of(Role::Admin) };
+        assert_eq!(ann.still(bob).map(|p| p.name), Err("it now signs in bob where it signed in ann".to_string()));
+    }
 
     #[test]
     fn a_credential_is_read_alike_at_every_door() {

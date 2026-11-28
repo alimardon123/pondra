@@ -119,12 +119,8 @@ pub async fn statement(lake: &Lake, sql: &str, scope: &crate::rights::Scope) -> 
             Done::Said(Kind::new("SET"))
         }
         Statement::Set(Set::SetRole { role_name: None, .. }) => Done::Said(Kind::new("SET")), // (SET ROLE NONE: the sign-in's own rights, which a session always has)
-        Statement::Set(Set::SetRole { role_name: Some(role), .. }) => {
-            return Err(crate::codes::coded("0A000", format!("SET ROLE {role}: a session has its sign-in's rights, and no other: sign in as a user who has them, or GRANT {role} TO the user you sign in as")))
-        }
-        Statement::Set(Set::SetSessionAuthorization(_)) => {
-            return Err(crate::codes::coded("0A000", "SET SESSION AUTHORIZATION: a session is its sign-in's: sign in as that user (with its token or password)"))
-        }
+        Statement::Set(Set::SetRole { role_name: Some(role), .. }) => return Err(crate::codes::coded("0A000", format!("SET ROLE {role}: {}", ROLE_IS_SIGN_INS.replacen("the role", &role.to_string(), 1)))), // (the role named: "GRANT analyst TO …")
+        Statement::Set(Set::SetSessionAuthorization(_)) => return Err(crate::codes::coded("0A000", format!("SET SESSION AUTHORIZATION: {AUTHORIZATION_IS_SIGN_INS}"))),
         Statement::Set(Set::SetNames { charset_name, .. }) => {
             set(&session()?, "client_encoding", charset_name.value)?; // (Postgres's SET NAMES is client_encoding)
             Done::Said(Kind::new("SET"))
@@ -261,7 +257,16 @@ const ONE_WAY: &[(&str, &[&str], &str, &str)] = &[
     ("autocommit", &["on", "true", "1"], "22023", "each statement commits on its own here: BEGIN … COMMIT makes several one"),
     ("transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
     ("default_transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
+    // (by its name too, `SET role = …` or `set_config('role', …)`, which would only say so: 11-28 audit L1)
+    ("role", &["none"], "0A000", ROLE_IS_SIGN_INS),
+    ("session_authorization", &[], "0A000", AUTHORIZATION_IS_SIGN_INS),
 ];
+
+/// Why a session takes no other role (`SET ROLE`, or the setting `role`): who it is is its sign-in's.
+const ROLE_IS_SIGN_INS: &str = "a session has its sign-in's rights, and no other: sign in as a user who has them, or GRANT the role TO the user you sign in as";
+
+/// Why a session is no other user (`SET SESSION AUTHORIZATION`, or the setting `session_authorization`).
+const AUTHORIZATION_IS_SIGN_INS: &str = "a session is its sign-in's: sign in as that user (with its token or password)";
 
 /// Other engines' settings for what is the node's here, with the way to set it.
 const THE_NODES: &[(&str, &str)] = &[
@@ -573,6 +578,20 @@ impl VisitorMut for Arguments {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session takes no other role or user by the setting's name either, as SET ROLE and SET SESSION AUTHORIZATION refuse
+    /// them (0A000): `set_config('role', …)` doesn't answer what it didn't do (11-28 audit L1). NONE and DEFAULT keep.
+    #[test]
+    fn the_role_settings_are_refused_as_set_role_is() {
+        for (n, v) in [("role", "ann"), ("ROLE", "admin"), ("session_authorization", "bob")] {
+            let (code, why) = one_way(&name(n), v).unwrap_or_else(|| panic!("{n} = {v} is refused"));
+            assert_eq!(code, "0A000");
+            assert!(why.contains("sign-in's"), "{why}");
+        }
+        for (n, v) in [("role", "none"), ("role", "NONE"), ("role", "default"), ("session_authorization", "default")] {
+            assert!(one_way(&name(n), v).is_none(), "{n} = {v} keeps");
+        }
+    }
 
     /// A table's default formats (I11): SET keeps a format this build has, refuses one that comes later by name and any
     /// other with the ones it has; pg_dump's `heap` is Pondra's own; the session's comes before the node's, which comes

@@ -362,7 +362,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
     };
     // (one sign-in at every door, `signin::Attempt`: the lock, whom it signs in, the count, 400 ms and the audit line. An open
     // node takes anyone, but never a credential that can't be read; a password crosses only TLS from another machine)
-    let attempt = crate::signin::Attempt::at(app, "kafka", who.from);
+    let attempt = crate::signin::Attempt { plain: !peer.may_send_password(), ..crate::signin::Attempt::at(app, "kafka", who.from) };
     let open = credential.malformed().is_none() && app.open().await;
     let refused = if open {
         *who = made(crate::auth::Principal::of(Role::Admin)).at("kafka", who.from);
@@ -381,6 +381,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &m
                 *who = made(p).at("kafka", who.from);
                 None
             }
+            Err(r) if r.kind == crate::signin::Kind::Plain => Some(PASSWORD_PLAIN.to_string()), // (a password in a token's form)
             Err(r) => Some(r.words),
         }
     };

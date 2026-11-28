@@ -245,16 +245,17 @@ fn allowed<T>(_: &App, req: &Request<T>, need: Role) -> Result<Role, Status> {
 /// every door signs in (`signin::Attempt`: the lock, the count, 400 ms, the audit). With nothing sent, or on a node
 /// nothing locks, nothing is refused: anyone is the open node's admin, else no one (`Gate` refuses what needs a sign-in).
 /// A credential sent that signs nobody in is refused, a Bearer's too. A password crosses only TLS from another machine
-/// (`tls.rs`; no peer at all refuses one).
+/// (`tls.rs`; no peer at all refuses one): one that isn't a token's form at once, and one in a token's form that signs in as
+/// its user's password by the sign-in (`Attempt::plain`).
 async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, peer: Option<Peer>) -> Result<crate::auth::Principal, Status> {
     let from = peer.map(|p| p.addr);
+    let plain = !peer.is_some_and(|p| p.may_send_password()) && !app.open().await;
     if let crate::auth::Credential::Password { user, password } = &credential {
-        let token = crate::users::is_token(&app.auth, user, password);
-        if !token && !peer.is_some_and(|p| p.may_send_password()) && !app.open().await {
-            return Err(refused("28000", crate::tls::PASSWORD_PLAIN));
+        if plain && !crate::users::is_token(&app.auth, user, password) {
+            return Err(said_no(crate::signin::Refusal { kind: crate::signin::Kind::Plain, words: crate::signin::PLAIN.into() }));
         }
     }
-    let attempt = crate::signin::Attempt::at(app, "flight", from);
+    let attempt = crate::signin::Attempt { plain, ..crate::signin::Attempt::at(app, "flight", from) };
     let who = match attempt.check(&credential).await {
         crate::signin::Tried::Signed(p) => p,
         crate::signin::Tried::Refused(r) => return Err(said_no(r)),
@@ -268,6 +269,7 @@ async fn sign_in(app: &App, credential: crate::auth::Credential, sent: bool, pee
 /// A refused sign-in as Flight says it: 28P01 for a wrong name and password, as Postgres says it, else 28000.
 fn said_no(r: crate::signin::Refusal) -> Status {
     match r.kind {
+        crate::signin::Kind::Plain => refused("28000", crate::tls::PASSWORD_PLAIN),
         crate::signin::Kind::Password => refused("28P01", r.words),
         _ => refused("28000", r.words),
     }
@@ -894,10 +896,13 @@ impl FlightSqlService for Sql {
         let credential = crate::auth::Credential::of_header(req.metadata().get("authorization").and_then(|v| v.to_str().ok()));
         let crate::auth::Credential::Password { password, .. } = credential else { return Err(refused("28P01", "wrong user name or password")) };
         let open = self.0.open().await;
+        // (a password set before #864 in a token's form is its user's, not a token: it gets a session, as any password does,
+        // never itself back, which no later call would sign in with; 11-28 audit M1)
+        let a_token = password.starts_with("pt_") && crate::users::who_at(&self.0.lake, &self.0.auth, &crate::auth::Credential::Token(password.clone()), false).await.is_some();
         let token = match self.0.auth.token_role(&password) {
             // (a user's token is handed back as itself, which every call checks again: a session made from it
             // would outlive a DROP TOKEN and the token's own end by the session's hours, 11-06 audit H2)
-            Role::None if !open && password.starts_with("pt_") => match caller(&req) {
+            Role::None if !open && a_token => match caller(&req) {
                 who if who.role > Role::None => password,
                 _ => return Err(refused("28P01", "wrong user name or password")),
             },
