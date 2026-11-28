@@ -173,15 +173,32 @@ impl Cluster {
     /// One request to member `m`'s router, from no member (from its owner, once `owned`): its status and whole body.
     /// Answered on a task its kill ends (`Net::answer`), within `ASKED` on the sim's clock, as the harness's `call` waits.
     pub async fn ask(&self, m: usize, method: &str, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+        self.ask_with(m, method, path, &[], body).await.map(|(status, _, body)| (status, body))
+    }
+
+    /// As `ask`, with `headers`: the answer's status, the SQLSTATE it was refused with (`x-pondra-sqlstate`), and its body.
+    pub async fn ask_with(&self, m: usize, method: &str, path: &str, headers: &[(String, String)], body: Vec<u8>) -> Result<(u16, Option<String>, Vec<u8>)> {
         let (name, owner) = (&self.members[m].name, lock(&self.owner).clone());
         let asked = async {
             self.members[m].faults.thawed().await; // (a frozen member answers no one until it is thawed)
-            let res = self.net.answer(name, crate::node::request(method, path, &[], body, owner.as_deref())?).await?;
+            let res = self.net.answer(name, crate::node::request(method, path, headers, body, owner.as_deref())?).await?;
             let status = res.status().as_u16();
+            let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
             let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
-            Ok((status, body.to_vec()))
+            Ok((status, code, body.to_vec()))
         };
         tokio::time::timeout(ASKED, asked).await.unwrap_or_else(|_| Err(anyhow!("{name}: no answer in {} s", ASKED.as_secs())))
+    }
+
+    /// One statement in session `session` on member `m` (`x-pondra-session`, the harness's `http(port, body, session)`):
+    /// "ok" when it ran, the SQLSTATE it was refused with, or "no answer" when none came.
+    pub async fn code_in(&self, m: usize, session: &str, sql: &str) -> String {
+        let headers = [("x-pondra-session".to_string(), session.to_string())];
+        match self.ask_with(m, "POST", "/sql", &headers, sql.as_bytes().to_vec()).await {
+            Ok((200..=299, ..)) => "ok".into(),
+            Ok((status, code, _)) => code.unwrap_or_else(|| format!("status {status}")),
+            Err(_) => "no answer".into(),
+        }
     }
 
     /// Member `m`'s `/stats`, or None while it doesn't answer.
