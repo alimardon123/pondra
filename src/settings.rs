@@ -341,6 +341,7 @@ pub const CORE: &[Setting] = &[
     test("PONDRA_SIM_FROM", Int, Is("1")),
     test("PONDRA_SIM_SEED", Int, No),
     test("PONDRA_SIM_SEEDS", Int, Is("2")),
+    test("PONDRA_SIM_TRIPS", Switch, No),
     test("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS", Ms, No),
     test("PONDRA_TEST_FILL_PAUSE_MS", Ms, No),
     test("PONDRA_TEST_FORMAT", Int, No),

@@ -64,6 +64,10 @@ pub struct Faults {
     points: Mutex<HashMap<String, f64>>,
     /// What it met, in order.
     met: Mutex<Vec<String>>,
+    /// How far away its bucket is: each call to it waits this long before it goes (`far`).
+    far: Mutex<Duration>,
+    /// Each call to the far bucket, with when it went: what a chain is made of (`trips`).
+    trips: Mutex<Vec<(crate::clock::Instant, String)>>,
 }
 
 impl std::fmt::Debug for Faults {
@@ -80,6 +84,8 @@ impl Faults {
             cut: AtomicBool::new(false),
             points: Default::default(),
             met: Default::default(),
+            far: Default::default(),
+            trips: Default::default(),
         })
     }
 
@@ -89,8 +95,13 @@ impl Faults {
     /// Every kind of call meets `odds` from now on.
     pub fn everywhere(&self, odds: Odds) { Op::ALL.iter().for_each(|op| self.set(*op, odds)); }
 
-    /// No call meets any fault from now on: no odds, nothing frozen or cut, no point to stop at.
+    /// Each call to the bucket waits `trip` before it goes, from now on: a bucket one round trip of `trip` away. With
+    /// nothing else slow, a wait on the sim's clock divided by `trip` is how many calls it waited on one after another.
+    pub fn far(&self, trip: Duration) { *lock(&self.far) = trip; }
+
+    /// No call meets any fault from now on: no odds, nothing frozen or cut, no point to stop at, the bucket near.
     pub fn calm(&self) {
+        *lock(&self.far) = Duration::ZERO;
         lock(&self.odds).clear();
         lock(&self.points).clear();
         self.cut.store(false, SeqCst);
@@ -132,6 +143,11 @@ impl Faults {
             self.note(format!("{op:?} {what}: cut off"));
             return Verdict::Fail;
         }
+        let far = *lock(&self.far);
+        if op != Op::Call && !far.is_zero() {
+            lock(&self.trips).push((crate::clock::now(), format!("{op:?} {what}")));
+            tokio::time::sleep(far).await; // (its round trip to the bucket: `far`)
+        }
         let Some(odds) = lock(&self.odds).get(&op).copied() else { return Verdict::Go };
         let (wait, verdict) = {
             let mut dice = lock(&self.dice);
@@ -156,6 +172,12 @@ impl Faults {
 
     /// What it met, in order.
     pub fn met(&self) -> Vec<String> { lock(&self.met).clone() }
+
+    /// Its calls to the far bucket since `since` (`far`), each with how long after `since` it went: calls that went at
+    /// the same moment went side by side.
+    pub fn trips(&self, since: crate::clock::Instant) -> Vec<String> {
+        lock(&self.trips).iter().filter(|(at, _)| *at >= since).map(|(at, call)| format!("{:>6} ms  {call}", at.duration_since(since).as_millis())).collect()
+    }
 
     fn note(&self, what: String) { lock(&self.met).push(what); }
 }
