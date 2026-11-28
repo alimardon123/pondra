@@ -328,13 +328,9 @@ pub fn end(at: &crate::temp::Sessions, session: &str) {
 /// The book's transaction of session `s`, removed (`commit`).
 fn take(at: &crate::temp::Sessions, s: &str) -> Option<Txn> { at.book.lock().unwrap().txns.remove(s) }
 
-/// A statement failed in this session's transaction: it is failed now (25P02 for the ones that follow). A statement whose
-/// lock wait gave way to a newer one of its transaction (`locks::GAVE_WAY`: its client sent it again) fails nothing: it
-/// changed nothing yet, and the newer one does its work.
+/// A statement failed in this session's transaction: it is failed now (25P02 for the ones that follow, and for one still
+/// running when its rows come to be kept: `keep`).
 pub fn failed(message: &str) {
-    if message.contains(crate::locks::GAVE_WAY) {
-        return;
-    }
     with_txn(|t| {
         t.failed.get_or_insert_with(|| message.to_string());
     });
@@ -1299,6 +1295,11 @@ fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch
     if t.id != id {
         return Err(ended_since());
     }
+    if let Some(why) = &t.failed {
+        // (another statement of it failed while this one ran, as an older one whose lock wait this one's took over does:
+        // `locks::Table::ask`. Its rows go nowhere, and its client is told so now, not at COMMIT)
+        return Err(aborted(why));
+    }
     let c = t.tables.entry(table.to_string()).or_default();
     c.placed.extend(crate::log::placed_for(table)); // (an INSERT without a column list: the order this node put its values by)
     let mut by = (!key.is_empty()).then(|| t.by_key.entry(table.to_string()).or_insert_with(|| ByKey { key: key.to_vec(), ..Default::default() }));
@@ -2215,10 +2216,10 @@ mod tests {
         assert!(!held(&a, "ann~t") && held(&b, "ann~t"), "ended at a, b's stays");
     }
 
-    /// A statement whose lock wait gave way to a newer one of its transaction (its client sent it again) leaves the
-    /// transaction open, whichever door words its error; any other failure fails it.
+    /// A statement still running when another of its transaction fails (an older one whose lock wait it took over, as when
+    /// its client sent it again) keeps no rows: it is refused with 25P02 where its rows would be kept.
     #[test]
-    fn a_wait_that_gave_way_fails_no_transaction() {
+    fn a_statement_keeps_no_rows_in_a_transaction_that_failed_while_it_ran() {
         let at = std::sync::Arc::new(crate::temp::Sessions::default());
         let txn = Txn {
             id: "t".into(), job: None, lake: std::sync::Weak::new(), level: Level::Committed, read_only: false, snapshot: 0, ran: false, leader: None,
@@ -2227,13 +2228,12 @@ mod tests {
         };
         at.book.lock().unwrap().txns.insert("ann~t".into(), txn);
         let here = Some(crate::temp::Named { name: "ann~t".into(), at: at.clone() });
-        let gave_way = format!("canceling statement: lock on held: {}", crate::locks::GAVE_WAY);
-        for said in [gave_way.clone(), format!("User provided error: ErrorInfo: ERROR, 57014, {gave_way}")] {
-            crate::temp::SESSION.sync_scope(here.clone(), || failed(&said));
-            assert!(at_in(&at, "ann~t", |t| t.failed.is_none()).expect("open"), "as HTTP or Postgres words it: {said}");
-        }
-        crate::temp::SESSION.sync_scope(here, || failed("canceling statement due to lock timeout"));
-        assert!(at_in(&at, "ann~t", |t| t.failed.is_some()).expect("open"), "a lock timeout fails it");
+        let kept = || crate::temp::SESSION.sync_scope(here.clone(), || keep("held", &[], vec![], vec![], 0, None, "t"));
+        assert!(kept().is_ok(), "an open transaction keeps a statement's rows");
+        crate::temp::SESSION.sync_scope(here.clone(), || failed("lock on held: its place ended without a grant"));
+        let refused = kept().expect_err("a failed one keeps none");
+        assert_eq!(crate::codes::of(&refused), "25P02");
+        assert!(refused.to_string().contains("lock on held"), "{refused}");
     }
 
     #[test]
