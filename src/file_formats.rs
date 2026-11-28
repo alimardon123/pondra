@@ -199,6 +199,20 @@ pub fn of(f: &crate::data_file::DataFile) -> Result<&'static dyn TableFileFormat
     }
 }
 
+/// The format a table's new files are written in, as its entry says (`TableMeta::file_format`; none: Parquet).
+pub fn table(file_format: &str) -> Result<&'static dyn TableFileFormat> {
+    match file_format {
+        "" => Ok(default()),
+        name => chosen(name),
+    }
+}
+
+/// The format `file_format = '…'` names (any case), refused naming the ones this build has when it has no such format.
+pub fn chosen(name: &str) -> Result<&'static dyn TableFileFormat> {
+    let name = name.trim().to_lowercase();
+    named(&name).ok_or_else(|| anyhow::anyhow!("file_format: this build has no {name} format (it has {})", all().map(|f| f.name()).collect::<Vec<_>>().join(", ")))
+}
+
 /// What a file's entry says of its format (`DataFile::format`): nothing for Parquet.
 pub fn recorded(format: &dyn TableFileFormat) -> String {
     match format.name() == parquet::PARQUET.name() {

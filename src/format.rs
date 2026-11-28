@@ -37,7 +37,9 @@ use std::time::Duration;
 /// writes the entry again, leaving the file with no ranges (`BOUNDS`).
 /// 9: a file's partition spec (`DataFile::spec`, step 5 I3-c), which a node from before drops when it writes the entry
 /// again (`SPECS`).
-pub const FORMAT: u32 = 9;
+/// 10: a file in another format than Parquet (`DataFile::format`, step 5 piece 15c), which a node from before reads as
+/// Parquet (`FORMATS`).
+pub const FORMAT: u32 = 10;
 
 /// The format whose tables keep their columns as one list (`store::Stored`). A lake moves to it by itself: its leader raises
 /// it once every node knows it (`raise`), and a form that leads a lake in memory or a folder alone as it opens (`alone`). The commit sets the
@@ -59,6 +61,10 @@ pub const FIXED: u32 = 8;
 /// the table's current spec. Its own number, not format 8's: a node built with format 8 before it would (audit 11-21 M3).
 /// A lake moves to it only by `require`, when a table's spec first changes.
 pub const SPECS: u32 = 9;
+
+/// The format whose files may be in another format than Parquet (`DataFile::format`), which a node from before reads as
+/// Parquet. A lake moves to it only by `require`, when a table's `file_format` first names another.
+pub const FORMATS: u32 = 10;
 
 /// Does a table made in this lake now keep a fixed-size list's size (`FIXED`)? A lake this process made does from its first
 /// statement: no release before has read it, and it starts at `FIXED` (`first`), which `raise` or `alone` commits as it

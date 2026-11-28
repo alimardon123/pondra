@@ -423,7 +423,7 @@ pub(crate) fn option_text(v: &ast::Expr) -> String {
 }
 
 /// The WITH options a table takes.
-const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
+const OPTIONS: [&str; 8] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention", "file_format"];
 
 /// What a `CREATE TABLE` declares, read from its AST alone. `write::create_spec` keeps it in a table's spec. It is computed
 /// in the order a node refuses a statement's faults: the key, the identity columns, the NOT NULLs, the DEFAULTs, the CHECKs,
