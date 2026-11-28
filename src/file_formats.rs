@@ -49,6 +49,9 @@ pub trait TableFileFormat: Sync + std::fmt::Debug {
     /// Its files' columns decoded from their bytes one at a time, if it can (`Columns`): what the hot tier keeps in memory.
     /// None: its files aren't kept there (`hot.rs`).
     fn columns(&self) -> Option<&dyn Columns> { None }
+    /// Whether a scan of its files gives each row's place in its file (`place`: what a lake's own row ids are read by,
+    /// `lake_scan.rs`). false: such a scan of its files is refused, naming it.
+    fn numbers(&self) -> bool { false }
 }
 
 /// A file's bytes where they are, read by range: a lookup reads only a file's index and the blocks it needs.
@@ -221,6 +224,22 @@ pub fn recorded(format: &dyn TableFileFormat) -> String {
     }
 }
 
+/// The column of each row's place in its file, under `name`: a scan's virtual column, last (`Files::row`), which an entry
+/// that `numbers` its rows fills. It is marked as Parquet's row number, the one mark DataFusion's readers know.
+pub fn place(name: &str) -> datafusion::arrow::datatypes::FieldRef {
+    Arc::new(datafusion::arrow::datatypes::Field::new(name, datafusion::arrow::datatypes::DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber))
+}
+
+/// Whether other engines read `f` when a table is published (Delta, Iceberg): a file in Parquet, the one format both
+/// name and every reader reads. A table's file_format refuses publishing (`delta::refused`); this holds out the files a
+/// table kept from before its format changed back to Parquet: its publish fails, naming one, while it has any.
+pub fn published(f: &crate::data_file::DataFile) -> Result<()> {
+    match f.format.is_empty() {
+        true => Ok(()),
+        false => Err(anyhow::anyhow!("{}: a file in the {} format, which other engines don't read: the table publishes again once its files are all Parquet", f.path, f.format)),
+    }
+}
+
 /// `files` by their formats, in the order each format is first met (one group for a table whose files share one).
 pub fn by_format<'a>(files: impl IntoIterator<Item = &'a crate::data_file::DataFile>) -> Result<Vec<(&'static dyn TableFileFormat, Vec<&'a crate::data_file::DataFile>)>> {
     let mut out: Vec<(&'static dyn TableFileFormat, Vec<&crate::data_file::DataFile>)> = vec![];
@@ -275,6 +294,9 @@ mod tests {
         assert_eq!(groups.iter().map(|(f, g)| (f.name(), g.iter().map(|f| f.path.as_str()).collect::<Vec<_>>())).collect::<Vec<_>>(), [("parquet", vec!["a", "c"])]);
         assert!(by_format([&a, &b]).is_err());
         assert!(!serde_json::to_string(&a).unwrap().contains("format"), "an entry written as before");
+        assert!(published(&a).is_ok());
+        let held = published(&b).err().expect("held out of a publish").to_string();
+        assert!(held.contains("b: a file in the vortex format, which other engines don't read"), "{held}");
     }
 
     /// Parquet under another name: a second format, for a table whose files are in two.
@@ -305,14 +327,24 @@ mod tests {
             let stats = Arc::new(datafusion::common::Statistics::new_unknown(&schema));
             crate::scan::File { key, size: std::fs::metadata(&path).unwrap().len(), rows: 10, partition: vec![], deleted: deleted.map(Arc::new), range: None, only: None, stats, modified: None, format }
         };
-        let files = |files| crate::scan::Files { store: datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(), file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None };
+        let files_of = |files| crate::scan::Files { store: datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(), file_schema: schema.clone(), partition: vec![], files, adapter: None, row: None };
         let ctx = datafusion::prelude::SessionContext::new();
-        let two = ctx.read_table(Arc::new(files(vec![file(0, &parquet::PARQUET, None), file(10, &Renamed, None), file(20, &parquet::PARQUET, Some(vec![0, 1]))]))).unwrap();
+        let two = ctx.read_table(Arc::new(files_of(vec![file(0, &parquet::PARQUET, None), file(10, &Renamed, None), file(20, &parquet::PARQUET, Some(vec![0, 1]))]))).unwrap();
         let plan = datafusion::physical_plan::displayable(two.clone().create_physical_plan().await.unwrap().as_ref()).indent(true).to_string();
         assert!(plan.contains("UnionExec") && plan.matches("DataSourceExec").count() == 2, "{plan}");
         assert_eq!(two.count().await.unwrap(), 28, "every file's rows but the two deleted");
-        let refused = ctx.read_table(Arc::new(files(vec![file(30, &Renamed, Some(vec![3]))]))).unwrap().count().await.err().expect("refused").to_string();
+        let refused = ctx.read_table(Arc::new(files_of(vec![file(30, &Renamed, Some(vec![3]))]))).unwrap().count().await.err().expect("refused").to_string();
         assert!(refused.contains("which this build's renamed can't"), "{refused}");
+        // (each row's place in its file, as a row id reads it: from a format that numbers its rows; refused, naming the
+        // format, from one that doesn't, but only when the scan reads it)
+        use datafusion::arrow::array::AsArray;
+        let placed = |files| ctx.read_table(Arc::new(crate::scan::Files { row: Some(place("__row")), ..files_of(files) })).unwrap();
+        let rows = placed(vec![file(40, &parquet::PARQUET, Some(vec![2]))]).collect().await.unwrap();
+        let at: Vec<i64> = rows.iter().flat_map(|b| b.column(1).as_primitive::<datafusion::arrow::datatypes::Int64Type>().values().to_vec()).collect();
+        assert_eq!(at, [0, 1, 3, 4, 5, 6, 7, 8, 9], "each row's place, the deleted one's skipped");
+        let refused = placed(vec![file(50, &Renamed, None)]).collect().await.err().expect("refused").to_string();
+        assert!(refused.contains("each row's place in its file is read (a row id), which this build's renamed can't give"), "{refused}");
+        assert_eq!(placed(vec![file(60, &Renamed, None)]).count().await.unwrap(), 10, "a scan that doesn't read the places reads it");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

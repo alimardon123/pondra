@@ -361,6 +361,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
         // (one Iceberg manifest a spec: those of the first in `written`, the others' in `more`)
         let mut by_spec: BTreeMap<i32, Vec<&DataFile>> = BTreeMap::new();
         for f in files {
+            crate::file_formats::published(f)?; // (every file named PARQUET in its manifest: a file kept from another format holds the snapshot back)
             by_spec.entry(layout.id_of(f.spec)).or_default().push(f);
         }
         for (n, (spec, files)) in by_spec.into_iter().enumerate() {

@@ -146,6 +146,10 @@ capi/     `pondra_lib`: the C ABI (seven functions) and `napi.rs`, the same libr
 launcher/ the packages' `pondra`: finds the library and runs it (ADR-061)
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style),
           console-extension.js (what a console extension adds: a section, a tab, a view, an action)
+src/sim/  (redesign step 3) a whole cluster in one test, on paused time, its faults thrown from a seed
+          (`PONDRA_SIM_SEEDS`; `PONDRA_SIM_SEED` replays one; nightly 200 seeds, sim.yml). A new cluster test is
+          written in the sim first, and gets a harness copy only when it needs sockets or a real bucket: what
+          stays in the harness, and why, is listed in `src/sim/mod.rs`.
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
           kafka_bench.py (Kafka clients: throughput, latency), mcp_client.py (the MCP SDK),
