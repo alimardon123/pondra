@@ -759,7 +759,7 @@ async fn chain<T>(faults: &Faults, f: impl std::future::Future<Output = T>) -> (
 async fn a_cold_open_waits_on_few_bucket_calls_one_after_another() {
     // (the most each may wait on: the chains measured on 11-28; a change that shortens one lowers its cap here)
     // (`PONDRA_SIM_TRIPS=1` shows each chain's calls, each with when it went)
-    const CAPS: [(&str, u128); 4] = [("a cold pondra sql SELECT", 30), ("a node's start", 19), ("its first SELECT", 0), ("its second SELECT", 0)];
+    const CAPS: [(&str, u128); 4] = [("a cold pondra sql SELECT", 8), ("a node's start", 19), ("its first SELECT", 0), ("its second SELECT", 0)];
     for seed in seeds() {
         let c = Cluster::new(seed, 1);
         c.guest(0, "CREATE TABLE t (id BIGINT)", "made").await.unwrap();
@@ -820,5 +820,43 @@ async fn a_statement_sent_again_in_its_transaction_fails_it_and_writes_nothing()
         let v = c.sql(0, "SELECT v FROM held WHERE id = 1").await.unwrap();
         assert_eq!(rows(&v), vec![serde_json::json!({"v": 10})], "seed {seed}: v on member 1 after the rollback\n{}", c.met());
         println!("seed {seed}: the UPDATE sent again after 30 s with no answer was refused 25P02, COMMIT rolled back, v 10");
+    }
+}
+
+/// A killed member makes no bucket call from its kill on, as a killed process makes none. Its catalog's own tasks
+/// (SlateDB's), which a kill doesn't end, went on polling the bucket and flushing to it, so a write its leader hadn't put
+/// yet could still land after it died. Started again, it is a new process, and its calls go as before.
+#[tokio::test(start_paused = true)]
+async fn a_killed_member_makes_no_bucket_call_after_its_kill() {
+    for seed in seeds() {
+        let c = Cluster::new(seed, 2);
+        c.start(0).await.unwrap();
+        c.start(1).await.unwrap();
+        c.until("the leader knows the two", Duration::from_secs(30), || async { c.known(0).await == 2 }).await.unwrap();
+        c.sql(0, "CREATE TABLE t (id BIGINT)").await.unwrap();
+        c.sql(0, "INSERT INTO t VALUES (1)").await.unwrap();
+        (0..2).for_each(|m| c.faults(m).far(Duration::from_millis(1))); // (from now on each call is listed: `Faults::trips`)
+        let alive = crate::clock::now();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let calls: Vec<usize> = (0..2).map(|m| c.faults(m).trips(alive).len()).collect();
+        assert!(calls.iter().all(|&n| n > 0), "seed {seed}: up, each member calls the bucket: {calls:?} calls in 20 s\n{}", c.met());
+        let killed = crate::clock::now();
+        c.kill(0);
+        c.kill(1);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        for m in 0..2 {
+            let after = c.faults(m).trips(killed);
+            assert!(after.is_empty(), "seed {seed}: member {} called the bucket after its kill:\n{}\n{}", m + 1, after.join("\n"), c.met());
+        }
+        let again = crate::clock::now();
+        c.start(0).await.unwrap();
+        let rows_back = c.until("member 1, started again, reads the row", Duration::from_secs(120), || async {
+            c.sql(0, "SELECT id FROM t").await.is_ok_and(|a| rows(&a) == vec![serde_json::json!({"id": 1})])
+        })
+        .await;
+        assert!(rows_back.is_ok(), "seed {seed}: member 1 started again: {rows_back:?}\n{}", c.met());
+        let restarted = c.faults(0).trips(again).len();
+        assert!(restarted > 0, "seed {seed}: member 1 started again calls the bucket\n{}", c.met());
+        println!("seed {seed}: up, the members made {calls:?} bucket calls in 20 s; killed, none in 60 s; member 1 started again made {restarted} and read its row");
     }
 }

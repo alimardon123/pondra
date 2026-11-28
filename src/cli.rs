@@ -708,8 +708,7 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
     anyhow::ensure!(!path::is_use(query) && path::set_schema(query).is_none(), "{}", set::NO_SESSION);
     // DuckDB's INSTALL and LOAD answer a row naming what happened, as a page answers them (`extension.rs`).
     let query = match extension::row(query) { Some(row) => row?, None => query.to_string() };
-    let reads = statement::single_statement(&query).is_some_and(|one| statement::plain_statement(&one)) || matches!(write::parse(&query), Some(write::Stmt::CopyTo(..)));
-    let guest = if reads { node::Guest::Reads } else { node::Guest::Writes };
+    let guest = if statement::reads_only(&query) { node::Guest::Reads } else { node::Guest::Writes };
     let life = node::native(true).life.clone(); // (a guest's, as its node's: a run again gives up after five)
     let node = match node::Node::open(node::Options::guest(dir, attached.to_vec(), guest)).await {
         Ok(node) => node,

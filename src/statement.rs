@@ -234,6 +234,13 @@ pub(crate) fn plain_statement(one: &str) -> bool {
     !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::set::is(one) && crate::with_writes::of(one).is_none()
 }
 
+/// Does `sql` only read, as `pondra sql` asks it: one plain statement (`single_statement`, `plain_statement`), or an
+/// export (`COPY … TO`)? Then its process opens a guest that reads (`node::Guest::Reads`), and claims nothing; anything
+/// else may write. The sim's guest asks the same (`sim::cluster::Cluster::guest`).
+pub(crate) fn reads_only(sql: &str) -> bool {
+    single_statement(sql).is_some_and(|one| plain_statement(&one)) || matches!(crate::write::parse(sql), Some(crate::write::Stmt::CopyTo(..)))
+}
+
 /// A plain query's text as sent, and the statement it runs as (its `$name`s and macros expanded, `vars::bound` and
 /// `expand`): the pair when `sql` is one plain statement (`single_statement`, `plain_statement`); None for a script, a
 /// change or a write, which `run` runs whole. Flight plans a query from the second half without running it.
