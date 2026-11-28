@@ -64,10 +64,19 @@ pub async fn newer_claimed(store: &Store, n: u64) {
 
 /// The newest term, if any.
 pub async fn latest(store: &Store) -> Result<Option<Term>> {
-    let metas: Vec<_> = store.list(Some(&Path::from("cluster/term"))).try_collect().await?;
-    let Some(m) = metas.iter().max_by_key(|m| m.location.to_string()) else { return Ok(None) };
-    Ok(Some(serde_json::from_slice(&store.get(&m.location).await?.bytes().await?)?))
+    let Some(newest) = newest_listed(store).await? else { return Ok(None) };
+    Ok(Some(record(store, &newest).await?))
 }
+
+/// The newest term's record in the listing, which names it by its number (`cluster/term/{n:020}`).
+async fn newest_listed(store: &Store) -> Result<Option<Path>> {
+    let metas: Vec<_> = store.list(Some(&Path::from("cluster/term"))).try_collect().await?;
+    Ok(metas.into_iter().map(|m| m.location).max_by_key(|l| l.to_string()))
+}
+
+async fn record(store: &Store, at: &Path) -> Result<Term> { Ok(serde_json::from_slice(&store.get(at).await?.bytes().await?)?) }
+
+fn mark_of(n: u64) -> Path { Path::from(format!("cluster/alive/{n:020}")) }
 
 /// Try to become leader of term `n`: put-if-absent, so at most one node succeeds. (`addr` is
 /// empty for a `pondra sql` INSERT recording its files: nothing to follow, just wait for it.)
@@ -92,7 +101,7 @@ pub async fn claim(store: &Store, n: u64, addr: &str, claims: &Claims) -> Result
                 }
             };
             if listed.iter().any(|(k, _)| *k > n) {
-                let _ = store.delete(&Path::from(format!("cluster/alive/{n:020}"))).await;
+                let _ = store.delete(&mark_of(n)).await;
                 discard(lock);
                 return Ok(None);
             }
@@ -179,7 +188,7 @@ pub(crate) async fn superseded(store: &Store, m: u64) -> bool {
 
 /// The holder of term `n` is still here (the leader: every 10 s).
 pub async fn mark_alive(store: &Store, n: u64) -> Result<()> {
-    store.put(&Path::from(format!("cluster/alive/{n:020}")), Vec::<u8>::new().into()).await?;
+    store.put(&mark_of(n), Vec::<u8>::new().into()).await?;
     Ok(())
 }
 
@@ -258,7 +267,7 @@ impl Ear {
         if !t.bell || here || lately {
             return None;
         }
-        let mark = Path::from(format!("cluster/alive/{:020}", t.n));
+        let mark = mark_of(t.n);
         let m = store.head(&mark).await.ok()?; // (no mark: `alive` says it's gone already)
         Some((key, mark, (m.last_modified, m.e_tag)))
     }
@@ -317,7 +326,12 @@ pub async fn alive(store: &Store, t: &Term, claims: Option<&Claims>) -> bool {
     if gone_here(t, claims) || deaf_here(store, t) {
         return false; // a claimer on this machine that ended can't be alive, whatever its mark says; nor one elsewhere that didn't answer
     }
-    match store.head(&Path::from(format!("cluster/alive/{:020}", t.n))).await {
+    marked(store, t, store.head(&mark_of(t.n)).await).await
+}
+
+/// What term `t`'s mark, as read, says of its holder (`alive`, past the checks made here).
+async fn marked(store: &Store, t: &Term, mark: object_store::Result<object_store::ObjectMeta>) -> bool {
+    match mark {
         // (a leader that stepped down isn't alive, whatever its mark says: its last mark, in flight
         // as it stepped down, can land after `release` took it away)
         Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000 && !stepped_down(store, t.n).await,
@@ -331,7 +345,7 @@ pub async fn alive(store: &Store, t: &Term, claims: Option<&Claims>) -> bool {
 /// A one-off writer is done: whoever comes next doesn't wait for its mark to go stale, nor for its
 /// lock file to be let go.
 pub async fn release(store: &Store, n: u64, claims: &Claims) {
-    let _ = store.delete(&Path::from(format!("cluster/alive/{n:020}"))).await;
+    let _ = store.delete(&mark_of(n)).await;
     let held = claims.0.lock().unwrap().remove(&n);
     discard(held);
 }
@@ -436,14 +450,27 @@ pub(crate) enum Holder {
     Free(Option<Term>),
 }
 
-/// The lake's holder now (`Holder`).
+/// The lake's holder now (`Holder`). The newest term's record and its mark are read side by side, one round trip and not
+/// two: the listing names the term by its number, and the mark is named by it too. (A node's start, a guest and a
+/// one-off writer each look here first.)
 pub(crate) async fn holder(store: &Store, claims: Option<&Claims>) -> Result<Holder> {
-    Ok(match latest(store).await? {
-        Some(t) if alive(store, &t, claims).await => match t.addr.is_empty() {
-            true => Holder::Recording(t),
-            false => Holder::Led(t),
-        },
-        t => Holder::Free(t),
+    let Some(newest) = newest_listed(store).await? else { return Ok(Holder::Free(None)) };
+    let n = newest.filename().and_then(|f| f.parse::<u64>().ok());
+    let (t, mark) = futures::join!(record(store, &newest), async {
+        match n {
+            Some(n) => Some(store.head(&mark_of(n)).await),
+            None => None,
+        }
+    });
+    let t = t?;
+    let alive = match mark {
+        Some(mark) if n == Some(t.n) => !gone_here(&t, claims) && !deaf_here(store, &t) && marked(store, &t, mark).await,
+        _ => alive(store, &t, claims).await, // (a record not named by its number: its mark read after it)
+    };
+    Ok(match alive {
+        true if t.addr.is_empty() => Holder::Recording(t),
+        true => Holder::Led(t),
+        false => Holder::Free(Some(t)),
     })
 }
 
@@ -615,6 +642,29 @@ mod tests {
         assert!(matches!(holder(&with_term(4, "10.0.0.1:9000", true).await, Some(&node.claims)).await.unwrap(), Holder::Led(t) if t.n == 4), "alive with an address: led");
         assert!(matches!(holder(&with_term(5, "", true).await, Some(&node.claims)).await.unwrap(), Holder::Recording(t) if t.n == 5), "alive with none: recording");
         assert!(matches!(holder(&with_term(6, "10.0.0.1:9000", false).await, Some(&node.claims)).await.unwrap(), Holder::Free(Some(t)) if t.n == 6), "not marked: free, numbered from it");
+    }
+
+    #[tokio::test(start_paused = true)] // (on paused time: a bucket 50 ms away, whose waits pass at once)
+    async fn the_holder_is_looked_up_in_two_round_trips_and_a_live_one_in_three() {
+        let trip = Duration::from_millis(50);
+        let node = crate::node_state::NodeState::unhosted();
+        // (the listing, then the record and its mark side by side; a fresh mark, then whether its leader stepped down)
+        for (marked, trips) in [(false, 2u32), (true, 3)] {
+            let store: Store = Arc::new(object_store::memory::InMemory::new());
+            let term = Term { n: 7, addr: "10.0.0.1:9000".into(), lock: String::new(), bell: false };
+            store.put(&Path::from(format!("cluster/term/{:020}", 7)), serde_json::to_vec(&term).unwrap().into()).await.unwrap();
+            if marked {
+                mark_alive(&store, 7).await.unwrap();
+            }
+            let far: Store = Arc::new(object_store::throttle::ThrottledStore::new(store, object_store::throttle::ThrottleConfig { wait_get_per_call: trip, wait_list_per_call: trip, ..Default::default() }));
+            let began = tokio::time::Instant::now();
+            let found = holder(&far, Some(&node.claims)).await.unwrap();
+            assert_eq!(began.elapsed(), trip * trips, "marked {marked}: the holder took {:?}, {trips} round trips of {trip:?} wanted", began.elapsed());
+            match marked {
+                true => assert!(matches!(found, Holder::Led(t) if t.n == 7)),
+                false => assert!(matches!(found, Holder::Free(Some(t)) if t.n == 7)),
+            }
+        }
     }
 
     #[tokio::test]

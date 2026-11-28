@@ -792,8 +792,8 @@ pub fn full(dir: &str) -> Result<String> {
 /// what deletes it, or marks it dropped, stops that process first.
 pub async fn unled(dir: &str, reaches: Option<&crate::reaches::Reaches>) -> Result<()> {
     let store = crate::store::open_store(dir, reaches)?.1;
-    if let Some(t) = crate::terms::latest(&store).await? {
-        ensure!(!crate::terms::alive(&store, &t, None).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
+    if let crate::terms::Holder::Led(t) | crate::terms::Holder::Recording(t) = crate::terms::holder(&store, None).await? {
+        bail!("another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
     }
     Ok(())
 }

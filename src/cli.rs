@@ -669,8 +669,8 @@ async fn run() -> anyhow::Result<()> {
             // serves can be kept tidy by a scheduled `pondra sql --dir … CHECKPOINT`)
             let dir = crate::memory_lake::place(&dir);
             let store = store::open_store(&dir, None)?.1;
-            match terms::latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && terms::alive(&store, &t, None).await => {
+            match terms::holder(&store, None).await? {
+                terms::Holder::Led(t) => {
                     println!("{}", crate::net::process().client(crate::net::Policy::Cluster).post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
                 _ => sql_on_guest(&dir, &query, &attached).await?,

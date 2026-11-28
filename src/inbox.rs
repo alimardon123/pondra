@@ -68,7 +68,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<(&str, &crate::node_s
                 None => {}
             }
         }
-        if tick % 10 == 0 && !matches!(&crate::terms::latest(store).await?, Some(t) if crate::terms::alive(store, t, claims).await) {
+        if tick % 10 == 0 && matches!(crate::terms::holder(store, claims).await?, crate::terms::Holder::Free(_)) {
             let _ = store.delete(&req).await;
             return Ok(None);
         }
