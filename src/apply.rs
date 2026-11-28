@@ -1042,6 +1042,10 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta, scope: &crate::r
     if let Some(r) = opts["retention"].as_str().filter(|r| crate::ddl::retention(r).ok() != m.retention_secs) {
         set.push(format!("retention = {}", text(r)));
     }
+    let file_format = opts["file_format"].as_str().map(|f| f.trim().to_lowercase()).filter(|f| f != "parquet").unwrap_or_default();
+    if file_format != m.file_format {
+        set.push(format!("file_format = {}", text(if file_format.is_empty() { "parquet" } else { &file_format })));
+    }
     if !set.is_empty() {
         sql.push(format!("ALTER TABLE {} SET ({})", quoted(&d.name), set.join(", ")));
     }

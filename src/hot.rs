@@ -532,9 +532,11 @@ fn base(key: &str) -> &str { key.rsplit_once('#').map_or(key, |(path, _)| path) 
 /// holds what it has kept and about twice one column, not twice the file's columns (7 of lineitem's decoded at once
 /// took 248 MB to the cache and 519 MB to the process, at a 0.25 GB `PONDRA_MEMORY_GB`).
 async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool, fits: impl FnOnce(usize) -> bool + Send + 'static) -> Result<std::result::Result<Decoded, usize>> {
+    let format = crate::file_formats::of(file)?;
+    anyhow::ensure!(format.columns().is_some(), "{}: the hot tier decodes a file's columns, which the {} format's can't be", file.path, format.name()); // (before its bytes are read: it stays read from its file)
     let bytes = lake.object(&file.path).await?;
     let gone = if deletes && !file.deletes.is_empty() { crate::lake_scan::deleted_rows(lake, file).await? } else { vec![] };
-    let (fields, lineage, format) = (fields.to_vec(), file.lineage, crate::file_formats::of(file)?);
+    let (fields, lineage) = (fields.to_vec(), file.lineage);
     tokio::task::spawn_blocking(move || read_columns(format, bytes, &gone, &fields, lineage, fits)).await?
 }
 

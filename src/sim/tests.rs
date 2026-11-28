@@ -787,3 +787,38 @@ async fn a_cold_open_waits_on_few_bucket_calls_one_after_another() {
         println!("seed {seed}: bucket calls one after another, 50 ms each: a cold pondra sql SELECT {guest}, a node's start {start}, its first SELECT {first}, its second {second}");
     }
 }
+
+/// A statement sent again in its transaction while its first send still waits for a lock: the holder's member is killed,
+/// a waiter's UPDATE through a follower gets no answer in 30 s (its client gives up, and the statement waits on), and the
+/// same UPDATE sent again takes over the wait. The first one's wait fails the transaction, so the second is refused
+/// (25P02) once the row is free, COMMIT rolls back, and the row keeps its value: no write lost or doubled.
+#[tokio::test(start_paused = true)]
+async fn a_statement_sent_again_in_its_transaction_fails_it_and_writes_nothing() {
+    for seed in seeds() {
+        let c = Cluster::new(seed, 3);
+        c.start(0).await.unwrap();
+        c.sql(0, "CREATE TABLE held (id BIGINT, v BIGINT)").await.unwrap();
+        c.sql(0, "INSERT INTO held VALUES (1, 10)").await.unwrap();
+        c.start(1).await.unwrap();
+        c.start(2).await.unwrap();
+        c.until("every member knows the three", Duration::from_secs(30), || async { c.known(1).await == 3 && c.known(2).await == 3 }).await.unwrap();
+        let upd = "UPDATE held SET v = v + 1 WHERE id = 1";
+        for (m, session, sql) in [(1, "holder-01", "BEGIN"), (1, "holder-01", upd)] {
+            assert_eq!(c.code_in(m, session, sql).await, "ok", "seed {seed}: session {session} ran {sql:?}\n{}", c.met());
+        }
+        c.kill(1);
+        for sql in ["SET lock_timeout = '120s'", "BEGIN"] {
+            assert_eq!(c.code_in(2, "waiter-03", sql).await, "ok", "seed {seed}: the waiter ran {sql:?}\n{}", c.met());
+        }
+        let first = c.code_in(2, "waiter-03", upd).await;
+        assert_eq!(first, "no answer", "seed {seed}: the waiter's first UPDATE, while the lock's lease lasts\n{}", c.met());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let again = in_session(&c, 2, "waiter-03", upd).await;
+        assert_eq!(again["code"], "25P02", "seed {seed}: the UPDATE sent again answered {again}\n{}", c.met());
+        let done = in_session(&c, 2, "waiter-03", "COMMIT").await;
+        assert_eq!(done["transaction"], "rollback", "seed {seed}: the waiter's COMMIT answered {done}\n{}", c.met());
+        let v = c.sql(0, "SELECT v FROM held WHERE id = 1").await.unwrap();
+        assert_eq!(rows(&v), vec![serde_json::json!({"v": 10})], "seed {seed}: v on member 1 after the rollback\n{}", c.met());
+        println!("seed {seed}: the UPDATE sent again after 30 s with no answer was refused 25P02, COMMIT rolled back, v 10");
+    }
+}
