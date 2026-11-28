@@ -1646,9 +1646,22 @@ pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::a
 /// `who_at`, or why it signs nobody in when there is something to say: an identity provider's token says why (expired,
 /// another audience, no such user here). Err(None): nobody, with nothing to say.
 pub async fn who_or_why(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth::Credential, vouched: bool) -> Result<Principal, Option<String>> {
+    who_and_how(lake, auth, credential, vouched).await.map(|(p, _)| p)
+}
+
+/// How a sign-in was made: by a token, or by a user's own password. A value in a token's form may be either (`signed_in`),
+/// so a door that lets a token cross where a password may not asks this, never the value's form (11-28 audit M1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum By {
+    Token,
+    Password,
+}
+
+/// `who_or_why`, and how it signed in (`By`).
+pub async fn who_and_how(lake: &Lake, auth: &crate::auth::Auth, credential: &crate::auth::Credential, vouched: bool) -> Result<(Principal, By), Option<String>> {
     match credential {
         crate::auth::Credential::Password { user, password } => signed_in(lake, auth, user, password).await,
-        crate::auth::Credential::Token(token) => of_token(lake, auth, token, vouched).await,
+        crate::auth::Credential::Token(token) => of_token(lake, auth, token, vouched).await.map(|p| (p, By::Token)),
         _ => Err(None),
     }
 }
@@ -1706,26 +1719,27 @@ pub fn token_form(auth: &crate::auth::Auth, password: &str) -> bool {
 /// signs in the token's principal whatever the name (redesign step 7, piece 2): a node's token, a user's `pt_`, a session,
 /// an identity provider's. The name tells nothing a token doesn't, and the audit line records it beside (`signin`). Else
 /// a user's own password; a token's name (`admin`, `writer`, `reader`) takes none.
-pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> { signed_in(lake, auth, user, password).await.ok() }
+pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> { signed_in(lake, auth, user, password).await.ok().map(|(p, _)| p) }
 
 /// `sign_in`, or why not when a token says (`who_or_why`). A value in a token's form that signs no one in as a token is
 /// still the user's password when it is one: a password set before such were refused (#864) signs in at every door, as
 /// SCRAM and `/login` take it (11-22 audit L1), and its miss is a guess (`signin::Attempt::refuse`).
-async fn signed_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Result<Principal, Option<String>> {
+async fn signed_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Result<(Principal, By), Option<String>> {
+    let by_password = || async { principal(lake, user).await.map(|p| (p, By::Password)).map_err(|_| None) };
     if token_form(auth, password) {
         let why = match of_token(lake, auth, password, false).await {
-            Ok(p) => return Ok(p),
+            Ok(p) => return Ok((p, By::Token)),
             Err(why) => why,
         };
         return match !BUILT_IN.contains(&user) && password_ok(lake, user, password).await {
-            true => principal(lake, user).await.map_err(|_| None),
+            true => by_password().await,
             false => Err(why),
         };
     }
     if BUILT_IN.contains(&user) || !password_ok(lake, user, password).await {
         return Err(None);
     }
-    principal(lake, user).await.map_err(|_| None)
+    by_password().await
 }
 
 /// `SHOW USERS`, `SHOW GRANTS [TO name]`: what `pondra.users` and `pondra.grants` hold.
@@ -1830,6 +1844,16 @@ mod tests {
         assert_eq!(sign_in(&lake, &auth, "ann", old).await.map(|p| p.name), Some("ann".into()), "its own user's password still");
         assert!(sign_in(&lake, &auth, "svc", old).await.is_none(), "and no one else's");
         assert!(sign_in(&lake, &auth, "ann", "ps_another-one-1").await.is_none());
+        // (how it signed in, which a door that lets a token cross a plain connection asks: 11-28 audit M1)
+        let how = |user: &str, password: &str| {
+            let credential = crate::auth::Credential::Password { user: user.into(), password: password.into() };
+            let (lake, auth) = (&lake, &auth);
+            async move { who_and_how(lake, auth, &credential, false).await.map(|(p, by)| (p.name, by)).ok() }
+        };
+        assert_eq!(how("ann", old).await, Some(("ann".into(), By::Password)), "the old password in a token's form is a password");
+        let (session, _) = session(&lake, "ann").await?;
+        assert_eq!(how("svc", &session).await, Some(("ann".into(), By::Token)), "a session is a token, whatever the name");
+        assert_eq!(how("admin", "an-admin-token-1").await.map(|(_, by)| by), Some(By::Token));
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

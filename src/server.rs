@@ -265,7 +265,7 @@ async fn used(State(app): State<App>, req: Request, next: Next) -> Response {
 async fn said_no(app: &App, path: &str, headers: &axum::http::HeaderMap, r: crate::signin::Refusal) -> Response {
     match r.kind {
         crate::signin::Kind::Locked(wait) => (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], r.words).into_response(),
-        crate::signin::Kind::Password | crate::signin::Kind::Token | crate::signin::Kind::Malformed => challenge(app, path, headers, (StatusCode::UNAUTHORIZED, r.words).into_response()).await,
+        crate::signin::Kind::Password | crate::signin::Kind::Token | crate::signin::Kind::Malformed | crate::signin::Kind::Plain => challenge(app, path, headers, (StatusCode::UNAUTHORIZED, r.words).into_response()).await,
     }
 }
 
@@ -333,7 +333,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     }
     // (one sign-in at every door, `signin::Attempt`: a header that can't be read is refused, never taken for no sign-in (an
     // open node's); a name locked out from this address is refused at once, the right password too; then whom it signs in)
-    let attempt = crate::signin::Attempt { app: &app, door: "http", from, client, what: format!("{} {}", req.method(), req.uri().path()), vouched };
+    let attempt = crate::signin::Attempt { app: &app, door: "http", from, client, what: format!("{} {}", req.method(), req.uri().path()), vouched, plain: false }; // (a password on a plain connection is refused before: by its kind, `Credential::Password`)
     let (signed, why) = match attempt.check(&credential).await {
         crate::signin::Tried::Signed(p) => (Some(p), None),
         crate::signin::Tried::Nobody(why) => (None, why),
@@ -470,7 +470,7 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
         return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (`tls.rs`)
     }
     // (a user's own password, which a session is made from: no token. Locked out, counted and audited as at every door)
-    let attempt = crate::signin::Attempt { app: &app, door: "http", from: Some(peer.addr), client: Some(peer.client(&headers)), what: "sign in".into(), vouched: false };
+    let attempt = crate::signin::Attempt { app: &app, door: "http", from: Some(peer.addr), client: Some(peer.client(&headers)), what: "sign in".into(), vouched: false, plain: false };
     if let Err(r) = attempt.password(user, password).await {
         return match r.kind {
             crate::signin::Kind::Locked(wait) => (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], r.words).into_response(),
