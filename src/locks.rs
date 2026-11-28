@@ -61,6 +61,7 @@ pub struct Table {
     leases: HashMap<String, Instant>,       // owner → until when its locks last
     ended: HashMap<String, Instant>,        // owner → until when it is refused: it let its locks go
     waiting: HashMap<String, (String, u64)>, // owner → the key it waits for, and its place's token
+    gave_way: HashSet<u64>,                 // the places a newer ask of their owner took over, until their wait reads it
     flying: HashMap<String, HashSet<String>>, // table → the owners appending to it, past their row locks (`enter`)
     closed: HashMap<String, usize>,         // table → the writers closing it (`close`): no new appender enters
     tokens: u64,
@@ -84,6 +85,7 @@ impl Table {
             leases: HashMap::new(),
             ended: HashMap::new(),
             waiting: HashMap::new(),
+            gave_way: HashSet::new(),
             flying: HashMap::new(),
             closed: HashMap::new(),
             tokens: 0,
@@ -93,12 +95,16 @@ impl Table {
 
     /// `owner` asks for `key` at `now`: granted, refused (its wait would close a loop, or it let its locks go), or
     /// queued behind the holder and the waiters ahead of it. Asking renews its lease. A place it already has (a
-    /// retry after its request timed out) is replaced, never doubled.
+    /// retry after its request timed out, or a statement its client sent again in its transaction) is replaced, never
+    /// doubled: the older wait gives way (`gave_way`), and that fails nothing, as the newer ask does its work.
     pub fn ask(&mut self, owner: &str, key: &str, now: Instant) -> Ask {
         if self.is_ended(owner, now) {
             return Ask::Ended;
         }
         self.renew(owner, now);
+        if let Some(older) = self.unwait(owner, now) {
+            self.gave_way.insert(older); // (before `settle`: the place it gives up is granted to no one)
+        }
         self.settle(key, now);
         if self.holds(key, owner) {
             return Ask::Granted;
@@ -107,7 +113,6 @@ impl Table {
             self.grant(owner, key, now);
             return Ask::Granted;
         }
-        self.unwait(owner, now);
         let blockers = self.ahead(key, owner, now);
         if self.loops(blockers, owner, now) {
             return Ask::Deadlock;
@@ -195,17 +200,22 @@ impl Table {
             lock.queue.retain(|w| w.token != token);
         }
         self.waiting.retain(|_, (_, t)| *t != token); // (tokens are unique: only that place)
+        self.gave_way.remove(&token); // (a wait that ends unread: nothing is kept for it)
         self.settle(key, now);
     }
 
-    /// Gives up `owner`'s place in a queue, if it has one (its wait ends without a grant).
-    fn unwait(&mut self, owner: &str, now: Instant) {
-        let Some((key, token)) = self.waiting.remove(owner) else { return };
+    /// Gives up `owner`'s place in a queue, if it has one (its wait ends without a grant), and says which.
+    fn unwait(&mut self, owner: &str, now: Instant) -> Option<u64> {
+        let (key, token) = self.waiting.remove(owner)?;
         if let Some(lock) = self.locks.get_mut(&key) {
             lock.queue.retain(|w| w.token != token);
         }
         self.settle(&key, now);
+        Some(token)
     }
+
+    /// Did a newer ask of its owner take over the place `token` names (`ask`)? Asked once, by the wait that place was.
+    fn gave_way(&mut self, token: u64) -> bool { self.gave_way.remove(&token) }
 
     /// Gives `key` to its queue, in order, once its holder is gone: a holder whose lease lapsed is
     /// gone, and a waiter who stopped listening is skipped.
@@ -435,6 +445,11 @@ impl Drop for Queued {
     }
 }
 
+/// What a wait that gave way says (`Table::ask`): it reads as a cancel (57014), and it fails no transaction (`txn::failed`).
+pub const GAVE_WAY: &str = "a newer statement of its transaction asks for its locks in its place";
+
+fn gave_way(key: &str) -> anyhow::Error { coded("57014", format!("canceling statement: lock on {key}: {GAVE_WAY}")) }
+
 async fn wait_for(node: &NodeState, t: &Arc<Mutex<Table>>, owner: &str, key: &str, mut rx: oneshot::Receiver<()>, token: u64, wait: Option<Duration>) -> Result<()> {
     let mut place = Queued { t: t.clone(), key: key.to_string(), token, done: false };
     let deadline = wait.map(|w| Instant::now() + w);
@@ -444,7 +459,10 @@ async fn wait_for(node: &NodeState, t: &Arc<Mutex<Table>>, owner: &str, key: &st
             if place.done {
                 return Ok(());
             }
-            return Err(coded("55P03", format!("lock on {key}: its place ended without a grant (its transaction ended, or a newer wait of it took its place)")));
+            if t.lock().unwrap().gave_way(token) {
+                return Err(gave_way(key));
+            }
+            return Err(coded("55P03", format!("lock on {key}: its place ended without a grant: its transaction ended")));
         }
         let now = Instant::now();
         let mut table = t.lock().unwrap();
@@ -535,7 +553,7 @@ pub async fn serve(lake: &Lake, r: Req) -> Result<u64> {
 }
 
 /// The SQLSTATEs a leader's answer can carry (its `x-pondra-sqlstate` header), as static strings.
-const ANSWERS: [&str; 4] = ["40P01", "55P03", "40001", "57P01"];
+const ANSWERS: [&str; 5] = ["40P01", "55P03", "40001", "57P01", "57014"];
 
 /// A node asks the leader at `addr` (`POST /cluster/lock`). Its answer: the commit the locks were
 /// granted at. A refusal keeps the leader's SQLSTATE. A lock wait is bounded: the leader answers within
@@ -997,6 +1015,23 @@ mod tests {
         assert_eq!(t.locks["k"].queue.len(), 1, "one place, not two");
         t.release("A", now);
         assert!(again.try_recv().is_ok(), "the new place is the one granted");
+        assert!(t.gave_way(first), "the first place gave way to the retry");
+        assert!(!t.gave_way(first), "and it is told so once");
+        assert!(!t.gave_way(second), "the granted place gave way to no one");
+    }
+
+    #[test]
+    fn a_place_given_up_to_a_newer_ask_is_granted_to_no_one() {
+        let (mut t, now) = (lease_table(), Instant::now());
+        assert!(granted(t.ask("A", "k", now)));
+        let (mut first, token) = waiting(t.ask("B", "k", now)).expect("B waits");
+        let later = now + Duration::from_secs(61); // (A's lease lapsed: k is free when B's statement is sent again)
+        assert!(granted(t.ask("B", "k", later)), "B's newer ask takes k");
+        assert!(first.try_recv().is_err(), "B's older wait isn't granted k too: it gave way");
+        assert!(t.gave_way(token));
+        let (_, ends) = waiting(t.ask("C", "k", later)).expect("C waits for B");
+        t.release("C", later);
+        assert!(!t.gave_way(ends), "a place its transaction's end gave up gave way to no one");
     }
 
     #[test]
@@ -1081,6 +1116,28 @@ mod tests {
         release(&lake, "A");
         take(&crate::node_state::NodeState::unhosted(), &lake, "C", &["k".to_string()], Some(Duration::from_millis(500)), None).await.expect("C gets k: B left");
         release(&lake, "C");
+    }
+
+    #[tokio::test]
+    async fn a_statement_sent_again_takes_over_the_wait_and_its_transaction_goes_on() {
+        let lake = Lake::open(&format!("memory://test-locks-{}", uuid::Uuid::new_v4()), true, false, NodeState::unhosted()).await.expect("a lake");
+        take(&crate::node_state::NodeState::unhosted(), &lake, "A", &["k".to_string()], None, None).await.expect("A takes k");
+        let older = tokio::spawn({
+            let lake = lake.clone();
+            async move { take(&crate::node_state::NodeState::unhosted(), &lake, "B", &["k".to_string()], None, None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await; // (B's first statement waits; its client gave up and sends it again)
+        let newer = tokio::spawn({
+            let lake = lake.clone();
+            async move { take(&crate::node_state::NodeState::unhosted(), &lake, "B", &["k".to_string()], None, None).await }
+        });
+        let err = older.await.expect("joined").expect_err("the older wait gives way");
+        assert_eq!(crate::codes::of(&err), "57014");
+        let said = crate::codes::told(&err, true);
+        assert!(said.contains(GAVE_WAY), "{said}");
+        release(&lake, "A");
+        newer.await.expect("joined").expect("the newer one gets k");
+        release(&lake, "B");
     }
 
     #[test]
